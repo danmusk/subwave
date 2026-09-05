@@ -1,5 +1,5 @@
 import * as library from './library.js';
-import * as subsonic from './subsonic.js';
+import * as subsonic from './source.js';
 import { applyStrictLocks, hasEraBound, type VocalMode } from './show-filter.js';
 import { resolveExcludedPlaylistIds, resolveShowPlaylistPool } from './show-playlist.js';
 

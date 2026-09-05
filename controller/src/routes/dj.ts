@@ -11,7 +11,7 @@ import * as blocklist from '../music/blocklist.js';
 import { zipUpload } from '../middleware/upload.js';
 import { queue } from '../broadcast/queue.js';
 import * as dj from '../llm/dj.js';
-import * as subsonic from '../music/subsonic.js';
+import * as subsonic from '../music/source.js';
 import * as library from '../music/library.js';
 import * as settings from '../settings.js';
 import { runStationId, runHourlyCheck, runLink, runBanter, runProgrammeIntro, runProgrammeFeature, runProgrammeOutro, refreshAutoPlaylist, syncSkillCrons } from '../broadcast/scheduler.js';

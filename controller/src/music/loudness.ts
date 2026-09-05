@@ -18,7 +18,7 @@
 // library.
 
 import * as settings from '../settings.js';
-import * as subsonic from './subsonic.js';
+import * as subsonic from './source.js';
 import * as library from './library.js';
 import * as mix from './mix.js';
 

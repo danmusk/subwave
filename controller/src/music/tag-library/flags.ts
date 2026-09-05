@@ -3,7 +3,7 @@
 //
 // Part of the tag-library/ split - see ../tag-library.ts for main().
 
-import * as subsonic from '../subsonic.js';
+import * as subsonic from '../source.js';
 import * as db from '../library-db.js';
 import * as embeddings from '../embeddings.js';
 import { config } from '../../config.js';

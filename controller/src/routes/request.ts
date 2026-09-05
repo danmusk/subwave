@@ -4,7 +4,7 @@
 // outcome so the UI can poll for it.
 import express from 'express';
 import { randomUUID } from 'node:crypto';
-import * as subsonic from '../music/subsonic.js';
+import * as subsonic from '../music/source.js';
 import * as dj from '../llm/dj.js';
 import * as library from '../music/library.js';
 import { getFullContext } from '../context.js';

@@ -1,0 +1,76 @@
+// Per-source capability descriptors — the single place declaring which optional
+// methods each music source can actually serve. The facade (music/source.ts)
+// reads these to return neutral empties for methods a source lacks, and the
+// picker tools read them (PickerContext.sourceCaps) to gate off LLM tools that
+// can't work, so no call site ever branches on the source id.
+//
+// Pure: no settings or SDK imports (mirrors llm/internal/provider/capabilities.ts
+// and upstream PR #843's table), so the mappings stay trivially inspectable.
+
+export interface SourceCapabilities {
+  hasSimilar: boolean;         // getSimilarSongs (Last.fm graph via the server)
+  hasSonicSimilarity: boolean; // OpenSubsonic sonicSimilarity extension (class-level; runtime probe still applies)
+  hasStarred: boolean;         // server-side stars (read)
+  hasStar: boolean;            // server-side stars (write) — likes mirroring
+  hasScrobble: boolean;        // play reporting back to the source
+  hasTopSongs: boolean;        // popularity-ranked songs for an artist
+  hasArtistInfo: boolean;      // bio / images / similar artists
+  hasLastfmTags: boolean;      // crowd tags for an artist
+  hasLyrics: boolean;
+  hasPlaylists: boolean;       // getPlaylists + getPlaylist
+  hasPlaylistWrite: boolean;   // create/add/remove/update/delete playlists
+  hasRecentlyAdded: boolean;   // "newest" albums
+  hasFrequent: boolean;        // play-count-ranked albums
+  // Fetchable audio bytes (URL or shared-mount path) for the analyzer, the
+  // loudness measurement, silence trim and stem rendering. False means every
+  // analyzer-derived column stays NULL and those features degrade to "as if
+  // never analysed" — the documented null semantics, not an error.
+  hasAudio: boolean;
+  // The source plays through a live mixer input (a player process feeding
+  // Liquidsoap) rather than a per-track request URI. The queue hands tracks
+  // to a PlaybackTransport instead of writing next.txt.
+  hasLiveTransport: boolean;
+}
+
+const CAPS: Record<string, SourceCapabilities> = {
+  subsonic: {
+    hasSimilar: true,
+    hasSonicSimilarity: true,
+    hasStarred: true,
+    hasStar: true,
+    hasScrobble: true,
+    hasTopSongs: true,
+    hasArtistInfo: true,
+    hasLastfmTags: true,
+    hasLyrics: true,
+    hasPlaylists: true,
+    hasPlaylistWrite: true,
+    hasRecentlyAdded: true,
+    hasFrequent: true,
+    hasAudio: true,
+    hasLiveTransport: false,
+  },
+};
+
+// Everything off — a source declares only what it can serve.
+export const DEFAULT_CAPS: SourceCapabilities = {
+  hasSimilar: false,
+  hasSonicSimilarity: false,
+  hasStarred: false,
+  hasStar: false,
+  hasScrobble: false,
+  hasTopSongs: false,
+  hasArtistInfo: false,
+  hasLastfmTags: false,
+  hasLyrics: false,
+  hasPlaylists: false,
+  hasPlaylistWrite: false,
+  hasRecentlyAdded: false,
+  hasFrequent: false,
+  hasAudio: false,
+  hasLiveTransport: false,
+};
+
+export function capabilitiesFor(sourceId: string | undefined): SourceCapabilities {
+  return (sourceId && CAPS[sourceId]) || DEFAULT_CAPS;
+}

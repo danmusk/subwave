@@ -630,7 +630,7 @@ test('the converted keys are exactly the ones with schemas', () => {
     'djHouseRules', 'djPrompt', 'djPrompts', 'djSpeakClock',
     'djTalkOnlyBetweenTracks', 'ducking', 'festivals',
     'jingleRatio', 'likes',
-    'locale', 'loudness', 'maxTrackSeconds', 'moodSchedule', 'moods', 'personas',
+    'locale', 'loudness', 'maxTrackSeconds', 'moodSchedule', 'moods', 'music', 'personas',
     'picker',
     'privacy', 'requests', 'schedule', 'scheduleOverride', 'scrobble', 'search',
     'sfx', 'shows', 'silenceTrim', 'station', 'stationDescription', 'stream',

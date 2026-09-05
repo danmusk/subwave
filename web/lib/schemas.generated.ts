@@ -2730,6 +2730,20 @@ export const pickerPatchSchema = settingsBlockOf({
   ),
 });
 
+// Pluggable music sources — the enum backing settings.music.source (upstream
+// #843's key). One active source at a time. Only list sources with a registered
+// implementation (music/sources/registry.ts): validating a source nothing can
+// build would let an operator strand the station on a backend that resolves to
+// nothing. A new source appends here in the PR that registers it.
+export const MUSIC_SOURCES: readonly string[] = ['subsonic'];
+
+export const musicPatchSchema = settingsBlockOf({
+  source: settingsStrictOneOf(
+    MUSIC_SOURCES,
+    `music.source must be one of: ${MUSIC_SOURCES.join(', ')}`,
+  ),
+});
+
 export const likesPatchSchema = settingsBlockOf({
   enabled: settingsBoolLike(),
   starInNavidrome: settingsBoolLike(),

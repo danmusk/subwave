@@ -10,7 +10,7 @@
 // extra archive filtering here — the merge is purely union + dedupe by id and
 // normalised title|artist identity.
 
-import * as subsonic from './subsonic.js';
+import * as subsonic from './source.js';
 import { trackKey } from './recency.js';
 
 export type PlaylistPool = {

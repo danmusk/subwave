@@ -5,7 +5,7 @@
 // Part of the doctor/ split - see ../doctor.ts for the section runner.
 
 import { config } from '../config.js';
-import * as subsonic from '../music/subsonic.js';
+import * as subsonic from '../music/source.js';
 import * as subsonicLog from '../music/subsonic-log.js';
 import * as library from '../music/library.js';
 import * as embeddings from '../music/embeddings.js';

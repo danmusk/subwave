@@ -90,6 +90,7 @@ import {
 import { validateCompatParams } from './settings/compat-params.js';
 import { parseSettingsPatchKey } from './settings/patch-registry.js';
 import {
+  MUSIC_SOURCES,
   PICKER_ALBUM_HOURS_BOUNDS,
   STREAM_BUFFER_SECONDS_BOUNDS,
   STREAM_COUNTRY_HEADER_RE,
@@ -1112,6 +1113,13 @@ export async function load() {
           )
         : DEFAULTS.picker.albumHours,
     },
+    // Active music source. An unknown or absent value falls back to subsonic so
+    // an upgrade is byte-identical; the strict refusal is the patch path's.
+    music: {
+      source: MUSIC_SOURCES.includes(stored.music?.source)
+        ? stored.music.source
+        : DEFAULTS.music.source,
+    },
     likes: {
       enabled:
         typeof stored.likes?.enabled === 'boolean'
@@ -1794,6 +1802,10 @@ export async function update(patch) {
   if ('picker' in patch) {
     const pk = parseSettingsPatchKey<Record<string, unknown>>('picker', patch.picker);
     if (pk.albumHours !== undefined) next.picker.albumHours = pk.albumHours as number;
+  }
+  if ('music' in patch) {
+    const mu = parseSettingsPatchKey<Record<string, unknown>>('music', patch.music);
+    if (mu.source !== undefined) next.music.source = mu.source as string;
   }
   if ('search' in patch) {
     const sr = parseSettingsPatchKey<Record<string, unknown>>('search', patch.search);

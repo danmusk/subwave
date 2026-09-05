@@ -7,7 +7,7 @@
 // after a manual refresh. Concurrent /coverage requests share the in-flight
 // scan via a single promise.
 
-import * as subsonic from './subsonic.js';
+import * as subsonic from './source.js';
 import * as library from './library.js';
 import * as db from './library-db.js';
 import * as analyzer from './analyzer.js';

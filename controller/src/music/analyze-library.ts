@@ -25,7 +25,7 @@
 // The heavy DSP lives in music/analyzer.ts's backend (tts-heavy sidecar or a
 // local librosa venv via ANALYZE_PYTHON). With no backend the pass is a no-op.
 
-import * as subsonic from './subsonic.js';
+import * as subsonic from './source.js';
 import * as db from './library-db.js';
 import * as settings from '../settings.js';
 import * as embeddings from './embeddings.js';

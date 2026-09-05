@@ -17,7 +17,7 @@ import { randomBytes } from 'node:crypto';
 import { basename } from 'node:path';
 import { config } from '../config.js';
 import { writeFileAtomic } from '../util/atomic-file.js';
-import * as subsonic from '../music/subsonic.js';
+import * as subsonic from '../music/source.js';
 import * as mix from '../music/mix.js';
 import * as library from '../music/library.js';
 import * as loudness from '../music/loudness.js';

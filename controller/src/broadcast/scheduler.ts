@@ -16,7 +16,7 @@ import { config } from '../config.js';
 import { writeFileAtomic } from '../util/atomic-file.js';
 import { shuffle } from '../util/shuffle.js';
 import { mapPool } from '../util/async-pool.js';
-import * as subsonic from '../music/subsonic.js';
+import * as subsonic from '../music/source.js';
 import * as silenceTrim from '../music/silence-trim.js';
 import * as dj from '../llm/dj.js';
 import * as library from '../music/library.js';

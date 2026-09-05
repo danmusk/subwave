@@ -637,6 +637,14 @@ export const DEFAULTS = {
     albumHours: 0,
   },
 
+  // Active music source (upstream #843's key). Only `source` lives here —
+  // per-source connection config stays where it already is (Navidrome creds in
+  // config.navidrome / the setup overlay; cloud keys in secrets.env). See
+  // music/sources/registry.ts.
+  music: {
+    source: 'subsonic',
+  },
+
   // The player heart button (#991). `starInNavidrome` mirrors each first like
   // into Navidrome via Subsonic star. `influenceDj` feeds the most-liked tracks
   // back to BOTH pick paths as a weighted preference — never a lock.

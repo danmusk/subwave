@@ -13,7 +13,7 @@
 // k-means init and shuffle fall back to Math.random, so only the earlier
 // layers are stable across runs. Tests exercise the deterministic layers.
 
-import * as subsonic from './subsonic.js';
+import * as subsonic from './source.js';
 import * as db from './library-db.js';
 import { moodVocab } from '../settings.js';
 import { shuffle } from '../util/shuffle.js';

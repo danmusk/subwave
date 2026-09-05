@@ -6,7 +6,7 @@
 // agent (broadcast/dj-agent.js) whenever the conversational agent is disabled
 // or fails — so a pick is never missed.
 
-import * as subsonic from './subsonic.js';
+import * as subsonic from './source.js';
 import * as library from './library.js';
 import * as dj from '../llm/dj.js';
 import { nearestId } from '../llm/sdk.js';

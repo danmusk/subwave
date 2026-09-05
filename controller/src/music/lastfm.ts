@@ -13,7 +13,7 @@
 // so the caller can fall back; no retry (project convention — Last.fm's read
 // API is generous and the tagger loop is already sequential + per-artist cached).
 
-import * as subsonic from './subsonic.js';
+import * as subsonic from './source.js';
 import { LASTFM_API, resolveLastfmApiKey } from './lastfm-shared.js';
 import { fetchWithTimeout } from '../util/fetch-timeout.js';
 
