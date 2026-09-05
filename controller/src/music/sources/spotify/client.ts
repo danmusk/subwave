@@ -144,6 +144,15 @@ export class SpotifyClient {
     return Boolean(c.clientId && c.clientSecret && c.refreshToken);
   }
 
+  // Drop the cached access token so the next call refreshes. Needed whenever the
+  // refresh token changes underneath us (a reconnect that added scopes, a pasted
+  // token, a disconnect): an access token lives an hour and carries the scopes
+  // it was minted with, so without this a reconnect looked like it had not
+  // happened until the old token expired.
+  resetToken(): void {
+    this.token = null;
+  }
+
   // A valid access token, refreshing when absent or within 60s of expiry.
   // Concurrent callers share one in-flight refresh.
   async accessToken(force = false): Promise<string> {

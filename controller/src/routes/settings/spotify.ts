@@ -129,6 +129,7 @@ router.get('/settings/spotify/callback', async (req, res) => {
     const tok = await SpotifyClient.exchangeCode({ clientId: c.clientId, clientSecret: c.clientSecret, code, redirectUri: spotifyRedirectUri(req) });
     await saveSecrets({ SPOTIFY_REFRESH_TOKEN: tok.refreshToken });
     await writeLibrespotToken(tok.accessToken, Date.now() + tok.expiresIn * 1000).catch(() => {});
+    spotifyClient().resetToken();
     spotifyPool().invalidate();
     queue.log('scheduler', 'Spotify connected — refresh token stored');
     return back('connected');
@@ -146,6 +147,7 @@ router.post('/settings/spotify/token', requireAdmin, async (req, res) => {
     return res.status(400).json({ ok: false, error: 'SPOTIFY_REFRESH_TOKEN is managed by the root .env' });
   }
   await saveSecrets({ SPOTIFY_REFRESH_TOKEN: token });
+  spotifyClient().resetToken();
   spotifyPool().invalidate();
   res.json({ ok: true, ...spotifyStatus(req) });
 });
@@ -168,6 +170,7 @@ router.post('/settings/spotify/disconnect', requireAdmin, async (req, res) => {
     return res.status(400).json({ ok: false, error: 'SPOTIFY_REFRESH_TOKEN is managed by the root .env' });
   }
   await saveSecrets({ SPOTIFY_REFRESH_TOKEN: '' });
+  spotifyClient().resetToken();
   spotifyPool().invalidate();
   res.json({ ok: true, ...spotifyStatus(req) });
 });
