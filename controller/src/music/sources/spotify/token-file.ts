@@ -8,7 +8,7 @@
 //
 // Mode 0600 and atomic, like state/secrets.env; the file is a credential.
 
-import { mkdirSync, existsSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { chmod, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { STATE_DIR } from '../../../config.js';
@@ -17,6 +17,26 @@ import { writeFileAtomic } from '../../../util/atomic-file.js';
 export const SPOTIFY_STATE_DIR = path.join(STATE_DIR, 'spotify');
 export const LIBRESPOT_TOKEN_PATH = path.join(SPOTIFY_STATE_DIR, 'token');
 export const LIBRESPOT_CACHE_DIR = path.join(SPOTIFY_STATE_DIR, 'cache');
+// Written by librespot-run.sh at every launch: the Spotify Connect name the
+// RUNNING receiver registered with. The controller resolves the device by this,
+// never by the settings alone — the handoff file (and the station name before
+// it) can change while the receiver keeps the name it booted with, which is how
+// the first real run ended up with "receiver not found" on every play.
+export const LIBRESPOT_DEVICE_NAME_PATH = path.join(SPOTIFY_STATE_DIR, 'device-name');
+
+let deviceNameMemo: { at: number; value: string | null } | null = null;
+export function readReceiverDeviceName(now: number = Date.now()): string | null {
+  if (deviceNameMemo && now - deviceNameMemo.at < 5_000) return deviceNameMemo.value;
+  let value: string | null = null;
+  try {
+    const v = readFileSync(LIBRESPOT_DEVICE_NAME_PATH, 'utf8').split('\n')[0].trim();
+    value = v || null;
+  } catch {
+    value = null;
+  }
+  deviceNameMemo = { at: now, value };
+  return value;
+}
 
 export async function writeLibrespotToken(accessToken: string, expiresAt: number): Promise<void> {
   if (!existsSync(SPOTIFY_STATE_DIR)) mkdirSync(SPOTIFY_STATE_DIR, { recursive: true, mode: 0o700 });

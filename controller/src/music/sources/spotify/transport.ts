@@ -412,14 +412,14 @@ export async function startSpotifyTransportIfActive(): Promise<SpotifyTransport 
   const markers = await import('../../../broadcast/spotify-player.js');
   const { SPOTIFY_DEFAULT_DEVICE_NAME } = await import('../../../settings/liquidsoap.js');
   const { spotifyClient, spotifySettings, spotifySource } = await import('./source.js');
+  const { readLibrespotToken, writeLibrespotToken, readReceiverDeviceName } = await import('./token-file.js');
   const { SpotifyPlaybackController } = await import('./playback.js');
 
   const controller = new SpotifyPlaybackController({
     client: spotifyClient,
-    // The same rule as the handoff file's (settings/liquidsoap.ts): a constant
-    // default, so the name the controller looks for is the name the receiver
-    // booted with.
-    deviceName: () => spotifySettings().deviceName || SPOTIFY_DEFAULT_DEVICE_NAME,
+    // The name the RUNNING receiver registered with (written by its wrapper at
+    // launch) beats the settings: the settings describe the NEXT boot.
+    deviceName: () => readReceiverDeviceName() || spotifySettings().deviceName || SPOTIFY_DEFAULT_DEVICE_NAME,
     log: (l) => queue.log('scheduler', l),
   });
   instance = new SpotifyTransport({
@@ -457,7 +457,6 @@ export async function startSpotifyTransportIfActive(): Promise<SpotifyTransport 
   // librespot credential cache re-signs in without the operator. Hourly
   // tokens, refreshed every 50 minutes; a failure just logs (the cache is the
   // normal path — this file is only read on a cold login).
-  const { readLibrespotToken, writeLibrespotToken } = await import('./token-file.js');
   const { refreshReceiverToken } = await import('./receiver-auth.js');
   const refresh = async () => {
     const rt = process.env.SPOTIFY_RECEIVER_REFRESH_TOKEN;

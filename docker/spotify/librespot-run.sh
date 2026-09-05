@@ -111,6 +111,10 @@ if [ ! -f "$CACHE_DIR/credentials.json" ]; then
     fi
 fi
 
+# The name this receiver is REGISTERING with, for the controller to resolve
+# the device by (state/spotify/device-name). The truth lives here, not in the
+# settings: the handoff file can change while this process keeps its name.
+printf '%s\n' "$DEVICE_NAME" > "$SP_DIR/device-name" 2>/dev/null || true
 log "starting: device \"$DEVICE_NAME\", ${BITRATE} kbps"
 rm -f "$SP_DIR/.audiokey-timeout"
 
