@@ -135,6 +135,10 @@ router.get('/settings', requireAdmin, async (req, res) => {
         search: s.search,
         embedding: s.embedding,
         likes: s.likes,
+        // The active music source + the Spotify knobs — what MusicSection /
+        // SpotifySection render and diff against.
+        music: s.music,
+        spotify: s.spotify,
         audio: s.audio,
         transitions: s.transitions,
         sfx: s.sfx,
