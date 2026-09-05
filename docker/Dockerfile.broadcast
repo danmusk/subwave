@@ -18,8 +18,12 @@
 # mode only (radio.liq); in file mode the binary is inert.
 FROM rust:1-bookworm AS librespot
 ARG LIBRESPOT_VERSION=0.8.0
-RUN cargo install librespot --version "${LIBRESPOT_VERSION}" \
-        --no-default-features --features rustls-tls-webpki-roots
+# --locked from the git tag: the crates.io build script pulls an UNLOCKED
+# vergen and a newer minor broke it (E0277 in librespot-core, measured on
+# 0.8.0); the repository lockfile pins what the release was built with.
+RUN cargo install --locked --git https://github.com/librespot-org/librespot \
+        --tag "v${LIBRESPOT_VERSION}" --no-default-features \
+        --features rustls-tls-webpki-roots librespot
 
 FROM savonet/liquidsoap:v2.4.5
 

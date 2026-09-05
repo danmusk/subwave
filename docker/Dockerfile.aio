@@ -46,8 +46,10 @@ FROM node:22-bookworm-slim AS nodebin
 # mode (liquidsoap_music_mode.txt).
 FROM rust:1-bookworm AS librespot
 ARG LIBRESPOT_VERSION=0.8.0
-RUN cargo install librespot --version "${LIBRESPOT_VERSION}" \
-        --no-default-features --features rustls-tls-webpki-roots
+# --locked from the git tag — see Dockerfile.broadcast for why.
+RUN cargo install --locked --git https://github.com/librespot-org/librespot \
+        --tag "v${LIBRESPOT_VERSION}" --no-default-features \
+        --features rustls-tls-webpki-roots librespot
 
 # ---- final: everything under the liquidsoap (Debian) base -------------------
 # v2.4.5 minimum — same reason as Dockerfile.broadcast (2.4.4's O(n) clock scan
