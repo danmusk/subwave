@@ -13,7 +13,6 @@
 import * as settings from '../../../settings.js';
 import * as blocklist from '../../blocklist.js';
 import { saveSecrets } from '../../../setup/secrets.js';
-import { registerSourceReadiness } from '../../../setup/firstRun.js';
 import type { MusicSource, Song, Album, Artist, CoverArt, AnalyzableRef } from '../types.js';
 import { SpotifyClient, type SpotifyCredentials } from './client.js';
 import { SpotifyPoolCache, sample, type PoolConfig } from './pool.js';
@@ -369,7 +368,3 @@ export const spotifySource: MusicSource = {
   getPlaylist,
   getRecentlyAddedAlbums,
 };
-
-// /state's needsSetup for a Spotify station: "connected" means the three
-// secrets are present; the doctor reports whether they actually work.
-registerSourceReadiness(SPOTIFY_SOURCE_ID, () => spotifyClient().hasCredentials());

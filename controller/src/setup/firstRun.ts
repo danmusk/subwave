@@ -32,17 +32,16 @@ function activeMusicSource(): string {
   }
 }
 
-// Sources other than subsonic own their own readiness check; register one here
-// (spotify does) so /state can still answer needsSetup for them.
-const sourceReadiness = new Map<string, () => boolean>();
-export function registerSourceReadiness(sourceId: string, ready: () => boolean): void {
-  sourceReadiness.set(sourceId, ready);
-}
-
+// A non-Navidrome source NEVER gates first-run (upstream #843's rule, and a
+// measured one): the wizard's first screen is Navidrome, and the only place a
+// Spotify station can enter its credentials is the admin Settings page — which
+// the shell redirects AWAY from while needsSetup is true. Gating on "Spotify
+// connected" therefore locked the operator out of the page that connects it.
+// Whether Spotify is actually connected is the doctor's and the settings
+// section's job to report, not the redirect's.
 function nonSubsonicStatus(source: string): SetupStatus {
-  const ready = sourceReadiness.get(source);
   return {
-    needsSetup: ready ? !ready() : false,
+    needsSetup: false,
     setupCompletedAt: null,
     navidromeSource: 'unset',
     musicSource: source,
