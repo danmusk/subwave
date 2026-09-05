@@ -162,7 +162,10 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
             {probe ? (probe.ok ? ` · ${probe.displayName} · ${probe.product}${probe.country ? ` · ${probe.country}` : ''}` : ` · ${probe.error}`) : ''}
           </span>
         </div>
-        {probe?.ok && probe.product && probe.product !== 'premium' ? (
+        {probe?.ok && probe.product === 'unknown' ? (
+          <div className="field-hint mt-2">Spotify did not report the account type — the token predates the <code>user-read-private</code> scope. Press <b>Reconnect Spotify</b> once to grant it.</div>
+        ) : null}
+        {probe?.ok && probe.product && probe.product !== 'unknown' && probe.product !== 'premium' ? (
           <div className="field-hint mt-2">This account is <b>{probe.product}</b>. Spotify Connect playback needs Premium.</div>
         ) : null}
         <details className="mt-3">

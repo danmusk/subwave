@@ -20,8 +20,11 @@ export const SPOTIFY_API = 'https://api.spotify.com/v1';
 
 // Scopes the station needs. `streaming` is for librespot's login (the Connect
 // receiver), the player scopes for commanding it, the rest for the catalog.
+// `user-read-private` is what makes /me report `product` — without it Spotify
+// silently omits the field and the Premium check can only answer "unknown".
 export const SPOTIFY_SCOPES = [
   'streaming',
+  'user-read-private',
   'user-read-playback-state',
   'user-modify-playback-state',
   'user-read-currently-playing',
