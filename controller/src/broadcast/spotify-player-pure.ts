@@ -18,6 +18,9 @@ export interface SpotifyPlayerEvent {
   durationMs: number | null;
   // ms epoch when the event script ran — the marker's own clock.
   at: number;
+  // Monotonic per-station counter from the event script (absent on a marker
+  // written by an older build). The feed reader resumes on it.
+  seq: number | null;
 }
 
 const ID_RE = /^[0-9A-Za-z]{22}$/;
@@ -31,13 +34,32 @@ export function parseSpotifyPlayerEvent(raw: unknown): SpotifyPlayerEvent | null
   if (!Number.isFinite(at) || at <= 0) return null;
   const idRaw = typeof o.trackId === 'string' ? o.trackId : '';
   const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null);
+  const seq = Number(o.seq);
   return {
     event,
     trackId: ID_RE.test(idRaw) ? idRaw : null,
     positionMs: num(o.positionMs),
     durationMs: num(o.durationMs),
     at,
+    seq: Number.isFinite(seq) && seq > 0 ? seq : null,
   };
+}
+
+// The append-only feed (spotify-events.jsonl): every parseable line with a
+// seq above `afterSeq`, in file order. A torn last line (mid-write) is skipped
+// and picked up on the next read.
+export function parseSpotifyEventFeed(text: string, afterSeq: number): SpotifyPlayerEvent[] {
+  const out: SpotifyPlayerEvent[] = [];
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); } catch { continue; }
+    const ev = parseSpotifyPlayerEvent(parsed);
+    if (!ev || ev.seq == null || ev.seq <= afterSeq) continue;
+    out.push(ev);
+  }
+  return out;
 }
 
 export interface SpotifyAudioState {

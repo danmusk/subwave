@@ -32,7 +32,20 @@ CFG_FILE="$STATE_DIR/liquidsoap_spotify.txt"
 EVENT_SCRIPT="${LIBRESPOT_EVENT_SCRIPT:-/app/spotify/librespot-event.sh}"
 BIN="${LIBRESPOT_BIN:-librespot}"
 
-log() { printf 'librespot-run: %s\n' "$*" >&2; }
+# Everything the receiver says also goes to a file the operator can read: the
+# wrapper's stderr belongs to Liquidsoap's process, which does not forward it to
+# the container log, so "why did it exit 1" was invisible from outside.
+LOG_FILE="$STATE_DIR/logs/librespot.log"
+logf() {
+    if [ -d "$STATE_DIR/logs" ]; then
+        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+        # ~1 MB cap: keep the newest half when it grows past it.
+        if [ "$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+            tail -n 2000 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv -f "$LOG_FILE.tmp" "$LOG_FILE"
+        fi
+    fi
+}
+log() { printf 'librespot-run: %s\n' "$*" >&2; logf "librespot-run: $*"; }
 
 mkdir -p "$CACHE_DIR" 2>/dev/null || true
 chmod 700 "$CACHE_DIR" 2>/dev/null || true
@@ -107,6 +120,7 @@ rm -f "$SP_DIR/.audiokey-timeout"
 "$BIN" "${args[@]}" 2> >(
     while IFS= read -r line; do
         printf '[librespot] %s\n' "$line" >&2
+        logf "$line"
         case "$line" in
             *"Authenticated as"*) rm -f "$SP_DIR/.audiokey-timeout" ;;
             *"Audio key response timeout"*) : > "$SP_DIR/.audiokey-timeout" ;;

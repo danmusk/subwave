@@ -7,6 +7,7 @@ import { STATE_DIR } from '../config.js';
 import {
   parseSpotifyPlayerEvent,
   parseSpotifyAudioState,
+  parseSpotifyEventFeed,
   type SpotifyPlayerEvent,
   type SpotifyAudioState,
 } from './spotify-player-pure.js';
@@ -14,7 +15,19 @@ import {
 export type { SpotifyPlayerEvent, SpotifyAudioState };
 
 export const SPOTIFY_PLAYER_FILE = `${STATE_DIR}/spotify-player.json`;
+export const SPOTIFY_EVENTS_FILE = `${STATE_DIR}/spotify-events.jsonl`;
 export const SPOTIFY_AUDIO_FILE = `${STATE_DIR}/spotify-audio.json`;
+
+// New events since `afterSeq`, oldest first. The whole (short, rotated) file is
+// read each time — cheaper than tracking byte offsets across the script's
+// trims, and a 300-line file is nothing at 500 ms.
+export function spotifyEventsSince(afterSeq: number): SpotifyPlayerEvent[] {
+  try {
+    return parseSpotifyEventFeed(readFileSync(SPOTIFY_EVENTS_FILE, 'utf8'), afterSeq);
+  } catch {
+    return [];
+  }
+}
 
 const MEMO_MS = 250;
 let playerMemo: { at: number; value: SpotifyPlayerEvent | null } | null = null;

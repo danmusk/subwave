@@ -89,9 +89,10 @@ test('mismatch under reclaim: one reclaim (transfer + play) then adopt', async (
   const h = harness();
   await h.t.handoff(h.item(ID_B, 'Roads'));   // nothing playing → commands B at once
   assert.deepEqual(h.calls, [`play:${ID_B}`]);
-  h.emit('track_changed', { trackId: ID_X, durationMs: 100_000 }); h.advance(500); await h.t.tick();
+  // Past the 3s command floor, the wrong track starts.
+  h.advance(3_500); h.emit('track_changed', { trackId: ID_X, durationMs: 100_000 }); await h.t.tick();
   assert.deepEqual(h.calls.slice(1), ['transfer', `play:${ID_B}`], 'reclaimed once');
-  h.emit('track_changed', { trackId: ID_X, durationMs: 100_000, at: h.deps.now!() + 1 }); h.advance(500); await h.t.tick();
+  h.advance(3_500); h.emit('track_changed', { trackId: ID_X, durationMs: 100_000 }); await h.t.tick();
   assert.ok(h.calls.includes(`mixer:${ID_X}:song X`), 'second mismatch → adopted and published');
   assert.ok(h.logs.some((l) => /following "song X"/.test(l)));
 });
@@ -107,7 +108,7 @@ test('mismatch under follow adopts immediately and publishes the real track', as
 test('an unavailable track is dropped through the queue hook and the next thing plays', async () => {
   const h = harness();
   await h.t.handoff(h.item(ID_B, 'Roads'));
-  h.emit('unavailable', { trackId: ID_B }); h.advance(300); await h.t.tick();
+  h.advance(3_500); h.emit('unavailable', { trackId: ID_B }); await h.t.tick();
   assert.ok(h.calls.includes(`unplayable:${ID_B}:unavailable`));
   assert.ok(h.calls.includes(`play:${ID_X}`), 'fell through to the pool');
 });
@@ -143,12 +144,51 @@ test('operator skip commands the pending pick now', async () => {
   assert.deepEqual(h.calls, [`play:${ID_B}`]);
 });
 
-test('a receiver reconnect mid-track takes the receiver back and restarts the track', async () => {
+test('session_connected never re-commands: librespot fires it for OUR OWN play command', async () => {
+  // The first real run: every play → session_connected → "reconnect" handler →
+  // transfer + play → session_connected → … ~100 commands in minutes, then
+  // Spotify rate-limited the session. A session event is a log line, nothing more.
   const h = harness();
   h.emit('track_changed', { trackId: ID_A, durationMs: 200_000 }); await h.t.tick();
   await h.t.handoff(h.item(ID_B, 'Roads'));
   h.calls.length = 0;
-  // A marker is new only when its clock moved (the reader dedups on `at`).
   h.advance(500); h.emit('session_connected'); await h.t.tick();
-  assert.deepEqual(h.calls, ['transfer', `play:${ID_B}`]);
+  assert.deepEqual(h.calls, []);
+});
+
+test('consecutive failures back the transport off; a real start clears it', async () => {
+  const h = harness({ playResult: { ok: false, reason: 'no-device', message: 'gone' } });
+  await h.t.handoff(h.item(ID_B, 'Roads'));          // failure 1 (no hold yet)
+  h.advance(16_000); await h.t.tick();                // idle → command → failure 2 → hold 30s
+  const plays = () => h.calls.filter((c) => c.startsWith('play:')).length;
+  assert.equal(plays(), 2);
+  assert.ok((h.t.status().holdForMs as number) > 0, 'holding');
+  h.advance(16_000); await h.t.tick();
+  assert.equal(plays(), 2, 'no command inside the hold');
+  h.advance(20_000); await h.t.tick();                // hold over → failure 3 → 60s
+  assert.equal(plays(), 3);
+  assert.ok(h.logs.some((l) => /failures in a row/.test(l)));
+});
+
+test('a hard floor of 3s between play commands, whatever the reason', async () => {
+  const h = harness();
+  await h.t.handoff(h.item(ID_B, 'Roads'));
+  assert.deepEqual(h.calls, [`play:${ID_B}`]);
+  h.advance(500);
+  await h.t.skip();                                    // 0.5s later — refused by the floor
+  assert.deepEqual(h.calls, [`play:${ID_B}`]);
+});
+
+test('15s of silence while a track should be playing ends it (a receiver that restarted)', async () => {
+  let audioState: any = null;
+  const h = harness({ readAudioState: () => audioState });
+  h.emit('track_changed', { trackId: ID_A, durationMs: 300_000 }); await h.t.tick();
+  await h.t.handoff(h.item(ID_B, 'Roads'));
+  h.calls.length = 0;
+  audioState = { state: 'silent', atMs: h.deps.now!() };
+  h.advance(10_000); await h.t.tick();
+  assert.deepEqual(h.calls, [], 'not yet');
+  h.advance(6_000); await h.t.tick();
+  assert.deepEqual(h.calls, ['gap:true', `play:${ID_B}`].filter((c) => h.calls.includes(c)).length ? h.calls : [], 'commanded the pending pick');
+  assert.ok(h.calls.includes(`play:${ID_B}`));
 });
