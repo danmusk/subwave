@@ -54,6 +54,13 @@ export const SECRET_ENV_KEYS = [
   'LASTFM_SESSION_KEY',
   'LISTENBRAINZ_USER_TOKEN',
   'LISTENBRAINZ_API_URL',
+  // Spotify music source (music/sources/spotify). The client id/secret are the
+  // operator's own Developer-app credentials; the refresh token is minted by the
+  // admin Connect flow (routes/settings/spotify.ts) and may be ROTATED by
+  // Spotify on refresh, which is why the client writes it back here.
+  'SPOTIFY_CLIENT_ID',
+  'SPOTIFY_CLIENT_SECRET',
+  'SPOTIFY_REFRESH_TOKEN',
 ];
 
 // An unquoted value carrying a `#`. dotenv reads that as the start of an inline
@@ -130,8 +137,18 @@ export async function loadSecretsIntoEnv(): Promise<{ loaded: string[]; skipped:
     }
     process.env[key] = value;
     loaded.push(key);
+    loadedKeys.add(key);
   }
   return { loaded, skipped, warnings };
+}
+
+// Which keys came from THIS file rather than the root .env. A route that lets
+// the operator edit a secret needs the distinction: env-managed keys are refused
+// (env wins on boot, so a saved value would be shadowed again), file-managed ones
+// are editable. Keys saved through saveSecrets join the set too.
+const loadedKeys = new Set<string>();
+export function loadedSecretKeys(): ReadonlySet<string> {
+  return loadedKeys;
 }
 
 // Persist a batch of API keys to state/secrets.env. Merges with whatever is
@@ -159,6 +176,7 @@ export async function saveSecrets(patch: Record<string, string>): Promise<void> 
   // permissions, and a crash mid-write can't truncate existing secrets.
   await writeFileAtomic(PATH, body, { mode: 0o600 });
   await chmod(PATH, 0o600);
+  for (const key of Object.keys(patch)) if (SECRET_ENV_KEYS.includes(key)) loadedKeys.add(key);
   // Only now — after the file is safely on disk — mutate the live process env,
   // so any subsequent AI SDK call sees the new key without a restart. Doing this
   // after the write (rather than in the merge loop above) means a value rejected

@@ -50,6 +50,31 @@ const CAPS: Record<string, SourceCapabilities> = {
     hasAudio: true,
     hasLiveTransport: false,
   },
+  // Spotify (Web API catalog + librespot playback). ON: saved tracks as stars,
+  // artist top-tracks, the account's playlists, saved albums as recently-added.
+  // OFF: the Last.fm similar-songs graph and the OpenSubsonic sonic extension
+  // (Spotify's recommendations endpoints are deprecated for new apps), bios,
+  // crowd tags, lyrics, play-count albums, writes back to the account, and —
+  // structurally — audio bytes (a DRM stream, nothing to analyse). Playback is
+  // a LIVE transport: the queue hands picks to the Spotify controller instead
+  // of writing next.txt.
+  spotify: {
+    hasSimilar: false,
+    hasSonicSimilarity: false,
+    hasStarred: true,
+    hasStar: false,
+    hasScrobble: false,
+    hasTopSongs: true,
+    hasArtistInfo: false,
+    hasLastfmTags: false,
+    hasLyrics: false,
+    hasPlaylists: true,
+    hasPlaylistWrite: false,
+    hasRecentlyAdded: true,
+    hasFrequent: false,
+    hasAudio: false,
+    hasLiveTransport: true,
+  },
 };
 
 // Everything off — a source declares only what it can serve.

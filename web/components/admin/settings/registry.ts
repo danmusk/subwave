@@ -54,7 +54,7 @@ export const SECTIONS = [
   },
   {
     id: 'music', group: 'the station', label: 'Music source',
-    hint: 'navidrome · subsonic', icon: Music2,
+    hint: 'navidrome · subsonic · spotify', icon: Music2,
     formKeys: [],
   },
   {

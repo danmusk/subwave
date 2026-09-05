@@ -430,6 +430,16 @@ export interface SettingsData {
     picker?: {
       albumHours?: number;
     };
+    // The active MusicSource (settings.music.source) and the Spotify source's knobs.
+    music?: { source?: string };
+    spotify?: {
+      deviceName?: string;
+      bitrate?: number;
+      pool?: { playlistIds?: string[]; includeSaved?: boolean; includeSavedAlbums?: boolean; maxTracks?: number };
+      seamLeadMs?: number;
+      healthPollSec?: number;
+      mismatch?: string;
+    };
     likes?: {
       enabled?: boolean;
       starInNavidrome?: boolean;
@@ -484,6 +494,16 @@ export interface SettingsData {
     user?: string;
     passSet?: boolean;
     env?: { url?: boolean; user?: boolean; pass?: boolean };
+  };
+  // Spotify source connection state (routes/settings/spotify.ts spotifyStatus):
+  // set/connected flags only — no secret value ever reaches the browser.
+  spotify?: {
+    clientIdSet?: boolean;
+    clientSecretSet?: boolean;
+    connected?: boolean;
+    env?: { clientId?: boolean; clientSecret?: boolean; refreshToken?: boolean };
+    redirectUri?: string;
+    pool?: { tracks: number; albums: number; playlists: number; builtAt: number; partial: boolean } | null;
   };
   streamOnAir?: boolean;
   // What timezone '' (Auto) resolves to — the controller's own zone.

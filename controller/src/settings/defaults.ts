@@ -645,6 +645,28 @@ export const DEFAULTS = {
     source: 'subsonic',
   },
 
+  // Spotify music source (music/sources/spotify). Credentials are SECRETS
+  // (state/secrets.env), never here. `pool` is the station's library on
+  // Spotify: the operator's playlists (empty = every playlist the account
+  // owns/follows) plus saved tracks/albums. `deviceName` is the Spotify Connect
+  // receiver librespot registers as ('' = the station name). `seamLeadMs` is how
+  // early the transport commands the next track before the current one ends;
+  // `mismatch` is what to do when playback was moved off the station device
+  // (reclaim = transfer back, follow = adopt what is playing).
+  spotify: {
+    deviceName: '',
+    bitrate: 320,
+    pool: {
+      playlistIds: [],
+      includeSaved: true,
+      includeSavedAlbums: false,
+      maxTracks: 5000,
+    },
+    seamLeadMs: 1500,
+    healthPollSec: 60,
+    mismatch: 'reclaim',
+  },
+
   // The player heart button (#991). `starInNavidrome` mirrors each first like
   // into Navidrome via Subsonic star. `influenceDj` feeds the most-liked tracks
   // back to BOTH pick paths as a weighted preference — never a lock.

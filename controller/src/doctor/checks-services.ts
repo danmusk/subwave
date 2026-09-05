@@ -161,6 +161,19 @@ export async function checkLlm(s: StationSettings | null): Promise<Finding[]> {
 export async function checkNavidrome(): Promise<Finding[]> {
   const out: Finding[] = [];
 
+  // Another active source owns its own connectivity story; the Navidrome
+  // creds are simply not in play. (Spotify: the account + Premium check.)
+  if (subsonic.activeSourceId() !== 'subsonic') {
+    const sp = await subsonic.ping();
+    out.push({
+      label: `${subsonic.activeSourceId()} connectivity`,
+      status: sp.ok ? 'ok' : 'fail',
+      detail: sp.reason || (sp.ok ? 'connected' : 'unreachable'),
+      hint: sp.ok ? undefined : 'Settings → Music source: add the Spotify client id/secret and press Connect. Playback needs a Premium account.',
+    });
+    return out;
+  }
+
   const p = await subsonic.ping();
   out.push({
     label: 'connectivity',

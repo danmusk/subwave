@@ -9,6 +9,7 @@
 
 import * as settings from '../../settings.js';
 import { subsonicSource } from './subsonic.js';
+import { spotifySource } from './spotify/source.js';
 import type { MusicSource } from './types.js';
 
 export const DEFAULT_MUSIC_SOURCE = 'subsonic';
@@ -16,7 +17,10 @@ export const DEFAULT_MUSIC_SOURCE = 'subsonic';
 // One entry per implementation; a new source is one import + one line here,
 // and one entry in schemas/settings.ts MUSIC_SOURCES. Unknown ids resolve to
 // subsonic — the same "fall back to the default" load() applies.
-const registered = new Map<string, MusicSource>([[subsonicSource.id, subsonicSource]]);
+const registered = new Map<string, MusicSource>([
+  [subsonicSource.id, subsonicSource],
+  [spotifySource.id, spotifySource],
+]);
 
 // `|| { source: 'subsonic' }` keeps this safe before the settings key exists
 // (fresh load → DEFAULTS) and against a hand-edited settings.json — same spirit

@@ -5,6 +5,7 @@ import { router as coreRoutes } from './settings/core.js';
 import { router as llmRoutes } from './settings/llm.js';
 import { router as ttsRoutes } from './settings/tts.js';
 import { router as stationRoutes } from './settings/station.js';
+import { router as spotifyRoutes } from './settings/spotify.js';
 
 export const router = express.Router();
 
@@ -15,8 +16,10 @@ export const router = express.Router();
 //   llm.ts      provider probing and model discovery (read-only)
 //   tts.ts      voice preview and the voice catalogue
 //   station.ts  station actions: mixer, stream, themes, search probe
+//   spotify.ts  the Spotify music source: credentials, OAuth connect, probe
 router.use(coreRoutes);
 router.use(llmRoutes);
 router.use(ttsRoutes);
 router.use(stationRoutes);
+router.use(spotifyRoutes);
 

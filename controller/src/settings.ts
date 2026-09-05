@@ -92,6 +92,11 @@ import { parseSettingsPatchKey } from './settings/patch-registry.js';
 import {
   MUSIC_SOURCES,
   PICKER_ALBUM_HOURS_BOUNDS,
+  SPOTIFY_BITRATES,
+  SPOTIFY_HEALTH_POLL_SEC_BOUNDS,
+  SPOTIFY_MISMATCH_MODES,
+  SPOTIFY_POOL_MAX_TRACKS_BOUNDS,
+  SPOTIFY_SEAM_LEAD_MS_BOUNDS,
   STREAM_BUFFER_SECONDS_BOUNDS,
   STREAM_COUNTRY_HEADER_RE,
   STREAM_GEOIP_DB_PATH_MAX,
@@ -1120,6 +1125,43 @@ export async function load() {
         ? stored.music.source
         : DEFAULTS.music.source,
     },
+    // Spotify source knobs — every field repaired to its default (load() is
+    // lenient by contract; the strict refusal is spotifyPatchSchema's). A
+    // settings.json written before this block existed loads byte-identically.
+    spotify: {
+      deviceName:
+        typeof stored.spotify?.deviceName === 'string'
+          ? stored.spotify.deviceName.slice(0, 64)
+          : DEFAULTS.spotify.deviceName,
+      bitrate: SPOTIFY_BITRATES.includes(Number(stored.spotify?.bitrate))
+        ? Number(stored.spotify.bitrate)
+        : DEFAULTS.spotify.bitrate,
+      pool: {
+        playlistIds: Array.isArray(stored.spotify?.pool?.playlistIds)
+          ? stored.spotify.pool.playlistIds.filter((v: unknown) => typeof v === 'string' && v.trim()).map((v: string) => v.trim()).slice(0, 200)
+          : DEFAULTS.spotify.pool.playlistIds,
+        includeSaved:
+          typeof stored.spotify?.pool?.includeSaved === 'boolean'
+            ? stored.spotify.pool.includeSaved
+            : DEFAULTS.spotify.pool.includeSaved,
+        includeSavedAlbums:
+          typeof stored.spotify?.pool?.includeSavedAlbums === 'boolean'
+            ? stored.spotify.pool.includeSavedAlbums
+            : DEFAULTS.spotify.pool.includeSavedAlbums,
+        maxTracks: Number.isFinite(Number(stored.spotify?.pool?.maxTracks))
+          ? Math.round(Math.min(SPOTIFY_POOL_MAX_TRACKS_BOUNDS.max, Math.max(SPOTIFY_POOL_MAX_TRACKS_BOUNDS.min, Number(stored.spotify.pool.maxTracks))))
+          : DEFAULTS.spotify.pool.maxTracks,
+      },
+      seamLeadMs: Number.isFinite(Number(stored.spotify?.seamLeadMs))
+        ? Math.round(Math.min(SPOTIFY_SEAM_LEAD_MS_BOUNDS.max, Math.max(SPOTIFY_SEAM_LEAD_MS_BOUNDS.min, Number(stored.spotify.seamLeadMs))))
+        : DEFAULTS.spotify.seamLeadMs,
+      healthPollSec: Number.isFinite(Number(stored.spotify?.healthPollSec))
+        ? Math.round(Math.min(SPOTIFY_HEALTH_POLL_SEC_BOUNDS.max, Math.max(SPOTIFY_HEALTH_POLL_SEC_BOUNDS.min, Number(stored.spotify.healthPollSec))))
+        : DEFAULTS.spotify.healthPollSec,
+      mismatch: SPOTIFY_MISMATCH_MODES.includes(stored.spotify?.mismatch)
+        ? stored.spotify.mismatch
+        : DEFAULTS.spotify.mismatch,
+    },
     likes: {
       enabled:
         typeof stored.likes?.enabled === 'boolean'
@@ -1806,6 +1848,21 @@ export async function update(patch) {
   if ('music' in patch) {
     const mu = parseSettingsPatchKey<Record<string, unknown>>('music', patch.music);
     if (mu.source !== undefined) next.music.source = mu.source as string;
+  }
+  if ('spotify' in patch) {
+    const sp = parseSettingsPatchKey<Record<string, any>>('spotify', patch.spotify);
+    if (sp.deviceName !== undefined) next.spotify.deviceName = sp.deviceName as string;
+    if (sp.bitrate !== undefined) next.spotify.bitrate = sp.bitrate as number;
+    if (sp.seamLeadMs !== undefined) next.spotify.seamLeadMs = sp.seamLeadMs as number;
+    if (sp.healthPollSec !== undefined) next.spotify.healthPollSec = sp.healthPollSec as number;
+    if (sp.mismatch !== undefined) next.spotify.mismatch = sp.mismatch as string;
+    if (sp.pool !== undefined) {
+      const pool = sp.pool as Record<string, unknown>;
+      if (pool.playlistIds !== undefined) next.spotify.pool.playlistIds = pool.playlistIds as string[];
+      if (pool.includeSaved !== undefined) next.spotify.pool.includeSaved = pool.includeSaved as boolean;
+      if (pool.includeSavedAlbums !== undefined) next.spotify.pool.includeSavedAlbums = pool.includeSavedAlbums as boolean;
+      if (pool.maxTracks !== undefined) next.spotify.pool.maxTracks = pool.maxTracks as number;
+    }
   }
   if ('search' in patch) {
     const sr = parseSettingsPatchKey<Record<string, unknown>>('search', patch.search);

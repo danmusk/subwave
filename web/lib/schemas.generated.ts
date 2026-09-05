@@ -2735,12 +2735,85 @@ export const pickerPatchSchema = settingsBlockOf({
 // implementation (music/sources/registry.ts): validating a source nothing can
 // build would let an operator strand the station on a backend that resolves to
 // nothing. A new source appends here in the PR that registers it.
-export const MUSIC_SOURCES: readonly string[] = ['subsonic'];
+export const MUSIC_SOURCES: readonly string[] = ['subsonic', 'spotify'];
 
 export const musicPatchSchema = settingsBlockOf({
   source: settingsStrictOneOf(
     MUSIC_SOURCES,
     `music.source must be one of: ${MUSIC_SOURCES.join(', ')}`,
+  ),
+});
+
+// Spotify source knobs (settings.spotify). Credentials are NOT here — they are
+// secrets (state/secrets.env, routes/settings/spotify.ts).
+export const SPOTIFY_BITRATES: readonly number[] = [96, 160, 320];
+export const SPOTIFY_MISMATCH_MODES: readonly string[] = ['reclaim', 'follow'];
+export const SPOTIFY_POOL_MAX_TRACKS_BOUNDS: SettingsNumericBound = { min: 100, max: 50_000 };
+export const SPOTIFY_SEAM_LEAD_MS_BOUNDS: SettingsNumericBound = { min: 0, max: 10_000 };
+export const SPOTIFY_HEALTH_POLL_SEC_BOUNDS: SettingsNumericBound = { min: 15, max: 600 };
+export const SPOTIFY_ID_RE = /^[0-9A-Za-z]{22}$/;
+
+// A list of Spotify playlist ids. Accepts an array or a comma/newline-separated
+// string, and each entry may be a bare id, a `spotify:playlist:` URI or an
+// open.spotify.com link — operators paste whatever the app copied. Anything
+// that is not a playlist reference is refused, naming it.
+export const spotifyPlaylistIdsSchema = z
+  .unknown()
+  .transform((raw, ctx) => {
+    const parts = Array.isArray(raw)
+      ? raw.map((v) => String(v ?? ''))
+      : typeof raw === 'string'
+        ? raw.split(/[\n,]/)
+        : null;
+    if (parts === null) {
+      ctx.addIssue({ code: 'custom', message: 'spotify.pool.playlistIds must be a list of playlist ids or links' });
+      return z.NEVER;
+    }
+    const out: string[] = [];
+    for (const p of parts) {
+      const v = p.trim();
+      if (!v) continue;
+      const m = /^spotify:playlist:([0-9A-Za-z]{22})$/.exec(v)
+        || /open\.spotify\.com\/playlist\/([0-9A-Za-z]{22})/.exec(v)
+        || (SPOTIFY_ID_RE.test(v) ? [v, v] : null);
+      if (!m) {
+        ctx.addIssue({ code: 'custom', message: `spotify.pool.playlistIds: "${v.slice(0, 40)}" is not a Spotify playlist id or link` });
+        return z.NEVER;
+      }
+      if (!out.includes(m[1])) out.push(m[1]);
+    }
+    if (out.length > 200) {
+      ctx.addIssue({ code: 'custom', message: 'spotify.pool.playlistIds: at most 200 playlists' });
+      return z.NEVER;
+    }
+    return out;
+  });
+
+export const spotifyPatchSchema = settingsBlockOf({
+  deviceName: settingsRawStringLike(64, 'spotify.deviceName must be at most 64 characters'),
+  bitrate: z.unknown().superRefine((raw, ctx) => {
+    if (!SPOTIFY_BITRATES.includes(Number(raw))) ctx.addIssue({ code: 'custom', message: `spotify.bitrate must be one of: ${SPOTIFY_BITRATES.join(', ')}` });
+  }).transform((raw) => Number(raw)),
+  pool: settingsBlockOf({
+    playlistIds: spotifyPlaylistIdsSchema,
+    includeSaved: settingsBoolLike(),
+    includeSavedAlbums: settingsBoolLike(),
+    maxTracks: settingsNumberRoundLike(
+      SPOTIFY_POOL_MAX_TRACKS_BOUNDS,
+      `spotify.pool.maxTracks must be between ${SPOTIFY_POOL_MAX_TRACKS_BOUNDS.min} and ${SPOTIFY_POOL_MAX_TRACKS_BOUNDS.max}`,
+    ),
+  }),
+  seamLeadMs: settingsNumberRoundLike(
+    SPOTIFY_SEAM_LEAD_MS_BOUNDS,
+    `spotify.seamLeadMs must be between ${SPOTIFY_SEAM_LEAD_MS_BOUNDS.min} and ${SPOTIFY_SEAM_LEAD_MS_BOUNDS.max}`,
+  ),
+  healthPollSec: settingsNumberRoundLike(
+    SPOTIFY_HEALTH_POLL_SEC_BOUNDS,
+    `spotify.healthPollSec must be between ${SPOTIFY_HEALTH_POLL_SEC_BOUNDS.min} and ${SPOTIFY_HEALTH_POLL_SEC_BOUNDS.max}`,
+  ),
+  mismatch: settingsStrictOneOf(
+    SPOTIFY_MISMATCH_MODES,
+    `spotify.mismatch must be one of: ${SPOTIFY_MISMATCH_MODES.join(', ')}`,
   ),
 });
 
