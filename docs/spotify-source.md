@@ -54,7 +54,21 @@ track ids where a Navidrome library holds Navidrome ids.
    `spotify:playlist:` URIs or links, one per line; empty = every playlist the
    account owns or follows) and choose whether saved tracks / albums count.
    *Rebuild pool now* shows how many tracks it found.
-6. Restart the mixer if you have not yet. Within a few seconds the receiver
+6. **Sign the receiver in** (Playback card). This is a second, separate login:
+   the receiver (librespot) talks to Spotify as Spotify's own desktop client,
+   and a token from your Developer app is refused at the Connect handshake
+   (`INVALID_CREDENTIALS`). Spotify sends the browser to
+   `http://127.0.0.1:5588/login` afterwards, which is librespot's registered
+   redirect, not yours:
+   - with `docker compose -f docker-compose.yml -f docker-compose.spotify.yml`
+     the controller is published on that loopback port and completes the
+     sign-in itself, bouncing you back to the settings page;
+   - without the overlay the page fails to load — copy the whole address from
+     the address bar into *Finish sign-in*.
+   The token lands in `state/spotify/token`; librespot caches reusable
+   credentials on its next start and the controller renews the token from its
+   refresh token, so this is a one-time step.
+7. Restart the mixer if you have not yet. Within a few seconds the receiver
    (named after the station, or `spotify.deviceName`) appears in your Spotify
    apps' device list, and the station starts playing from the pool. The DJ's
    picks follow.
@@ -120,7 +134,8 @@ receiver launch flags and need a mixer restart; the rest apply live.
 | Symptom | Where to look | Likely cause |
 |---|---|---|
 | Emergency loop on air, `/state` says `musicStarved` | `docker compose logs broadcast` (`librespot-run:` lines) | receiver not running: not connected yet, token stale, or the image lacks librespot |
-| `librespot-run: no cached credentials and no token file` | admin → Music source | *Connect Spotify* has not been done on this station |
+| `librespot-run: no cached credentials and no token file` | admin → Music source → Playback | *Sign the receiver in* has not been done on this station |
+| `could not initialize spirc: … INVALID_CREDENTIALS` in the broadcast log | Playback card | the token file holds a Developer-app token (older build) — *Sign the receiver in*; a newer token replaces the stale credential cache |
 | Test says `free`/`open` | Spotify account | Premium required for Connect playback |
 | Receiver missing from the device list | `spotify.deviceName`, `docker compose logs broadcast` | librespot not authenticated; the name is matched case-insensitively |
 | Picks never start, booth log says `no-device` | as above | the receiver is down; picks stay queued until it returns |

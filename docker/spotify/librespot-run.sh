@@ -9,10 +9,14 @@
 # restart_delay_on_error when it exits non-zero), so this script does one run
 # and gets out of the way; the backoff is the mixer's.
 #
-# Auth (librespot ≥0.5, password login is gone): first run passes the access
-# token the controller wrote to state/spotify/token (streaming scope, written by
-# the admin "Connect Spotify" flow and refreshed hourly); librespot then caches
-# reusable credentials under state/spotify/cache and later runs need neither.
+# Auth (librespot ≥0.5, password login is gone): the controller writes an
+# access token to state/spotify/token — minted for Spotify's OWN desktop client
+# id via the admin "Sign the receiver in" flow (a token from the operator's
+# Developer app authenticates but is refused at the Connect handshake with
+# INVALID_CREDENTIALS; measured on 0.8.0). librespot then caches reusable
+# credentials under state/spotify/cache and later runs need neither. A token
+# file NEWER than the cache wins and the cache is dropped: a cache built from a
+# bad token would otherwise be preferred forever.
 #
 # Watchdog (from lounge/tuify's librespot supervision): an "Audio key response
 # timeout" followed by "Spirc shut down unexpectedly" or "Unable to read audio
@@ -70,6 +74,12 @@ args=(
 )
 # --autoplay is deliberately NOT passed: the station picks every track.
 
+# A token newer than the cached credentials replaces them (a re-sign-in).
+if [ -f "$CACHE_DIR/credentials.json" ] && [ -f "$TOKEN_FILE" ] && [ "$TOKEN_FILE" -nt "$CACHE_DIR/credentials.json" ]; then
+    log "token file is newer than the credential cache — signing in afresh"
+    rm -f "$CACHE_DIR/credentials.json"
+fi
+
 if [ ! -f "$CACHE_DIR/credentials.json" ]; then
     if [ -f "$TOKEN_FILE" ]; then
         tok="$(sed -n 1p "$TOKEN_FILE" | tr -d '\r')"
@@ -103,15 +113,17 @@ rm -f "$SP_DIR/.audiokey-timeout"
             *"Spirc shut down unexpectedly"*|*"Unable to read audio file"*)
                 if [ -e "$SP_DIR/.audiokey-timeout" ]; then
                     log "broken session detected (audio key timeout + ${line%% *}) — killing for a clean restart"
-                    pkill -TERM -x "$(basename "$BIN")" 2>/dev/null || true
+                    # No procps in the image: the main script records the pid.
+                    kill -TERM "$(cat "$SP_DIR/.pid" 2>/dev/null)" 2>/dev/null || true
                 fi ;;
         esac
     done
 ) &
 pid=$!
+echo "$pid" > "$SP_DIR/.pid"
 trap 'kill -TERM "$pid" 2>/dev/null' TERM INT
 wait "$pid"
 rc=$?
-rm -f "$SP_DIR/.audiokey-timeout"
+rm -f "$SP_DIR/.audiokey-timeout" "$SP_DIR/.pid"
 log "exited with status $rc"
 exit "$rc"

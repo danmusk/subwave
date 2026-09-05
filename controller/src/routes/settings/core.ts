@@ -7,7 +7,7 @@
 import express from 'express';
 import { config } from '../../config.js';
 import * as subsonic from '../../music/subsonic.js';
-import { spotifyStatus } from './spotify.js';
+import { spotifyStatus, receiverStatus } from './spotify.js';
 import { clearPoolCache } from '../../music/picker.js';
 import { clearNavidromeCache } from '../../doctor.js';
 import { refreshAutoPlaylist } from '../../broadcast/scheduler.js';
@@ -94,7 +94,7 @@ router.get('/settings', requireAdmin, async (req, res) => {
       },
       // Spotify source connection state — secrets never leave the process
       // (set/connected flags only); the pool summary is what the section shows.
-      spotify: spotifyStatus(req),
+      spotify: { ...spotifyStatus(req), receiver: await receiverStatus() },
       // What the configured zone resolves to when timezone is '' (Auto) —
       // lets the UI label the Auto option with the actual server zone.
       serverTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',

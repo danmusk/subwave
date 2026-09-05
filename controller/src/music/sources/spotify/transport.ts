@@ -322,6 +322,28 @@ export async function startSpotifyTransportIfActive(): Promise<SpotifyTransport 
   });
   setLiveTransport(instance);
   instance.start();
+
+  // Keep the receiver's login token fresh from its refresh token, so a wiped
+  // librespot credential cache re-signs in without the operator. Hourly
+  // tokens, refreshed every 50 minutes; a failure just logs (the cache is the
+  // normal path — this file is only read on a cold login).
+  const { readLibrespotToken, writeLibrespotToken } = await import('./token-file.js');
+  const { refreshReceiverToken } = await import('./receiver-auth.js');
+  const refresh = async () => {
+    const rt = process.env.SPOTIFY_RECEIVER_REFRESH_TOKEN;
+    if (!rt) return;
+    const cur = await readLibrespotToken();
+    if (cur && cur.expiresAt - Date.now() > 15 * 60 * 1000) return;
+    try {
+      const tok = await refreshReceiverToken(rt);
+      await writeLibrespotToken(tok.accessToken, tok.expiresAt);
+    } catch (err: any) {
+      queue.log('error', `Spotify receiver token refresh failed: ${err?.message ?? err}`);
+    }
+  };
+  void refresh();
+  const t = setInterval(() => { void refresh(); }, 50 * 60 * 1000);
+  (t as any).unref?.();
   return instance;
 }
 

@@ -37,16 +37,24 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
   const [poolBusy, setPoolBusy] = useState(false);
   const [playlistText, setPlaylistText] = useState(() => (sp?.pool?.playlistIds ?? []).join('\n'));
   const [deviceName, setDeviceName] = useState(() => sp?.deviceName ?? '');
+  const [receiverPaste, setReceiverPaste] = useState('');
+  const rx = st?.receiver;
 
-  // The OAuth callback bounces back here with ?spotify=connected|error:<why>.
+  // The OAuth callbacks bounce back here with ?spotify=… (the app) or
+  // ?receiver=… (librespot): connected | error:<why>.
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    const q = new URLSearchParams(window.location.search).get('spotify');
-    if (!q) return;
-    if (q === 'connected') notify.ok('Spotify connected');
-    else notify.err(`Spotify connect failed: ${q.replace(/^error:/, '')}`);
+    const params = new URLSearchParams(window.location.search);
+    const app = params.get('spotify');
+    const rcv = params.get('receiver');
+    if (!app && !rcv) return;
+    if (app === 'connected') notify.ok('Spotify connected');
+    else if (app) notify.err(`Spotify connect failed: ${app.replace(/^error:/, '')}`);
+    if (rcv === 'connected') notify.ok('Receiver signed in — it logs in on its next start');
+    else if (rcv) notify.err(`Receiver sign-in failed: ${rcv.replace(/^error:/, '')}`);
     const url = new URL(window.location.href);
     url.searchParams.delete('spotify');
+    url.searchParams.delete('receiver');
     window.history.replaceState({}, '', url.toString());
     refresh();
   }, [refresh]);
@@ -126,6 +134,28 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
   };
 
   const savePool = () => saveSettings({ spotify: { pool: { playlistIds: playlistText } } });
+
+  const receiverSignIn = async () => {
+    try {
+      const r = await adminResponse(adminFetch, '/settings/spotify/receiver/auth');
+      const j = (await r.json()) as { ok?: boolean; url?: string; error?: string };
+      if (!j.ok || !j.url) return notify.err(j.error || 'could not start the receiver sign-in');
+      window.location.href = j.url;
+    } catch (err) { notify.err(errorMessage(err)); }
+  };
+
+  const receiverFinish = async () => {
+    if (!receiverPaste.trim()) return;
+    setSaving(true);
+    try {
+      const j = await post('/settings/spotify/receiver/code', { redirectUrl: receiverPaste.trim() });
+      if (j.ok === false) return notify.err(j.error || 'sign-in failed');
+      notify.ok('Receiver signed in — it logs in on its next start');
+      setReceiverPaste('');
+      refresh();
+    } catch (err) { notify.err(errorMessage(err)); }
+    finally { setSaving(false); }
+  };
   const envHint = (envVar: string) => (
     <div className="field-hint">Set via <code>{envVar}</code> in the root <code>.env</code> — env always wins on boot.</div>
   );
@@ -206,6 +236,26 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
       </Card>
 
       <Card title="Playback" sub="The Spotify Connect receiver (librespot) runs inside the broadcast container and is commanded by the station.">
+        <div className="mb-4 rounded-md border border-ink p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium">Receiver sign-in</span>
+            <span className="text-sm opacity-80">
+              {rx?.credentialsCached ? 'signed in (credentials cached)' : rx?.tokenValid ? 'token ready — the receiver logs in on its next start' : rx?.tokenPresent ? 'token expired' : 'not signed in'}
+              {rx?.refreshTokenPresent ? ' · auto-renews' : ''}
+            </span>
+            <Btn sm tone="accent" onClick={receiverSignIn} disabled={saving}>{rx?.credentialsCached || rx?.tokenValid ? 'Sign the receiver in again' : 'Sign the receiver in'}</Btn>
+          </div>
+          <div className="field-hint mt-2">
+            A second, separate login: the receiver speaks to Spotify as Spotify&apos;s own desktop client, so your app&apos;s
+            token cannot be used for it. Spotify sends you to <code>{rx?.redirectUri ?? 'http://127.0.0.1:5588/login'}</code> afterwards.
+            With <code>docker-compose.spotify.yml</code> in your compose command that page completes the sign-in by itself;
+            otherwise it fails to load — copy the whole address from the address bar and paste it here.
+          </div>
+          <div className="mt-2 flex gap-2">
+            <Input value={receiverPaste} onChange={(e) => setReceiverPaste(e.target.value)} placeholder="http://127.0.0.1:5588/login?code=…&state=…" />
+            <Btn sm onClick={receiverFinish} disabled={saving || !receiverPaste.trim()}>Finish sign-in</Btn>
+          </div>
+        </div>
         <div className="grid gap-4 md:grid-cols-2">
           <div>
             <Label htmlFor="sp-device">Device name</Label>

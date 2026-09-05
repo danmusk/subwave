@@ -504,6 +504,16 @@ export interface SettingsData {
     env?: { clientId?: boolean; clientSecret?: boolean; refreshToken?: boolean };
     redirectUri?: string;
     pool?: { tracks: number; albums: number; playlists: number; builtAt: number; partial: boolean } | null;
+    // The RECEIVER's (librespot) sign-in — a second login for Spotify's own
+    // client id; see music/sources/spotify/receiver-auth.ts.
+    receiver?: {
+      tokenPresent?: boolean;
+      tokenValid?: boolean;
+      tokenExpiresAt?: number | null;
+      refreshTokenPresent?: boolean;
+      credentialsCached?: boolean;
+      redirectUri?: string;
+    };
   };
   streamOnAir?: boolean;
   // What timezone '' (Auto) resolves to — the controller's own zone.

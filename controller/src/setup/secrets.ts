@@ -61,6 +61,10 @@ export const SECRET_ENV_KEYS = [
   'SPOTIFY_CLIENT_ID',
   'SPOTIFY_CLIENT_SECRET',
   'SPOTIFY_REFRESH_TOKEN',
+  // The RECEIVER's refresh token (music/sources/spotify/receiver-auth.ts):
+  // minted for Spotify's own desktop client id, so librespot can be re-signed
+  // in without the operator whenever its credential cache is gone.
+  'SPOTIFY_RECEIVER_REFRESH_TOKEN',
 ];
 
 // An unquoted value carrying a `#`. dotenv reads that as the start of an inline

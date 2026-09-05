@@ -17,7 +17,6 @@ import type { MusicSource, Song, Album, Artist, CoverArt, AnalyzableRef } from '
 import { SpotifyClient, type SpotifyCredentials } from './client.js';
 import { SpotifyPoolCache, sample, type PoolConfig } from './pool.js';
 import { mapTrack, mapAlbum, mapArtist, mapPlaylist, unwrapItem, trackIdFromUri } from './map.js';
-import { writeLibrespotToken } from './token-file.js';
 
 export const SPOTIFY_SOURCE_ID = 'spotify';
 
@@ -45,10 +44,9 @@ export function spotifyClient(): SpotifyClient {
         try { await saveSecrets({ SPOTIFY_REFRESH_TOKEN: token }); }
         catch (err: any) { log(`[spotify] could not persist rotated refresh token: ${err?.message ?? err}`); }
       },
-      onAccessToken: async (token, expiresAt) => {
-        try { await writeLibrespotToken(token, expiresAt); }
-        catch (err: any) { log(`[spotify] could not write librespot token file: ${err?.message ?? err}`); }
-      },
+      // No onAccessToken: this app's tokens are NOT what the receiver logs in
+      // with (see receiver-auth.ts) — writing them to the token file is what
+      // produced INVALID_CREDENTIALS at the Connect handshake.
     });
   }
   return client;

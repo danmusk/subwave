@@ -15,7 +15,10 @@ import { requireAdmin } from '../../middleware/auth.js';
 import { saveSecrets } from '../../setup/secrets.js';
 import { SpotifyClient, SPOTIFY_SCOPES } from '../../music/sources/spotify/client.js';
 import { spotifyClient, spotifyCredentials, spotifyPool } from '../../music/sources/spotify/source.js';
-import { writeLibrespotToken } from '../../music/sources/spotify/token-file.js';
+import { writeLibrespotToken, readLibrespotToken, LIBRESPOT_CACHE_DIR } from '../../music/sources/spotify/token-file.js';
+import { beginReceiverAuth, takeReceiverVerifier, exchangeReceiverCode, parseReceiverRedirect, LIBRESPOT_REDIRECT_URI } from '../../music/sources/spotify/receiver-auth.js';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { queue } from '../../broadcast/queue.js';
 
 export const router = express.Router();
@@ -128,7 +131,6 @@ router.get('/settings/spotify/callback', async (req, res) => {
   try {
     const tok = await SpotifyClient.exchangeCode({ clientId: c.clientId, clientSecret: c.clientSecret, code, redirectUri: spotifyRedirectUri(req) });
     await saveSecrets({ SPOTIFY_REFRESH_TOKEN: tok.refreshToken });
-    await writeLibrespotToken(tok.accessToken, Date.now() + tok.expiresIn * 1000).catch(() => {});
     spotifyClient().resetToken();
     spotifyPool().invalidate();
     queue.log('scheduler', 'Spotify connected — refresh token stored');
@@ -173,6 +175,64 @@ router.post('/settings/spotify/disconnect', requireAdmin, async (req, res) => {
   spotifyClient().resetToken();
   spotifyPool().invalidate();
   res.json({ ok: true, ...spotifyStatus(req) });
+});
+
+// ── Receiver sign-in (librespot) — see music/sources/spotify/receiver-auth.ts ──
+
+export async function receiverStatus() {
+  const tok = await readLibrespotToken();
+  return {
+    tokenPresent: !!tok,
+    tokenExpiresAt: tok?.expiresAt ?? null,
+    tokenValid: !!tok && tok.expiresAt > Date.now(),
+    refreshTokenPresent: !!process.env.SPOTIFY_RECEIVER_REFRESH_TOKEN,
+    credentialsCached: existsSync(path.join(LIBRESPOT_CACHE_DIR, 'credentials.json')),
+    redirectUri: LIBRESPOT_REDIRECT_URI,
+  };
+}
+
+router.get('/settings/spotify/receiver', requireAdmin, async (_req, res) => {
+  res.json(await receiverStatus());
+});
+
+// Step 1: the authorize URL for Spotify's own client id (PKCE).
+router.get('/settings/spotify/receiver/auth', requireAdmin, (_req, res) => {
+  res.json({ ok: true, ...beginReceiverAuth() });
+});
+
+async function completeReceiverSignIn(code: string, state: string | null): Promise<{ ok: true } | { ok: false; error: string }> {
+  const verifier = takeReceiverVerifier(state);
+  if (!verifier) return { ok: false, error: 'no matching sign-in is pending — press "Sign the receiver in" again and use the fresh link' };
+  try {
+    const tok = await exchangeReceiverCode(code, verifier);
+    await writeLibrespotToken(tok.accessToken, tok.expiresAt);
+    if (tok.refreshToken) await saveSecrets({ SPOTIFY_RECEIVER_REFRESH_TOKEN: tok.refreshToken });
+    queue.log('scheduler', 'Spotify receiver signed in — librespot logs in on its next start (restart the mixer if it is looping)');
+    return { ok: true };
+  } catch (err: any) {
+    queue.log('error', `Spotify receiver sign-in failed: ${err?.message || err}`);
+    return { ok: false, error: err?.message || 'exchange failed' };
+  }
+}
+
+// Step 2a (automatic): Spotify redirects to http://127.0.0.1:5588/login — this
+// route, when docker-compose.spotify.yml publishes the controller there. Not
+// admin-gated (the redirect carries no header); the PKCE state is the gate.
+router.get('/login', async (req, res) => {
+  const { code, state, error } = req.query as Record<string, string | undefined>;
+  const site = (process.env.SITE_URL || '').trim().replace(/\/+$/, '');
+  const back = (q: string) => res.redirect(`${site}/admin/settings?section=music&receiver=${encodeURIComponent(q)}`);
+  if (error || !code) return back(`error:${error || 'no-code'}`);
+  const r = await completeReceiverSignIn(code, state ?? null);
+  return back(r.ok ? 'connected' : `error:${r.error}`);
+});
+
+// Step 2b (paste): the landing URL from the browser's address bar, or the code.
+router.post('/settings/spotify/receiver/code', requireAdmin, async (req, res) => {
+  const parsed = parseReceiverRedirect(String(req.body?.redirectUrl ?? req.body?.code ?? ''));
+  if (!parsed) return res.status(400).json({ ok: false, error: 'paste the full http://127.0.0.1:5588/login?code=… URL from the address bar' });
+  const r = await completeReceiverSignIn(parsed.code, parsed.state);
+  res.status(r.ok ? 200 : 400).json({ ...r, ...(await receiverStatus()) });
 });
 
 // Rebuild the pool now (after editing playlists) rather than waiting out the TTL.
