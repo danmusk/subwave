@@ -134,6 +134,7 @@ import {
   LIQ_JINGLE_RATIO_PATH,
   LIQ_OPUS_ENABLED_PATH,
   LIQ_STREAM_BITRATE_PATH,
+  LIQ_MUSIC_MODE_PATH,
   LIQ_STREAM_BUFFER_SECONDS_PATH,
   writeLiquidsoapSettings,
 } from './settings/liquidsoap.js';
@@ -1847,12 +1848,27 @@ export async function update(patch) {
   }
   if ('music' in patch) {
     const mu = parseSettingsPatchKey<Record<string, unknown>>('music', patch.music);
-    if (mu.source !== undefined) next.music.source = mu.source as string;
+    // A source switch changes how the mixer BUILDS its music chain (request
+    // URIs vs a live librespot feed) — liquidsoap_music_mode.txt, read once.
+    if (mu.source !== undefined && mu.source !== cur.music?.source) {
+      next.music.source = mu.source as string;
+      restart = true;
+    }
   }
   if ('spotify' in patch) {
     const sp = parseSettingsPatchKey<Record<string, any>>('spotify', patch.spotify);
-    if (sp.deviceName !== undefined) next.spotify.deviceName = sp.deviceName as string;
-    if (sp.bitrate !== undefined) next.spotify.bitrate = sp.bitrate as number;
+    // The receiver's name and bitrate are librespot launch flags
+    // (liquidsoap_spotify.txt), so like every other handoff file a change is a
+    // mixer restart — gated on a real change so an untouched pair never drags
+    // the mixer down.
+    if (sp.deviceName !== undefined && sp.deviceName !== cur.spotify?.deviceName) {
+      next.spotify.deviceName = sp.deviceName as string;
+      restart = true;
+    }
+    if (sp.bitrate !== undefined && sp.bitrate !== cur.spotify?.bitrate) {
+      next.spotify.bitrate = sp.bitrate as number;
+      restart = true;
+    }
     if (sp.seamLeadMs !== undefined) next.spotify.seamLeadMs = sp.seamLeadMs as number;
     if (sp.healthPollSec !== undefined) next.spotify.healthPollSec = sp.healthPollSec as number;
     if (sp.mismatch !== undefined) next.spotify.mismatch = sp.mismatch as string;
@@ -2333,7 +2349,8 @@ export async function ensureLiquidsoapSettingsFile() {
     !existsSync(LIQ_OPUS_ENABLED_PATH) ||
     !existsSync(LIQ_STREAM_BITRATE_PATH) ||
     !existsSync(LIQ_STREAM_BUFFER_SECONDS_PATH) ||
-    !existsSync(ICECAST_LISTENER_AUTH_PATH)
+    !existsSync(ICECAST_LISTENER_AUTH_PATH) ||
+    !existsSync(LIQ_MUSIC_MODE_PATH)
   ) {
     await writeLiquidsoapSettings(s);
   }

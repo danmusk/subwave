@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# librespot wrapper — the command Liquidsoap's input.external.rawaudio runs in
+# spotify mode (radio.liq). librespot is a headless Spotify Connect receiver; its
+# `pipe` backend writes raw stereo S16LE 44.1 kHz PCM to STDOUT, which Liquidsoap
+# reads as the music source. Everything this script prints goes to STDERR so the
+# PCM stream stays clean.
+#
+# Liquidsoap restarts the command when it exits (restart=true, and after
+# restart_delay_on_error when it exits non-zero), so this script does one run
+# and gets out of the way; the backoff is the mixer's.
+#
+# Auth (librespot ≥0.5, password login is gone): first run passes the access
+# token the controller wrote to state/spotify/token (streaming scope, written by
+# the admin "Connect Spotify" flow and refreshed hourly); librespot then caches
+# reusable credentials under state/spotify/cache and later runs need neither.
+#
+# Watchdog (from lounge/tuify's librespot supervision): an "Audio key response
+# timeout" followed by "Spirc shut down unexpectedly" or "Unable to read audio
+# file" is a session that reconnected internally but can no longer play — kill
+# it so the mixer's restart gives a clean login.
+set -u
+
+STATE_DIR="${SUBWAVE_STATE_DIR:-/var/sub-wave}"
+SP_DIR="$STATE_DIR/spotify"
+CACHE_DIR="$SP_DIR/cache"
+TOKEN_FILE="$SP_DIR/token"
+CFG_FILE="$STATE_DIR/liquidsoap_spotify.txt"
+EVENT_SCRIPT="${LIBRESPOT_EVENT_SCRIPT:-/app/spotify/librespot-event.sh}"
+BIN="${LIBRESPOT_BIN:-librespot}"
+
+log() { printf 'librespot-run: %s\n' "$*" >&2; }
+
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
+chmod 700 "$CACHE_DIR" 2>/dev/null || true
+
+# Handoff from settings.update() (settings/liquidsoap.ts): KEY=value lines.
+DEVICE_NAME=""
+BITRATE=320
+if [ -f "$CFG_FILE" ]; then
+    while IFS='=' read -r k v; do
+        case "$k" in
+            device_name) DEVICE_NAME="$v" ;;
+            bitrate) BITRATE="$v" ;;
+        esac
+    done < "$CFG_FILE"
+fi
+if [ -z "$DEVICE_NAME" ] && [ -f "$STATE_DIR/liquidsoap_station_name.txt" ]; then
+    DEVICE_NAME="$(head -n1 "$STATE_DIR/liquidsoap_station_name.txt")"
+fi
+[ -z "$DEVICE_NAME" ] && DEVICE_NAME="SUB/WAVE"
+case "$BITRATE" in 96|160|320) ;; *) BITRATE=320 ;; esac
+
+if ! command -v "$BIN" >/dev/null 2>&1; then
+    log "librespot binary not found ($BIN) — rebuild the broadcast image"
+    sleep 30
+    exit 2
+fi
+
+args=(
+    --name "$DEVICE_NAME"
+    --backend pipe
+    --format S16
+    --bitrate "$BITRATE"
+    --cache "$CACHE_DIR"
+    --disable-audio-cache
+    --initial-volume 100
+    --volume-ctrl fixed
+    --enable-volume-normalisation
+    --onevent "$EVENT_SCRIPT"
+)
+# --autoplay is deliberately NOT passed: the station picks every track.
+
+if [ ! -f "$CACHE_DIR/credentials.json" ]; then
+    if [ -f "$TOKEN_FILE" ]; then
+        tok="$(sed -n 1p "$TOKEN_FILE" | tr -d '\r')"
+        exp="$(sed -n 2p "$TOKEN_FILE" | tr -d '\r')"
+        now_ms="$(date +%s)000"
+        if [ -n "$tok" ] && [ "${exp:-0}" -gt "$now_ms" ] 2>/dev/null; then
+            args+=(--access-token "$tok")
+            log "first login with the controller's access token"
+        else
+            log "token file is stale or empty — waiting for the controller to refresh it (is the controller running and Spotify connected?)"
+            sleep 15
+            exit 3
+        fi
+    else
+        log "no cached credentials and no token file — connect Spotify in admin → Settings → Music source"
+        sleep 15
+        exit 3
+    fi
+fi
+
+log "starting: device \"$DEVICE_NAME\", ${BITRATE} kbps"
+rm -f "$SP_DIR/.audiokey-timeout"
+
+# stderr → log with a watchdog; stdout (PCM) passes straight through to Liquidsoap.
+"$BIN" "${args[@]}" 2> >(
+    while IFS= read -r line; do
+        printf '[librespot] %s\n' "$line" >&2
+        case "$line" in
+            *"Authenticated as"*) rm -f "$SP_DIR/.audiokey-timeout" ;;
+            *"Audio key response timeout"*) : > "$SP_DIR/.audiokey-timeout" ;;
+            *"Spirc shut down unexpectedly"*|*"Unable to read audio file"*)
+                if [ -e "$SP_DIR/.audiokey-timeout" ]; then
+                    log "broken session detected (audio key timeout + ${line%% *}) — killing for a clean restart"
+                    pkill -TERM -x "$(basename "$BIN")" 2>/dev/null || true
+                fi ;;
+        esac
+    done
+) &
+pid=$!
+trap 'kill -TERM "$pid" 2>/dev/null' TERM INT
+wait "$pid"
+rc=$?
+rm -f "$SP_DIR/.audiokey-timeout"
+log "exited with status $rc"
+exit "$rc"

@@ -63,6 +63,9 @@ starve_tmp_dir = ensure_tmp_dir("#{state_dir}/tmp/starve")
 # heavy-duck segment and a talk-over link land together.
 voice_tmp_dir = ensure_tmp_dir("#{state_dir}/tmp/voice")
 intro_tmp_dir = ensure_tmp_dir("#{state_dir}/tmp/intro")
+# Spotify mode's audio marker (spotify-audio.json, written from blank.detect's
+# handlers). Its own dir like every other writer.
+spotify_tmp_dir = ensure_tmp_dir("#{state_dir}/tmp/spotify")
 
 # MUSIC STARVE GUARD (#1300 bug 7) — the latch only; the tick that drives it is
 # registered far below, after idle_mode exists. Declared up here because the
@@ -154,6 +157,18 @@ if file.exists("#{state_dir}/liquidsoap_crossfade.txt") then
   raw = string.trim(file.contents("#{state_dir}/liquidsoap_crossfade.txt"))
   v = float_of_string(default=10.0, raw)
   if v >= 0.0 then crossfade_duration := v end
+end
+
+# MUSIC MODE (settings.music.source, written as liquidsoap_music_mode.txt):
+# "files" (default, and what an absent file means — byte-identical to every
+# station that predates it) plays request URIs from dj_queue/auto.m3u;
+# "spotify" plays a LIVE PCM feed from librespot (see the MAIN MUSIC SOURCE
+# block). Read once, like everything above: switching sources is a mixer
+# restart, the same way switching stations is.
+spotify_mode = ref(false)
+if file.exists("#{state_dir}/liquidsoap_music_mode.txt") then
+  raw = string.trim(file.contents("#{state_dir}/liquidsoap_music_mode.txt"))
+  spotify_mode := (raw == "spotify")
 end
 
 # Duck depths. `p` is the fraction of the music LEFT UP under a voice channel,
@@ -441,11 +456,129 @@ auto_playlist = playlist(
 # MAIN MUSIC SOURCE — queue takes priority, falls back to autonomous
 # ---------------------------------------------------------------------------
 
-music = fallback(
-  id="music",
-  track_sensitive=true,
-  [dj_queue, auto_playlist]
-)
+# SPOTIFY MODE — the music is a live PCM feed from librespot (a Spotify Connect
+# receiver in this container), read from the command's stdout by
+# input.external.rawaudio, which also restarts it when it exits. Three facts
+# make the rest of the chain work unchanged (verified against the 2.4.5 source,
+# see docs/internals/broadcast.md):
+#   * the input is FALLIBLE (not ready until `buffer` seconds are held), so a
+#     dead or logged-out librespot starves `music` and the music_safety guard
+#     below airs the emergency loop exactly as it does for an empty dj_queue;
+#   * the controller inserts each track's metadata WITH a track mark
+#     (`spotify_track` below → insert_metadata(new_track=true)), so music_meta's
+#     on_metadata, the jingle rotate and the jingle_now fallback all see real
+#     track boundaries — no downstream change;
+#   * when a downstream switch stops pulling (a jingle at one of those
+#     boundaries) the buffer fills past `max`, the input stops reading, librespot
+#     blocks on its write and RESUMES from the same sample afterwards — no lost
+#     audio, no accumulated lag.
+# `cross` is bypassed in this mode (see there): it pulls `duration` seconds
+# ahead, which a live feed cannot supply.
+# dj_queue stays in front so beds and rendered clips (file requests) still play.
+# The `gap` leg is a controller-DECLARED intentional silence (between tracks,
+# an operator pause): gated off by default so that only silence the controller
+# vouches for is aired rather than the emergency loop — every other starvation
+# still reaches the guard.
+spotify_gap = ref(false)
+
+music =
+  if spotify_mode() then
+    spotify_raw = input.external.rawaudio(
+      id="spotify_in",
+      buffer=2.0,
+      max=10.0,
+      restart=true,
+      restart_on_error=true,
+      restart_delay_on_error=3.0,
+      "/app/spotify/librespot-run.sh"
+    )
+
+    # "connected but silent" is the one failure the fallible input cannot show
+    # (a stopped receiver still pads silence). Passive per-frame RMS, only
+    # executed while pulled — nothing here can busy-loop (#660 was blank.skip's
+    # reaction, not detection). Handlers must not raise (thread rule).
+    def write_spotify_audio_marker(state) =
+      try
+        file.write(
+          data=json.stringify(compact=true, {state = state, at = time()}),
+          atomic=true,
+          temp_dir=spotify_tmp_dir,
+          "#{state_dir}/spotify-audio.json"
+        )
+      catch err do
+        log(label="subwave", "spotify-audio marker write failed (#{err})")
+      end
+    end
+    spotify_in = blank.detect(
+      max_blank=8.0,
+      min_noise=0.5,
+      threshold=-45.0,
+      track_sensitive=false,
+      spotify_raw
+    )
+    spotify_in.on_blank(synchronous=false, {write_spotify_audio_marker("silent")})
+    spotify_in.on_noise(synchronous=false, {write_spotify_audio_marker("audio")})
+
+    # Seconds of audio the input holds ahead of playout (its `buffered` method
+    # reports per field; a live feed only has audio).
+    def spotify_buffered() =
+      list.assoc(default=0.0, "audio", spotify_raw.buffered())
+    end
+
+    # Controller → mixer: "track X just started" as JSON metadata (title,
+    # artist, album, subsonic_id — the same keys annotate: carries in file
+    # mode). The mark is delayed by the input's buffered length so it lands on
+    # the audio it describes rather than `buffer` seconds ahead of it.
+    server.register(
+      "spotify_track",
+      description="Insert a track boundary + metadata on the Spotify feed (JSON object)",
+      usage="spotify_track {\"title\":...,\"artist\":...,\"subsonic_id\":...}",
+      fun(arg) -> begin
+        try
+          m = metadata.json.parse(string.trim(arg))
+          lag = spotify_buffered()
+          thread.run(delay=lag, fun () -> begin
+            try
+              spotify_raw.insert_metadata(new_track=true, m)
+            catch err do
+              log(label="subwave", "spotify_track insert failed (#{err})")
+            end
+          end)
+          "OK lag=#{lag}"
+        catch err do
+          "ERR #{err}"
+        end
+      end
+    )
+    server.register(
+      "spotify_gap",
+      description="Declare an intentional gap on the Spotify feed: on | off",
+      usage="spotify_gap on|off",
+      fun(arg) -> begin
+        spotify_gap := (string.trim(arg) == "on")
+        "OK gap=#{spotify_gap()}"
+      end
+    )
+    server.register(
+      "spotify_status",
+      description="Spotify feed state: ready / buffered seconds / gap",
+      usage="spotify_status",
+      fun(_) -> "ready=#{source.is_ready(spotify_raw)} buffer=#{spotify_buffered()} gap=#{spotify_gap()}"
+    )
+
+    gap = source.available(blank(id="spotify_gap"), {spotify_gap()})
+    fallback(
+      id="music",
+      track_sensitive=true,
+      [dj_queue, (spotify_in : source), gap]
+    )
+  else
+    fallback(
+      id="music",
+      track_sensitive=true,
+      [dj_queue, auto_playlist]
+    )
+  end
 
 # ---------------------------------------------------------------------------
 # HARD TRACK-LENGTH CAP (#447) — the controller stamps liq_cue_out on autonomous
@@ -1153,12 +1286,22 @@ music = amplify(override="liq_amplify", 1., music)
 # stamps every track it annotates (subsonic.getAnnotatedUri falls back to the
 # operator's crossfade setting) and the lingering value is always the intended
 # one.
-music = cross(
-  duration=crossfade_duration(),
-  persist_override=true,
-  dj_transition,
-  music
-)
+# Spotify mode bypasses the cross: `cross` fills `duration` seconds of
+# look-ahead the moment its source is ready, and a live feed can only supply
+# what it has buffered — the underrun reads as end-of-track and fires
+# dj_transition on continuous audio, over and over. Tracks meet at a hard cut
+# there (the DJ link ducks the incoming intro exactly as in file mode).
+music =
+  if spotify_mode() then
+    music
+  else
+    cross(
+      duration=crossfade_duration(),
+      persist_override=true,
+      dj_transition,
+      music
+    )
+  end
 
 # ---------------------------------------------------------------------------
 # DJ VOICE — TTS clips dropped as paths into say.txt / intro.txt.

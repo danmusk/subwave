@@ -41,6 +41,25 @@ const LIQ_STATION_NAME_PATH = `${STATE_DIR}/liquidsoap_station_name.txt`;
 // entrypoint render the per-mount <authentication type="url"> blocks into
 // icecast.xml on the next broadcast restart.
 export const ICECAST_LISTENER_AUTH_PATH = `${STATE_DIR}/icecast_listener_auth.txt`;
+// Which MUSIC SOURCE the mixer builds: 'files' (dj_queue + auto.m3u request
+// URIs — the default, and what an absent file means) or 'spotify' (a live PCM
+// feed from librespot). settings.music.source, read once at mixer startup.
+export const LIQ_MUSIC_MODE_PATH = `${STATE_DIR}/liquidsoap_music_mode.txt`;
+// Read by docker/spotify/librespot-run.sh (not radio.liq): KEY=value lines
+// for the receiver — its Spotify Connect device name and bitrate.
+export const LIQ_SPOTIFY_PATH = `${STATE_DIR}/liquidsoap_spotify.txt`;
+
+export function musicModeFor(s: { music?: { source?: string } } | null | undefined): 'files' | 'spotify' {
+  return s?.music?.source === 'spotify' ? 'spotify' : 'files';
+}
+
+export function spotifyHandoffFor(s: any): string {
+  // One line per key; the wrapper splits on the first '='. Newlines and '='
+  // in a device name would corrupt the file, so they are folded to spaces.
+  const name = String(s?.spotify?.deviceName || s?.station || DEFAULTS.station).replace(/[\r\n=]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const bitrate = [96, 160, 320].includes(Number(s?.spotify?.bitrate)) ? Number(s.spotify.bitrate) : 320;
+  return `device_name=${name}\nbitrate=${bitrate}\n`;
+}
 
 export async function writeLiquidsoapSettings(s) {
   await writeFile(LIQ_JINGLE_RATIO_PATH, String(s.jingleRatio));
@@ -66,5 +85,7 @@ export async function writeLiquidsoapSettings(s) {
     ICECAST_LISTENER_AUTH_PATH,
     s.privacy?.listenerAuth ? 'true' : 'false',
   );
+  await writeFile(LIQ_MUSIC_MODE_PATH, musicModeFor(s));
+  await writeFile(LIQ_SPOTIFY_PATH, spotifyHandoffFor(s));
 }
 
