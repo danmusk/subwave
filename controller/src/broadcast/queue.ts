@@ -45,6 +45,7 @@ import { currentTalkAir } from './talk-air.js';
 import * as webhooks from './webhooks.js';
 import * as scrobble from './scrobble.js';
 import * as liquidsoapControl from './liquidsoap-control.js';
+import { liveTransport } from './queue/transport.js';
 import {
   drainAction,
   introRenderBudgetSec,
@@ -1241,6 +1242,21 @@ class Queue {
         // while we were awaiting the TTS render above — don't hand a removed
         // track to Liquidsoap.
         if (!this.upcoming.includes(item)) continue;
+
+        // A live-transport music source (Spotify): there is no request URI to
+        // write. Hand the item to the transport, which starts it at the seam,
+        // confirms it began and tells the mixer — from where now-playing.json,
+        // onTrackStarted and airIntro run exactly as they do for a file. The
+        // intro WAV above is already rendered for it. Everything below is
+        // file/URL work (mix stamps, loudness, beds, cue points, clip URIs) and
+        // does not apply; `sent` keeps its meaning of "handed over".
+        const live = liveTransport();
+        if (live) {
+          await live.handoff(item);
+          item.sent = true;
+          this.persist();
+          continue;
+        }
 
         // DJ-mode mixing (features 1 & 2): shape the transition INTO this track
         // from its tempo/harmonic compatibility with the track it follows. The

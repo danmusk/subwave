@@ -15,6 +15,7 @@ import * as session from '../broadcast/session.js';
 import { getStreamStatus } from '../broadcast/listeners.js';
 import { isIdle } from '../broadcast/stream-idle.js';
 import { currentStarve } from '../broadcast/music-starve.js';
+import { liveTransport } from '../broadcast/queue/transport.js';
 import { getSetupStatusSync } from '../setup/firstRun.js';
 import { getStationTimezone } from '../time.js';
 import { listThemesAnnotated, DEFAULT_THEME_ID } from '../themes.js';
@@ -567,6 +568,10 @@ router.get('/state', (req, res) => {
     // streamIdle, which is a deliberate pause for an empty room.
     musicStarved: starve.starved,
     musicStarvedSince: starve.since,
+    // The live playback transport's state when the active music source has
+    // one (Spotify): what the receiver is playing / awaiting / holding, or null
+    // in file mode. Operator surface — live edge, like everything else here.
+    transport: liveTransport()?.status() ?? null,
     theme: { active: activeThemeId },
     // Listener-player UI settings ride along with /state like the theme does,
     // so the player can flip them live on the next poll. Defaults off if

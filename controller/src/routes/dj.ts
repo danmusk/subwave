@@ -12,6 +12,7 @@ import { zipUpload } from '../middleware/upload.js';
 import { queue } from '../broadcast/queue.js';
 import * as dj from '../llm/dj.js';
 import * as subsonic from '../music/source.js';
+import { liveTransport } from '../broadcast/queue/transport.js';
 import * as library from '../music/library.js';
 import * as settings from '../settings.js';
 import { runStationId, runHourlyCheck, runLink, runBanter, runProgrammeIntro, runProgrammeFeature, runProgrammeOutro, refreshAutoPlaylist, syncSkillCrons } from '../broadcast/scheduler.js';
@@ -845,6 +846,15 @@ router.post('/dj/auto-link', requireAdmin, (req, res) => {
 // ---------------------------------------------------------------------------
 router.post('/dj/skip', requireAdmin, async (req, res) => {
   try {
+    // Live transport (Spotify): the mixer's `skip` would only mark a boundary
+    // on a feed that keeps playing the same song. The transport ends the track
+    // by commanding the next one — the same commit-first intent, one hop up.
+    const live = liveTransport();
+    if (live) {
+      const ok = await live.skip();
+      queue.log('scheduler', ok ? 'track skipped by operator (transport)' : 'skip refused — the transport is mid-command, try again');
+      return res.json({ ok, pending: false, committed: ok });
+    }
     const prep = await queue.commitBeforeSkip();
     await skipTrack();
     if (prep.pending && !prep.committed) {

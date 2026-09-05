@@ -132,6 +132,10 @@ export async function refreshAutoPlaylistOnShowChange(reason: string): Promise<b
 }
 
 async function refreshAutoPlaylistInner() {
+  // A live-transport source (Spotify) has no request URIs to write into
+  // auto.m3u — the transport's own pool fallback plays that role. Building the
+  // file would only ask the facade for a URI it refuses to make.
+  if (subsonic.activeCapabilities().hasLiveTransport) return;
   const ctx = await getFullContext();
   const mood = ctx.dominantMood;
   // Match the auto-DJ picker's window (dj-agent.pickViaAgent) — the same
