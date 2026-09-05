@@ -649,7 +649,8 @@ export const DEFAULTS = {
   // (state/secrets.env), never here. `pool` is the station's library on
   // Spotify: the operator's playlists (empty = every playlist the account
   // owns/follows) plus saved tracks/albums. `deviceName` is the Spotify Connect
-  // receiver librespot registers as ('' = the station name). `seamLeadMs` is how
+  // receiver librespot registers as ('' = the constant "SUB/WAVE" — never the
+  // station name, which can change while the receiver runs). `seamLeadMs` is how
   // early the transport commands the next track before the current one ends;
   // `mismatch` is what to do when playback was moved off the station device
   // (reclaim = transfer back, follow = adopt what is playing).

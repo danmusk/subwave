@@ -36,7 +36,7 @@ test('a default station writes mode "files" and a sane librespot handoff', async
   await coldLoad({ station: 'Night Signal' });
   await liq.writeLiquidsoapSettings(settings.get());
   assert.equal(read(liq.LIQ_MUSIC_MODE_PATH), 'files');
-  assert.equal(read(liq.LIQ_SPOTIFY_PATH), 'device_name=Night Signal\nbitrate=320\n', 'device name falls back to the station name');
+  assert.equal(read(liq.LIQ_SPOTIFY_PATH), 'device_name=SUB/WAVE\nbitrate=320\n', 'the receiver name is a CONSTANT, never the station name — a rename must not orphan a running receiver');
 });
 
 test('selecting spotify writes mode "spotify" and the configured receiver flags', async () => {
@@ -51,7 +51,7 @@ test('pure helpers agree with the files', () => {
   assert.equal(liq.musicModeFor(undefined), 'files');
   assert.equal(liq.musicModeFor({ music: { source: 'subsonic' } }), 'files');
   assert.equal(liq.musicModeFor({ music: { source: 'spotify' } }), 'spotify');
-  assert.equal(liq.spotifyHandoffFor({ spotify: { bitrate: 999 }, station: 'X' }), 'device_name=X\nbitrate=320\n', 'an invalid bitrate falls back');
+  assert.equal(liq.spotifyHandoffFor({ spotify: { bitrate: 999 }, station: 'X' }), 'device_name=SUB/WAVE\nbitrate=320\n', 'an invalid bitrate falls back; the station name is never used');
 });
 
 test('a source switch requires a mixer restart; an unrelated save does not', async () => {

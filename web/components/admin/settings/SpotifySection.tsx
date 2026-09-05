@@ -259,7 +259,7 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
         <div className="grid gap-4 md:grid-cols-2">
           <div>
             <Label htmlFor="sp-device">Device name</Label>
-            <Input id="sp-device" value={deviceName} onChange={(e) => setDeviceName(e.target.value)} placeholder="(station name)" disabled={busy}
+            <Input id="sp-device" value={deviceName} onChange={(e) => setDeviceName(e.target.value)} placeholder="SUB/WAVE" disabled={busy}
               onBlur={() => { if (deviceName !== (sp?.deviceName ?? '')) saveSettings({ spotify: { deviceName } }); }} />
             <div className="field-hint">How the receiver appears in Spotify apps. Changing it needs a mixer restart.</div>
           </div>

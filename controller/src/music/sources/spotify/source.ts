@@ -307,13 +307,20 @@ async function getTopSongs(artistName: any, { count = 10 } = {}): Promise<Song[]
   return withPoolGenres(keep((r?.tracks ?? []).map((t: any) => mapTrack(t)))).slice(0, count);
 }
 
+// Memoised: the admin's shows/blocklist tabs ask /dj/playlists on every render
+// and each answer used to be a fresh paginated walk — 429s within a minute on
+// the first real run. Five minutes is the pool's own cadence.
+let playlistsMemo: { at: number; value: any[] } | null = null;
+const PLAYLISTS_MEMO_MS = 5 * 60 * 1000;
 async function getPlaylists() {
+  if (playlistsMemo && Date.now() - playlistsMemo.at < PLAYLISTS_MEMO_MS) return playlistsMemo.value;
   const c = spotifyClient();
   const out: any[] = [];
   for await (const p of c.paginate<any>((o) => c.getMyPlaylists({ offset: o, limit: 50 }))) {
     const m = mapPlaylist(p);
     if (m) out.push(m);
   }
+  playlistsMemo = { at: Date.now(), value: out };
   return out;
 }
 

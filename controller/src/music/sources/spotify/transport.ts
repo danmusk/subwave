@@ -63,6 +63,10 @@ const MIN_COMMAND_GAP_MS = 3_000;
 const BASE_BACKOFF_MS = 30_000;
 const MAX_BACKOFF_MS = 10 * 60_000;
 const SILENT_ENDS_TRACK_MS = 15_000;
+// An intentional gap that outlives this is not intentional any more (the next
+// track failed to start): drop the gate so the dead-air guard airs the
+// emergency loop instead of the silence measured on the first run's hold.
+const GAP_MAX_MS = 20_000;
 
 interface Expected {
   id: string;
@@ -92,6 +96,7 @@ export class SpotifyTransport implements PlaybackTransport {
   private lastCommandAt: number | null = null;
   private reclaimAttempts = 0;
   private gapOn = false;
+  private gapSince = 0;
   private busy = false;
   private timer: NodeJS.Timeout | null = null;
   private lastLog = new Map<string, number>();
@@ -213,6 +218,11 @@ export class SpotifyTransport implements PlaybackTransport {
         }
       } else {
         this.silentSince = null;
+      }
+      // 1d. A gap declared long ago with nothing started is dead air, not a seam.
+      if (this.gapOn && !this.expected && this.now() - this.gapSince > GAP_MAX_MS) {
+        this.deps.log('scheduler', 'Spotify transport: nothing started within the gap window — handing the air to the dead-air guard');
+        await this.setGap(false);
       }
       // 2. Decide about the seam — unless a failure backoff holds it.
       const now = this.now();
@@ -377,6 +387,7 @@ export class SpotifyTransport implements PlaybackTransport {
   private async setGap(on: boolean): Promise<void> {
     if (this.gapOn === on) return;
     this.gapOn = on;
+    this.gapSince = on ? this.now() : 0;
     await this.deps.mixerGap(on);
   }
 
@@ -399,13 +410,16 @@ export async function startSpotifyTransportIfActive(): Promise<SpotifyTransport 
   const { setLiveTransport } = await import('../../../broadcast/queue/transport.js');
   const liq = await import('../../../broadcast/liquidsoap-control.js');
   const markers = await import('../../../broadcast/spotify-player.js');
-  const settings = await import('../../../settings.js');
+  const { SPOTIFY_DEFAULT_DEVICE_NAME } = await import('../../../settings/liquidsoap.js');
   const { spotifyClient, spotifySettings, spotifySource } = await import('./source.js');
   const { SpotifyPlaybackController } = await import('./playback.js');
 
   const controller = new SpotifyPlaybackController({
     client: spotifyClient,
-    deviceName: () => spotifySettings().deviceName || (settings.get() as any).station || 'SUB/WAVE',
+    // The same rule as the handoff file's (settings/liquidsoap.ts): a constant
+    // default, so the name the controller looks for is the name the receiver
+    // booted with.
+    deviceName: () => spotifySettings().deviceName || SPOTIFY_DEFAULT_DEVICE_NAME,
     log: (l) => queue.log('scheduler', l),
   });
   instance = new SpotifyTransport({

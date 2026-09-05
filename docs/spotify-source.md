@@ -69,9 +69,11 @@ track ids where a Navidrome library holds Navidrome ids.
    credentials on its next start and the controller renews the token from its
    refresh token, so this is a one-time step.
 7. Restart the mixer if you have not yet. Within a few seconds the receiver
-   (named after the station, or `spotify.deviceName`) appears in your Spotify
-   apps' device list, and the station starts playing from the pool. The DJ's
-   picks follow.
+   (named `SUB/WAVE`, or `spotify.deviceName`) appears in your Spotify apps'
+   device list, and the station starts playing from the pool. The DJ's picks
+   follow. The receiver's name is deliberately not the station name: the
+   receiver keeps the name it booted with, and renaming the station must not
+   orphan it.
 
 Optional: run the tagger (*Library → Tagging*) over the pool. Text tagging
 needs no audio, and it is what gives the picker mood tools on Spotify.

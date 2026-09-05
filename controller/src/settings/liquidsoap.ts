@@ -49,6 +49,8 @@ export const LIQ_MUSIC_MODE_PATH = `${STATE_DIR}/liquidsoap_music_mode.txt`;
 // for the receiver — its Spotify Connect device name and bitrate.
 export const LIQ_SPOTIFY_PATH = `${STATE_DIR}/liquidsoap_spotify.txt`;
 
+export const SPOTIFY_DEFAULT_DEVICE_NAME = 'SUB/WAVE';
+
 export function musicModeFor(s: { music?: { source?: string } } | null | undefined): 'files' | 'spotify' {
   return s?.music?.source === 'spotify' ? 'spotify' : 'files';
 }
@@ -56,7 +58,13 @@ export function musicModeFor(s: { music?: { source?: string } } | null | undefin
 export function spotifyHandoffFor(s: any): string {
   // One line per key; the wrapper splits on the first '='. Newlines and '='
   // in a device name would corrupt the file, so they are folded to spaces.
-  const name = String(s?.spotify?.deviceName || s?.station || DEFAULTS.station).replace(/[\r\n=]+/g, ' ').replace(/\s+/g, ' ').trim();
+  // A CONSTANT default, deliberately not the station name: the receiver keeps
+  // the name it booted with until the next mixer restart, while the controller
+  // resolves the device by name live — so a station rename with the old
+  // station-name default orphaned a running receiver ("receiver not found" on
+  // every play; measured on the first real run). Operators rename it via
+  // spotify.deviceName, which is a launch flag and flags the restart.
+  const name = String(s?.spotify?.deviceName || SPOTIFY_DEFAULT_DEVICE_NAME).replace(/[\r\n=]+/g, ' ').replace(/\s+/g, ' ').trim();
   const bitrate = [96, 160, 320].includes(Number(s?.spotify?.bitrate)) ? Number(s.spotify.bitrate) : 320;
   return `device_name=${name}\nbitrate=${bitrate}\n`;
 }

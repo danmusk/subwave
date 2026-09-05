@@ -61,9 +61,7 @@ if [ -f "$CFG_FILE" ]; then
         esac
     done < "$CFG_FILE"
 fi
-if [ -z "$DEVICE_NAME" ] && [ -f "$STATE_DIR/liquidsoap_station_name.txt" ]; then
-    DEVICE_NAME="$(head -n1 "$STATE_DIR/liquidsoap_station_name.txt")"
-fi
+# Constant default — NOT the station name; see settings/liquidsoap.ts.
 [ -z "$DEVICE_NAME" ] && DEVICE_NAME="SUB/WAVE"
 case "$BITRATE" in 96|160|320) ;; *) BITRATE=320 ;; esac
 
