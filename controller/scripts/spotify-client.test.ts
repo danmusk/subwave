@@ -120,6 +120,52 @@ test('one 429 closes the gate for EVERY other caller — a background call then 
   assert.equal(c.rateLimitedForMs(), 0);
 });
 
+// The regression this lane exists for: with only two lanes, a 1800s window made
+// getDevices() throw before the network, play() resolves the device before every
+// command, and the station went silent for the full half hour.
+test('a CRITICAL call reaches the network while the gate is closed; background still does not', async () => {
+  const { fetchImpl, calls } = fakeFetch([
+    tokenOk(),
+    { status: 429, headers: { 'retry-after': '1800' }, body: { error: { message: 'API rate limit exceeded' } } },
+    { status: 200, body: { devices: [{ id: 'D1', name: 'SUB/WAVE' }] } },
+    { status: 204 },
+  ]);
+  // Fixed clock: rateLimitedForMs() decays in real time, so an exact assertion
+  // against a wall clock is a flake waiting to happen.
+  const now = 1_000_000;
+  const c = new SpotifyClient({ fetch: fetchImpl, credentials: creds, sleep: noSleep, now: () => now });
+
+  // Close the gate with a background failure, as the genre fill does.
+  await assert.rejects(c.getArtist('A1', { background: true }), (e: any) => e.status === 429);
+  assert.equal(c.rateLimitedForMs(), 1_800_000);
+  const spent = calls.length;
+
+  // Enrichment stays down…
+  await assert.rejects(c.getArtist('A2', { background: true }), (e: any) => e instanceof SpotifyRateLimitError);
+  assert.equal(calls.length, spent, 'background sent nothing');
+
+  // …while the player calls go through, which is what keeps music on air.
+  const devices: any = await c.getDevices();
+  assert.equal(devices.devices[0].id, 'D1');
+  await c.play({ deviceId: 'D1', uris: ['spotify:track:abc'] });
+  assert.equal(calls.length, spent + 2, 'both player calls reached the network');
+  assert.ok(calls[spent].url.includes('/me/player/devices'));
+  assert.equal(c.rateLimitedForMs(), 1_800_000, 'and the window still stands for everyone else');
+});
+
+test('a critical call is not spaced by the background gap', async () => {
+  const { fetchImpl } = fakeFetch([tokenOk(), { status: 204 }, { status: 204 }, { status: 204 }]);
+  const slept: number[] = [];
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, backgroundGapMs: 500,
+    sleep: async (ms) => { slept.push(ms); },
+  });
+  await c.pause('D1');
+  await c.pause('D1');
+  await c.pause('D1');
+  assert.deepEqual(slept, [], 'three player commands, no spacing — the transport owns their pacing');
+});
+
 test('a foreground call waits out a SHORT window; background never waits', async () => {
   const { fetchImpl, calls } = fakeFetch([
     tokenOk(),

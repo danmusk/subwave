@@ -410,16 +410,13 @@ export async function startSpotifyTransportIfActive(): Promise<SpotifyTransport 
   const { setLiveTransport } = await import('../../../broadcast/queue/transport.js');
   const liq = await import('../../../broadcast/liquidsoap-control.js');
   const markers = await import('../../../broadcast/spotify-player.js');
-  const { SPOTIFY_DEFAULT_DEVICE_NAME } = await import('../../../settings/liquidsoap.js');
-  const { spotifyClient, spotifySettings, spotifySource } = await import('./source.js');
-  const { readLibrespotToken, writeLibrespotToken, readReceiverDeviceName } = await import('./token-file.js');
+  const { spotifyClient, spotifySettings, spotifySource, receiverDeviceName } = await import('./source.js');
+  const { readLibrespotToken, writeLibrespotToken } = await import('./token-file.js');
   const { SpotifyPlaybackController } = await import('./playback.js');
 
   const controller = new SpotifyPlaybackController({
     client: spotifyClient,
-    // The name the RUNNING receiver registered with (written by its wrapper at
-    // launch) beats the settings: the settings describe the NEXT boot.
-    deviceName: () => readReceiverDeviceName() || spotifySettings().deviceName || SPOTIFY_DEFAULT_DEVICE_NAME,
+    deviceName: receiverDeviceName,
     log: (l) => queue.log('scheduler', l),
   });
   instance = new SpotifyTransport({

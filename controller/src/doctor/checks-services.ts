@@ -20,7 +20,8 @@ import {
   activeModelLabel,
 } from '../llm/provider.js';
 import { recentCalls } from '../llm/log.js';
-import { spotifyPool, spotifyClient } from '../music/sources/spotify/source.js';
+import { spotifyPool, spotifyClient, receiverDeviceName } from '../music/sources/spotify/source.js';
+import { receiverStatus } from '../routes/settings/spotify.js';
 import type { Finding, StationSettings } from './types.js';
 import { classifyModel, isSchemaFailure } from './util.js';
 
@@ -60,6 +61,57 @@ function spotifyPoolFinding(): Finding[] {
     }];
   }
   return [{ label: 'spotify pool', status: 'ok', detail: summary }];
+}
+
+// Is the Spotify Connect receiver (librespot, in the broadcast container)
+// actually there? Nothing checked this before, so BOTH other spotify findings
+// went green with a completely dead receiver — the station on its emergency
+// loop, the doctor reporting connectivity ok and a full pool.
+//
+// Three states an operator has to tell apart, only the first of which was
+// visible anywhere: not signed in, signed in but not running, and running under
+// a name the controller is not looking for. The last two are why this reads the
+// live device list rather than trusting `credentialsCached`, which says "signed
+// in" whether or not any process exists.
+async function spotifyReceiverFinding(): Promise<Finding[]> {
+  const label = 'spotify receiver';
+  // Where the truth is. Liquidsoap owns the wrapper's stderr and never forwards
+  // it, so this file is the only record of WHY — and an empty one is itself a
+  // diagnosis: the image has no librespot to run.
+  const logHint = 'Why: state/logs/librespot.log in the broadcast container. An EMPTY log there means the image has no librespot — `docker compose build broadcast` (the compose file also names a published upstream image, which does not carry it).';
+  let rx: Awaited<ReturnType<typeof receiverStatus>>;
+  try {
+    rx = await receiverStatus();
+  } catch (err: any) {
+    return [{ label, status: 'warn', detail: `could not read the receiver's state: ${err?.message ?? err}` }];
+  }
+
+  if (!rx.credentialsCached && !rx.tokenValid) {
+    return [{
+      label,
+      status: 'fail',
+      detail: rx.tokenPresent ? 'not signed in — its login token has expired' : 'not signed in',
+      hint: 'Settings → Music source → Playback → Sign the receiver in, then restart the mixer. This is a SECOND login, separate from Connect Spotify: librespot authenticates as Spotify\'s own desktop client and refuses a Developer-app token.',
+    }];
+  }
+
+  // Signed in on paper. The device list is the only thing that proves a process.
+  try {
+    const devices: any = await spotifyClient().getDevices();
+    const list: any[] = Array.isArray(devices?.devices) ? devices.devices : [];
+    const want = receiverDeviceName().trim().toLowerCase();
+    const hit = list.find((d) => String(d?.name ?? '').trim().toLowerCase() === want);
+    if (hit) return [{ label, status: 'ok', detail: `"${hit.name}" is registered with Spotify` }];
+    return [{
+      label,
+      status: 'fail',
+      detail: `signed in, but "${receiverDeviceName()}" is not among the account's devices (${list.map((d) => d?.name).filter(Boolean).join(', ') || 'none'})`,
+      hint: `The receiver is not running, or is registered under another name. ${logHint}`,
+    }];
+  } catch (err: any) {
+    // A rate-limited or unreachable device list says nothing about the receiver.
+    return [{ label, status: 'warn', detail: `signed in; could not check the device list: ${err?.message ?? err}` }];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +266,12 @@ export async function checkNavidrome(): Promise<Finding[]> {
     // /me probe above keeps passing while every catalog call 403s, which is
     // exactly how a station ran for hours on the dead-air guard with a green
     // doctor. Judge the pool separately.
-    if (subsonic.activeSourceId() === 'spotify') out.push(...spotifyPoolFinding());
+    if (subsonic.activeSourceId() === 'spotify') {
+      out.push(...spotifyPoolFinding());
+      // "There is music to play" and "something can play it" are also different
+      // findings — a dead receiver leaves both of the others green.
+      out.push(...(await spotifyReceiverFinding()));
+    }
     return out;
   }
 

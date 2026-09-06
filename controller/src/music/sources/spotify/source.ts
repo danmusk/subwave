@@ -22,6 +22,8 @@ import type { MusicSource, Song, Album, Artist, CoverArt, AnalyzableRef } from '
 import { SpotifyClient, SPOTIFY_PAGE_MAX, SPOTIFY_SEARCH_MAX, type SpotifyCredentials } from './client.js';
 import { SpotifyPoolCache, sample, type PoolConfig } from './pool.js';
 import { mapTrack, mapAlbum, mapArtist, mapPlaylist, unwrapItem, trackIdFromUri } from './map.js';
+import { readReceiverDeviceName } from './token-file.js';
+import { SPOTIFY_DEFAULT_DEVICE_NAME } from '../../../settings/liquidsoap.js';
 
 export const SPOTIFY_SOURCE_ID = 'spotify';
 
@@ -59,6 +61,16 @@ export function spotifyClient(): SpotifyClient {
 
 export function spotifySettings(): any {
   return (settings.get() as any)?.spotify ?? {};
+}
+
+// The Connect name to resolve the receiver by. The name the RUNNING receiver
+// registered with (written by its wrapper at launch) beats the settings, which
+// describe the NEXT boot — a station rename with the old station-name default
+// orphaned a live receiver once already. One copy, shared by the transport's
+// playback controller and the doctor: a second composition of this would drift
+// and each would report a different device as missing.
+export function receiverDeviceName(): string {
+  return readReceiverDeviceName() || spotifySettings().deviceName || SPOTIFY_DEFAULT_DEVICE_NAME;
 }
 
 function poolConfig(): PoolConfig {

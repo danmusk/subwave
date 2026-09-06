@@ -135,11 +135,15 @@ export class SpotifyPoolCache {
 
   peek(): SpotifyPool | null { return this.pool; }
 
-  // How long the current pool may be served. A build that came back empty AND
-  // partial is a failure, not a curation — hold it briefly so the next tick can
-  // try again, rather than for the full TTL.
+  // How long the current pool may be served. An EMPTY pool is dead air whatever
+  // the reason, so it is held only briefly — the failure need not have announced
+  // itself as one. Two builds returned `0 tracks, 0 playlists` with `partial:
+  // false` (an empty /me/playlists reads as a successful walk), and gating the
+  // short retry on `partial` earned each of those thirty minutes of silence.
+  // A rebuild is three requests, and get() already refuses to rebuild while the
+  // rate-limit gate is closed, so this cannot become a hammer loop.
   private ttlFor(p: SpotifyPool): number {
-    return p.tracks.size === 0 && p.partial ? POOL_EMPTY_RETRY_MS : POOL_TTL_MS;
+    return p.tracks.size === 0 ? POOL_EMPTY_RETRY_MS : POOL_TTL_MS;
   }
 
   async get(): Promise<SpotifyPool> {
@@ -252,11 +256,15 @@ export class SpotifyPoolCache {
     // thousand unreachable artists cannot grow an unbounded status payload.
     let partial = false;
     const notes: string[] = [];
-    const fail = (note: string) => {
-      partial = true;
-      this.log(`[spotify] ${note}`);
-      if (notes.length < 10 && !notes.includes(note)) notes.push(note);
+    const record = (line: string) => {
+      this.log(`[spotify] ${line}`);
+      if (notes.length < 10 && !notes.includes(line)) notes.push(line);
     };
+    const fail = (note: string) => { partial = true; record(note); };
+    // Something the operator needs told, that is NOT a failure — an account with
+    // no playlists is a configuration, not a fault, but it must not produce a
+    // silently empty pool either.
+    const note = (line: string) => record(line);
 
     const add = (raw: any, addedAt?: string | null) => {
       const t = unwrapItem(raw);
@@ -280,6 +288,14 @@ export class SpotifyPoolCache {
     try {
       const mine: any[] = [];
       for await (const p of c.paginate<any>((o) => c.getMyPlaylists({ offset: o, limit: PAGE }), { pageSize: PAGE })) mine.push(p);
+      // An empty listing is a successful walk that found nothing, so it sets no
+      // error and no `partial` — and used to produce a completely unexplained
+      // `0 tracks, 0 playlists` pool. Say it, whichever way the pool is scoped.
+      if (mine.length === 0) {
+        note(cfg.playlistIds.length
+          ? 'the account owns or follows no playlists, so the configured ids can only be resolved one by one'
+          : 'the account returned no playlists — with no playlist ids configured the pool draws from every playlist it owns or follows, and there are none');
+      }
       const wanted = cfg.playlistIds.length ? mine.filter((p) => cfg.playlistIds.includes(p.id)) : mine;
       // Configured ids the account does not own/follow still RESOLVE, so the
       // name and cover render — but since February 2026 only a playlist the

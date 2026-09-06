@@ -308,6 +308,34 @@ test('a closed rate-limit gate suppresses the rebuild — the short empty retry 
   assert.ok(calls.filter((x) => x === 'saved').length > after, 'and resumes once the window clears');
 });
 
+// The two builds that logged "0 tracks, 0 albums, 0 playlists … in 0s" and said
+// nothing else: an empty /me/playlists is a SUCCESSFUL walk, so it set no error
+// and no `partial`, and the operator was left with an unexplained empty pool
+// held for the full 30 minutes.
+test('an empty playlist listing explains itself, is not called a failure, and is not held for 30 minutes', async () => {
+  const { POOL_TTL_MS, POOL_EMPTY_RETRY_MS } = await import('../src/music/sources/spotify/pool.js');
+  const { client, calls } = fakeClient();
+  // Keep the call markers the fixture records — overriding them away would make
+  // the rebuild counter below silently always zero.
+  client.getMyPlaylists = async () => { calls.push('playlists'); return { items: [], next: null }; };
+  client.getSavedTracks = async () => { calls.push('saved'); return { items: [], next: null }; };
+  let now = 1_000_000;
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now, freshCachePath());
+
+  const p = await pool.get();
+  assert.equal(p.tracks.size, 0);
+  assert.equal(p.partial, false, 'an account with no playlists is a configuration, not a fault');
+  assert.ok(p.notes.some((n) => /no playlists/.test(n)), `the reason is recorded: ${JSON.stringify(p.notes)}`);
+
+  // …and it is retried soon, because an empty pool is dead air either way.
+  const builds = () => calls.filter((x) => x === 'saved').length;
+  const after = builds();
+  now += POOL_EMPTY_RETRY_MS + 1_000;
+  await pool.get();
+  assert.ok(builds() > after, 'a non-partial empty pool retries on the short window, not the full TTL');
+  assert.ok(POOL_EMPTY_RETRY_MS < POOL_TTL_MS);
+});
+
 test('an empty, failed build is held only briefly — a 30-minute memo of nothing is 30 minutes of dead air', async () => {
   const { POOL_TTL_MS, POOL_EMPTY_RETRY_MS } = await import('../src/music/sources/spotify/pool.js');
   const { client, calls } = fakeClient({ failSaved: true });

@@ -27,12 +27,27 @@
 // spun through ~2000 remaining artists as fast as it could, turning a rate
 // limit into a rate-limit storm. Never restore per-request-only 429 handling.
 //
-// Two lanes, because a burst of enrichment must never delay the music:
-//   • FOREGROUND (default) — playing a track, walking the pool. Waits out a
+// THREE LANES, and the rule they encode is: the gate slows down what the
+// station can afford to lose, and NEVER what keeps it on air.
+//   • CRITICAL (`critical: true`) — the Spotify Connect player calls. Bypasses
+//     the gate entirely: attempted however long the window, never spaced.
+//   • FOREGROUND (default) — catalogue reads, walking the pool. Waits out a
 //     short window, gives up on a long one, and is never spaced.
 //   • BACKGROUND (`background: true`) — droppable enrichment. Spaced by a
 //     global promise chain, and while the gate is closed it does not send a
 //     request AT ALL. That is what turns 2000 doomed calls into zero.
+//
+// CRITICAL exists because the first version of this gate did not have it, and a
+// 1800s window meant THIRTY MINUTES OF GUARANTEED SILENCE: play() resolves the
+// device before every command, getDevices() was foreground, so every play died
+// before reaching the network. Making the player calls obey the gate looks like
+// a consistency fix and is the opposite of one. The transport already owns
+// exactly the backoff the gate was trying to provide — a 3s hard floor between
+// commands plus a 30s→10min exponential hold (transport.ts) — and a play is ONE
+// request per track, perhaps seven across a whole window. Denying it protects
+// nothing measurable and only stops the station recovering early when Spotify's
+// Retry-After was conservative.
+//
 // Background is deliberately NOT put on the same queue as foreground: a line of
 // spaced enrichment requests sitting in front of a play command is exactly the
 // priority inversion this split exists to prevent.
@@ -182,6 +197,9 @@ export interface RequestOpts {
   // playing. Spaced by the global gap, and abandoned outright — without
   // reaching the network — while the rate-limit gate is closed.
   background?: boolean;
+  // The opposite end: a call the station cannot stay on air without. Skips the
+  // gate entirely — see the three-lane note at the top of this file.
+  critical?: boolean;
 }
 
 export class SpotifyClient {
@@ -357,14 +375,14 @@ export class SpotifyClient {
 
   private async send<T>(url: URL, endpoint: string, opts: RequestOpts): Promise<T | null> {
     // The gate, consulted BEFORE the network. A caller that asks anyway is how
-    // a rate limit renews itself.
-    const held = this.rateLimitedForMs();
+    // a rate limit renews itself — except for the one lane that must ask.
+    const held = opts.critical ? 0 : this.rateLimitedForMs();
     if (held > 0) {
       // Background work is droppable by definition: stand down, cost nothing.
       if (opts.background) throw new SpotifyRateLimitError(endpoint, held);
       // Foreground waits out a SHORT window — a track boundary can afford a few
-      // seconds — and gives up on a long one so the transport's own backoff
-      // takes over rather than the seam hanging.
+      // seconds — and gives up on a long one so the caller's own backoff takes
+      // over rather than the seam hanging.
       if (held > this.maxRetryAfterMs) throw new SpotifyRateLimitError(endpoint, held);
       // Jitter, so a fleet released by one header does not stampede back in
       // sync (llm/internal/core/retry.ts keeps it for the same reason).
@@ -472,18 +490,25 @@ export class SpotifyClient {
   }
 
   // ── player (Spotify Connect) ───────────────────────────────────────────────
+  //
+  // EVERY call here is `critical`, and that is the whole block's defining
+  // property: these are what keep the station on air, so they skip the
+  // rate-limit gate rather than being denied by it. Low volume by construction
+  // (one command per track, behind the transport's 3s floor and exponential
+  // hold), so they cost the quota almost nothing — while blocking them costs the
+  // whole window in dead air. Do not "tidy" the flag away.
 
-  getDevices() { return this.api('/me/player/devices'); }
-  getPlaybackState() { return this.api('/me/player', { query: { additional_types: 'track' }, allow404: true }); }
+  getDevices() { return this.api('/me/player/devices', { critical: true }); }
+  getPlaybackState() { return this.api('/me/player', { query: { additional_types: 'track' }, allow404: true, critical: true }); }
   play(opts: { deviceId?: string; uris?: string[]; contextUri?: string; positionMs?: number } = {}) {
     const body: Record<string, unknown> = {};
     if (opts.uris) body.uris = opts.uris;
     if (opts.contextUri) body.context_uri = opts.contextUri;
     if (opts.positionMs != null) body.position_ms = opts.positionMs;
-    return this.api('/me/player/play', { method: 'PUT', query: { device_id: opts.deviceId }, body: Object.keys(body).length ? body : undefined });
+    return this.api('/me/player/play', { method: 'PUT', query: { device_id: opts.deviceId }, body: Object.keys(body).length ? body : undefined, critical: true });
   }
-  pause(deviceId?: string) { return this.api('/me/player/pause', { method: 'PUT', query: { device_id: deviceId }, allow404: true }); }
-  queue(uri: string, deviceId?: string) { return this.api('/me/player/queue', { method: 'POST', query: { uri, device_id: deviceId } }); }
-  transfer(deviceId: string, play = false) { return this.api('/me/player', { method: 'PUT', body: { device_ids: [deviceId], play } }); }
-  seek(positionMs: number, deviceId?: string) { return this.api('/me/player/seek', { method: 'PUT', query: { position_ms: Math.max(0, Math.round(positionMs)), device_id: deviceId } }); }
+  pause(deviceId?: string) { return this.api('/me/player/pause', { method: 'PUT', query: { device_id: deviceId }, allow404: true, critical: true }); }
+  queue(uri: string, deviceId?: string) { return this.api('/me/player/queue', { method: 'POST', query: { uri, device_id: deviceId }, critical: true }); }
+  transfer(deviceId: string, play = false) { return this.api('/me/player', { method: 'PUT', body: { device_ids: [deviceId], play }, critical: true }); }
+  seek(positionMs: number, deviceId?: string) { return this.api('/me/player/seek', { method: 'PUT', query: { position_ms: Math.max(0, Math.round(positionMs)), device_id: deviceId }, critical: true }); }
 }

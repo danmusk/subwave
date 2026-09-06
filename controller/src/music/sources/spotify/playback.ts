@@ -43,7 +43,16 @@ export class SpotifyPlaybackController {
       ?? devices.find((d) => String(d.name ?? '').trim().toLowerCase().startsWith(want));
     if (!hit?.id) {
       this.device = null;
-      this.log(`[spotify] receiver "${this.deps.deviceName()}" not among the account's devices (${devices.map((d) => d.name).join(', ') || 'none'})`);
+      // Name the log. Liquidsoap owns the wrapper's stderr and does not forward
+      // it to the container log, so the REASON the receiver is absent is only
+      // ever written to state/logs/librespot.log — and nothing else points
+      // there. Without this the operator sees "not among the devices" and has
+      // no next step; with it, one command answers which of four faults it is.
+      this.log(
+        `[spotify] receiver "${this.deps.deviceName()}" not among the account's devices `
+        + `(${devices.map((d) => d.name).join(', ') || 'none'}) — the receiver is not logged in. `
+        + `Why: state/logs/librespot.log in the broadcast container. An EMPTY log there means the image has no librespot (rebuild it).`,
+      );
       return null;
     }
     this.device = { id: hit.id, at: this.now() };
