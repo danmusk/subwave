@@ -108,7 +108,10 @@ test('every subsonic.<name> used by a facade importer is exported by the facade'
 
 test('the facade exports no name the client lacks a counterpart for (except its own additions)', () => {
   // Names the facade adds over the raw client — the source-generic adapters.
-  const additions = new Set(['activeSourceId', 'activeCapabilities', 'getCoverArt', 'getAnalyzableRef']);
+  // `catalogHealth` is one of them: Subsonic has no counterpart on purpose, and
+  // the facade answering `{ complete: true }` on its behalf is what keeps its
+  // orphan reconcile working (see music/prune-policy.ts).
+  const additions = new Set(['activeSourceId', 'activeCapabilities', 'getCoverArt', 'getAnalyzableRef', 'catalogHealth']);
   for (const name of Object.keys(facade)) {
     if (additions.has(name)) continue;
     assert.ok(name in client, `facade.${name} has no counterpart in music/subsonic.ts`);

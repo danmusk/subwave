@@ -64,6 +64,10 @@ export function poolStatus() {
     // Non-zero while Spotify is holding us off. Surfaced so a paused fill looks
     // like a pause rather than a failure.
     rateLimitedMs: spotifyClient().rateLimitedForMs(),
+    // The walk stopped at maxTracks, so it is a prefix of the library. Worth
+    // saying out loud: it also permanently disables the tagger's orphan
+    // reconcile, which must never delete against an incomplete walk.
+    truncated: p.truncated,
   };
 }
 

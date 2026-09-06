@@ -40,6 +40,25 @@ const { pickerScope } = await import('../src/llm/internal/tools/picker/scope.js'
 
 // ── fixtures ───────────────────────────────────────────────────────────────
 
+// SpotifyClient captures `fetch` at CONSTRUCTION, and the module-level client is
+// a singleton with no reset — so the stub has to be in place before anything
+// first calls spotifyClient(). Installed once here, steered per test through
+// `stubRoutes`; an unrouted URL 404s, which is what every test that does not opt
+// in wants (they drive fake clients instead).
+let stubRoutes: Array<[RegExp, unknown]> = [];
+globalThis.fetch = (async (url: any) => {
+  const hit = stubRoutes.find(([re]) => re.test(String(url)));
+  const body = JSON.stringify(hit ? hit[1] : {});
+  return {
+    ok: !!hit,
+    status: hit ? 200 : 404,
+    statusText: hit ? 'OK' : 'Not Found',
+    headers: { get: () => null },
+    json: async () => JSON.parse(body),
+    text: async () => body,
+  } as any;
+}) as any;
+
 const img = (w: number) => ({ url: `https://i.scdn.co/${w}`, width: w, height: w });
 const artist = (id: string, name: string) => ({ id, name, type: 'artist' });
 const album = (id: string, name: string, extra: any = {}) => ({
@@ -320,7 +339,10 @@ test('a failed source page leaves the pool usable and marked partial; a cap stop
   assert.equal(p.tracks.size, 2);
 
   const capped = new SpotifyPoolCache(() => fakeClient().client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 1 }), () => {}, Date.now, freshCachePath());
-  assert.equal((await capped.get()).tracks.size, 1);
+  const cappedPool = await capped.get();
+  assert.equal(cappedPool.tracks.size, 1);
+  assert.equal(cappedPool.truncated, true, 'a capped walk is a PREFIX of the library — the reconcile must not delete against it');
+  assert.equal(p.truncated, false, 'and an uncapped one is not');
 });
 
 test('a pool-definition change rebuilds on the next get() without an explicit invalidate', async () => {
@@ -365,9 +387,79 @@ test('with music.source = spotify the facade routes to the Spotify source and de
   for (const n of ['similarSongs', 'topSongsByArtist']) assert.ok(!names.includes(n), `${n} off on spotify`);
   for (const n of ['starredSongs', 'recentlyAdded', 'searchLibrary', 'randomSongs']) assert.ok(names.includes(n), `${n} on for spotify`);
   assert.deepEqual(await facade.getTopSongs('Portishead'), [], 'the facade answers the neutral empty rather than calling a dead endpoint');
+  // A Spotify station that has not built a pool yet must NOT be read as an
+  // authoritative catalogue — the reconcile would delete every tagged track.
+  const health = await facade.catalogHealth();
+  assert.equal(health.complete, false);
+  assert.match(health.reason ?? '', /not been built/);
   // and back to the default
   writeFileSync(path.join(stateRoot, 'settings.json'), '{}');
   setCache(null);
   await settings.load();
   assert.equal(facade.activeSourceId(), 'subsonic');
+  // THE regression guard for the default direction: Subsonic implements no
+  // health probe, and the facade must answer "complete" so its reconcile keeps
+  // working exactly as it always has. Flip this and every Navidrome station
+  // silently stops pruning.
+  assert.deepEqual(await facade.catalogHealth(), { complete: true });
+});
+
+// The divergence that made blocking a track destroy its tags: iterateAllSongs is
+// the LIBRARY walk, and the orphan reconcile deletes everything it does not
+// yield. Filtering the blocklist there (which Navidrome's walk does not do) made
+// a blocked track read as deleted. Driven through the real singleton source with
+// a stubbed global fetch, because that filtering lives in the singleton's
+// iterateAllSongs and nowhere a fake client can reach.
+test('the library walk yields a blocklisted track; the pick paths still refuse it', async () => {
+  const { spotifyPool, spotifyClient } = await import('../src/music/sources/spotify/source.js');
+  const blocklist = await import('../src/music/blocklist.js');
+
+  const BLOCKED = 'DDDDDDDDDDDDDDDDDDDDDD';
+  const OK = 'EEEEEEEEEEEEEEEEEEEEEE';
+  const page = (items: any[]) => ({ items, next: null });
+  stubRoutes = [
+    [/accounts\.spotify\.com\/api\/token/, { access_token: 'T', expires_in: 3600 }],
+    [/\/me\/playlists/, page([{ id: 'PL1', name: 'Night', items: { total: 2 } }])],
+    [/\/playlists\/PL1\/items/, page([{ item: track(BLOCKED, 'Nope') }, { item: track(OK, 'Fine') }])],
+    [/\/me\/tracks/, page([])],
+    [/\/me\/albums/, page([])],
+    [/\/artists\//, { id: 'ar1', genres: ['trip hop'] }],
+  ];
+  process.env.SPOTIFY_CLIENT_ID = 'id';
+  process.env.SPOTIFY_CLIENT_SECRET = 'secret';
+  process.env.SPOTIFY_REFRESH_TOKEN = 'refresh';
+
+  try {
+    writeFileSync(path.join(stateRoot, 'settings.json'), JSON.stringify({ music: { source: 'spotify' } }));
+    setCache(null);
+    await settings.load();
+    spotifyClient().resetToken();
+    spotifyPool().invalidate();
+
+    await blocklist.load();
+    await blocklist.add({ type: 'track', id: BLOCKED, name: 'Nope', artist: 'Portishead', album: 'Dummy' });
+
+    const walked: string[] = [];
+    for await (const s of facade.iterateAllSongs()) walked.push(s.id);
+    assert.equal(walked.length, 2, `the stubbed pool built (got ${JSON.stringify(walked)})`);
+    assert.ok(walked.includes(BLOCKED), 'the blocked track is still IN the library — deleting its tags would be the bug');
+    assert.ok(walked.includes(OK));
+
+    // …but it must never be handed to a pick path.
+    const picks = await facade.getRandomSongs({ size: 50 });
+    assert.ok(!picks.some((s: any) => s.id === BLOCKED), 'the blocklist is still absolute at the pick paths');
+    assert.ok(picks.some((s: any) => s.id === OK));
+
+    // A healthy, uncapped, un-rate-limited pool is safe to delete against.
+    assert.deepEqual(await facade.catalogHealth(), { complete: true });
+  } finally {
+    await blocklist.remove('track', BLOCKED).catch(() => {});
+    stubRoutes = [];
+    delete process.env.SPOTIFY_CLIENT_ID;
+    delete process.env.SPOTIFY_CLIENT_SECRET;
+    delete process.env.SPOTIFY_REFRESH_TOKEN;
+    writeFileSync(path.join(stateRoot, 'settings.json'), '{}');
+    setCache(null);
+    await settings.load();
+  }
 });

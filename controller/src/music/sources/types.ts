@@ -73,6 +73,11 @@ export type AnalyzableRef = { url: string } | { path: string };
 
 export type AnnotateOpts = NonNullable<Parameters<typeof client.getAnnotatedUri>[1]>;
 
+// Whether a full catalogue walk can be trusted as the complete live set.
+// `reason` is operator-facing and appears verbatim in the skipped-prune line, so
+// it names what was missing, not an error class.
+export type CatalogHealth = { complete: boolean; reason?: string };
+
 export interface MusicSource {
   // Matches a `MUSIC_SOURCES` entry in schemas/settings.ts.
   readonly id: string;
@@ -99,6 +104,21 @@ export interface MusicSource {
   resolveGenreName: typeof client.resolveGenreName;
   resolveArtist: typeof client.resolveArtist;
   getRecentSongsByArtist: typeof client.getRecentSongsByArtist;
+
+  // Was the last `iterateAllSongs()` walk AUTHORITATIVE — i.e. is "not in this
+  // walk" safe to read as "gone from the library"? Only the destructive
+  // reconcile asks (music/prune-policy.ts): the tagger and analyzer delete a
+  // track's tags, vectors and analysis for every id the walk did not yield.
+  //
+  // OPTIONAL, and its absence means `complete: true` — a source that says
+  // nothing prunes exactly as it always has. That default points the OPPOSITE
+  // way from the guard itself on purpose: Subsonic's walk is all-or-nothing
+  // (the API answers or it doesn't, which `walked > 0` already catches), so
+  // making silence mean "unsafe" would switch off reconcile for every existing
+  // station. Only a source that can degrade PARTIALLY implements this and says
+  // so — Spotify's pool can come back short from a 403, a rate-limit window or
+  // a maxTracks truncation, all of which look exactly like deletion.
+  catalogHealth?(): Promise<CatalogHealth>;
 
   // ── PLAYBACK — file/URL sources only. A source that hands Liquidsoap a
   //    request URI implements these; a live-transport source (capabilities

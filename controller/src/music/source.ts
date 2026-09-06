@@ -26,13 +26,13 @@
 import type * as client from './subsonic.js';
 import { activeSource, activeSourceId } from './sources/registry.js';
 import { capabilitiesFor } from './sources/capabilities.js';
-import type { CoverArt, AnalyzableRef } from './sources/types.js';
+import type { CoverArt, AnalyzableRef, CatalogHealth } from './sources/types.js';
 
 // Pure helpers that never touch a server — shared by every source and by the
 // Liquidsoap annotation builders. Re-exported from the client verbatim.
 export { songGenres, escAnnotate, isStationArchive } from './subsonic.js';
 export { activeSourceId } from './sources/registry.js';
-export type { Song, Artist, Album, Genre, Playlist, CoverArt, AnalyzableRef, MusicSource } from './sources/types.js';
+export type { Song, Artist, Album, Genre, Playlist, CoverArt, AnalyzableRef, CatalogHealth, MusicSource } from './sources/types.js';
 export const activeCapabilities = () => capabilitiesFor(activeSourceId());
 
 // ── CORE delegators ────────────────────────────────────────────────────────
@@ -58,6 +58,23 @@ export function getAnalyzableRef(songId: string): Promise<AnalyzableRef | null> 
 export const resolveGenreName: typeof client.resolveGenreName = (...a) => activeSource().resolveGenreName(...a);
 export const resolveArtist: typeof client.resolveArtist = (...a) => activeSource().resolveArtist(...a);
 export const getRecentSongsByArtist: typeof client.getRecentSongsByArtist = (...a) => activeSource().getRecentSongsByArtist(...a);
+
+// Whether the last full walk was authoritative enough to delete against — asked
+// ONLY by music/prune-policy.ts. A source that does not implement it answers
+// `complete: true`, which keeps Subsonic's reconcile byte-identical; see the
+// note on MusicSource.catalogHealth for why silence means "safe" here while the
+// gate it feeds fails closed. A source whose probe THROWS is treated as
+// degraded: the question is "may I delete", and an unanswerable question is not
+// a yes.
+export async function catalogHealth(): Promise<CatalogHealth> {
+  const src = activeSource();
+  if (!src.catalogHealth) return { complete: true };
+  try {
+    return await src.catalogHealth();
+  } catch (err: any) {
+    return { complete: false, reason: `${src.id} could not report catalogue health: ${err?.message ?? err}` };
+  }
+}
 
 // ── PLAYBACK delegators — request-URI sources only ──────────────────────────
 

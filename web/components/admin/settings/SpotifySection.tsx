@@ -261,6 +261,14 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
             across restarts — genre shows and genre picking improve as it goes.
           </div>
         ) : null}
+        {st?.pool?.truncated ? (
+          <div className="field-hint mt-2">
+            The pool stopped at its <b>{st.pool.tracks}-track cap</b>, so it holds only part of your
+            playlists. Raise <code>maxTracks</code> to take in the rest. While the walk is capped the
+            tagger will not remove tracks that have left your playlists either — it never deletes
+            against a partial view of the library.
+          </div>
+        ) : null}
         {st?.pool && (st.pool.rateLimitedMs ?? 0) > 0 ? (
           <div className="field-hint mt-2">
             <b>Spotify is rate-limiting this app</b> — resuming in about {Math.ceil((st.pool.rateLimitedMs ?? 0) / 1000)}s.

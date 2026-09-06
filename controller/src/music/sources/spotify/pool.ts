@@ -96,6 +96,12 @@ export interface SpotifyPool {
   // do — NOT a fault, and deliberately not folded into `partial`, which drives
   // the empty-pool retry and the doctor.
   genresPending: number;
+  // The walk stopped at `maxTracks` rather than at the end of the operator's
+  // playlists, so this pool is a PREFIX of the library, not the library. Unlike
+  // `partial` this is not a failure and nothing should retry over it — but it
+  // does mean the walk can never be read as "everything that exists", which is
+  // what the orphan reconcile needs (music/prune-policy.ts).
+  truncated: boolean;
   // The pool definition it was built from; a settings edit changes it and the
   // next get() rebuilds rather than serving a stale curation.
   cfgSig: string;
@@ -388,7 +394,12 @@ export class SpotifyPoolCache {
       }
     }
 
-    this.pool = { tracks, albums, artistGenres, genres, playlists, builtAt: this.now(), partial, notes, genresPending, cfgSig: poolConfigSignature(cfg) };
+    this.pool = {
+      tracks, albums, artistGenres, genres, playlists, builtAt: this.now(),
+      partial, notes, genresPending,
+      truncated: tracks.size >= cfg.maxTracks,
+      cfgSig: poolConfigSignature(cfg),
+    };
     const retry = this.ttlFor(this.pool) === POOL_EMPTY_RETRY_MS ? `, retrying in ${Math.round(POOL_EMPTY_RETRY_MS / 1000)}s` : '';
     const pending = genresPending ? `, ${genresPending} artists awaiting genres` : '';
     this.log(`[spotify] pool built: ${tracks.size} tracks, ${albums.size} albums, ${playlists.length} playlists, ${genres.size} genres in ${Math.round((this.now() - started) / 1000)}s${partial ? ' (partial)' : ''}${pending}${retry}`);

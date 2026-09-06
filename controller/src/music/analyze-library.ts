@@ -36,6 +36,7 @@ import { runAnalysisPass } from './analyze.js';
 import * as analyzer from './analyzer.js';
 import { reportProgress, makeEventLogger } from './tagger-progress.js';
 import { acquireStandaloneLock, installPidfileCleanup } from './tagger-lock.js';
+import { prunePermitted, pruneSkippedLine } from './prune-policy.js';
 
 const logEvent = makeEventLogger('analyze');
 
@@ -149,13 +150,17 @@ async function main() {
     }
     logEvent('info', `Scanned ${walked.toLocaleString('en-GB')} tracks`);
 
-    // Reconcile: drop rows for tracks no longer in Navidrome so the analysis
+    // Reconcile: drop rows for tracks no longer in the library so the analysis
     // scope reflects the live catalogue, not orphans from past full rescans.
-    // Guarded on a non-empty walk (a complete, authoritative pass).
-    if (walked > 0) {
+    // Gated on the walk being authoritative — see music/prune-policy.ts.
+    const decision = prunePermitted({ walked, health: await subsonic.catalogHealth() });
+    if (!decision.ok) {
+      console.warn(`[analyze] ${pruneSkippedLine(decision.reason)}`);
+      logEvent('warning', pruneSkippedLine(decision.reason));
+    } else {
       const pruned = db.pruneMissingTracks(liveIds);
       if (pruned > 0) {
-        console.log(`[analyze] pruned ${pruned} orphaned tracks no longer in Navidrome`);
+        console.log(`[analyze] pruned ${pruned} orphaned tracks no longer in the library`);
       }
     }
   }

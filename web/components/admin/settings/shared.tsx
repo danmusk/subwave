@@ -511,6 +511,9 @@ export interface SettingsData {
       tracks: number; albums: number; playlists: number; builtAt: number;
       partial: boolean; notes?: string[];
       artists?: number; genresPending?: number; rateLimitedMs?: number;
+      // Walk stopped at maxTracks — a prefix of the library, which also keeps
+      // the tagger's orphan reconcile switched off.
+      truncated?: boolean;
     } | null;
     // The RECEIVER's (librespot) sign-in — a second login for Spotify's own
     // client id; see music/sources/spotify/receiver-auth.ts.

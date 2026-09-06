@@ -250,9 +250,45 @@ async function getAlbumList(offset = 0, size = 500): Promise<Album[]> {
     .slice(offset, offset + size);
 }
 
+// The full catalogue walk. Deliberately UNFILTERED — `keep()` is not applied.
+//
+// This is the library, not the playable set, and its only consumers are the
+// tagger, the analyzer and coverage. Filtering the blocklist here (which is
+// what it used to do, diverging from Navidrome's walk in music/subsonic.ts)
+// made a blocked track look DELETED to the orphan reconcile, so blocking a
+// track silently threw away its tags, moods and embedding on the next tagging
+// run. Nothing plays as a result of being yielded here: the blocklist is
+// enforced at every pick path and again at queue.push() as the last line.
+// `isPlayable` is likewise a live-market judgement about right now, not a
+// statement about whether the track is in the operator's playlists.
 async function* iterateAllSongs(): AsyncGenerator<Song> {
   const p = await spotifyPool().get();
-  for (const s of keep([...p.tracks.values()])) yield s;
+  for (const s of p.tracks.values()) yield s;
+}
+
+// Whether that walk can be trusted as the complete live library — asked only by
+// the orphan reconcile, which DELETES everything it did not see. Spotify's pool
+// has three ways to come back short while still looking healthy, and all three
+// are indistinguishable from the operator deleting tracks:
+//   • `partial` — a playlist 403'd, or a page walk failed mid-way;
+//   • a closed rate-limit gate — the walk may have been cut short, and a
+//     rebuild is being suppressed anyway, so this pool is not fresh;
+//   • `truncated` — the walk stopped at maxTracks, so it is a prefix by design.
+// Subsonic implements none of this and prunes as it always has.
+async function catalogHealth(): Promise<{ complete: boolean; reason?: string }> {
+  const held = spotifyClient().rateLimitedForMs();
+  if (held > 0) {
+    return { complete: false, reason: `Spotify is rate-limiting the station (${Math.ceil(held / 1000)}s left), so the catalogue walk may be short` };
+  }
+  const p = spotifyPool().peek();
+  if (!p) return { complete: false, reason: 'the Spotify pool has not been built yet' };
+  if (p.partial) {
+    return { complete: false, reason: `the last Spotify pool build was incomplete — ${p.notes[0] ?? 'a source page failed'}` };
+  }
+  if (p.truncated) {
+    return { complete: false, reason: `the pool stopped at its ${p.tracks.size}-track cap (spotify.pool.maxTracks), so the walk is a prefix of the library` };
+  }
+  return { complete: true };
 }
 
 async function getCoverArt(id: string): Promise<CoverArt | null> {
@@ -388,6 +424,7 @@ export const spotifySource: MusicSource = {
   getSongsByGenreSampled,
   getAlbumList,
   iterateAllSongs,
+  catalogHealth,
   getCoverArt,
   getAnalyzableRef,
   resolveGenreName,
