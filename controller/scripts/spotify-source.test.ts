@@ -7,10 +7,15 @@
 //     (id, artist string, album year, duration in SECONDS, coverArt = id, the
 //     era flags the Navidrome walk stamps);
 //   • the pool dedupes across playlists/saved, caps at maxTracks, stamps artist
-//     genres from the batched artist call, and marks a compilation untrusted;
+//     genres from the per-artist call, and marks a compilation untrusted;
+//   • BOTH playlist-row shapes read: February 2026 renamed the playlist row's
+//     `track` key to `item`, while saved tracks still say `track`;
+//   • the artist-genre cache outlives a rebuild, since the batch endpoint is
+//     gone and every miss is now a request of its own;
 //   • the facade returns neutral empties for capabilities spotify lacks
 //     (similar songs, lyrics, scrobble) and THROWS on a request-URI builder;
-//   • the picker tool set drops the server-only tools spotify cannot serve.
+//   • the picker tool set drops the server-only tools spotify cannot serve —
+//     topSongsByArtist among them, since /artists/{id}/top-tracks was removed.
 //
 // Run: npm test -- spotify-source
 
@@ -110,29 +115,35 @@ test('sample is a permutation prefix', () => {
 
 // ── the pool ───────────────────────────────────────────────────────────────
 
-function fakeClient(opts: { failSaved?: boolean } = {}) {
+function fakeClient(opts: { failSaved?: boolean; failArtists?: boolean } = {}) {
   const calls: string[] = [];
   const t1 = track('AAAAAAAAAAAAAAAAAAAAAA', 'Glory Box');
   const t2 = track('BBBBBBBBBBBBBBBBBBBBBB', 'Roads');
   const comp = track('CCCCCCCCCCCCCCCCCCCCCC', 'Hit', { artists: [artist('ar2', 'Someone')], album: album('cmp', 'Now 42', { album_type: 'compilation', artists: [artist('va', 'Various Artists')] }) });
   const client: any = {
-    async getMyPlaylists() { calls.push('playlists'); return { items: [{ id: 'PL1', name: 'Night', tracks: { total: 2 } }], next: null }; },
-    async getPlaylist(id: string) { calls.push(`playlist:${id}`); return { id, name: `ext ${id}`, tracks: { total: 1 } }; },
+    // `items: { total }` is the post-February-2026 playlist shape; the mappers
+    // still accept the old `tracks: { total }`.
+    async getMyPlaylists() { calls.push('playlists'); return { items: [{ id: 'PL1', name: 'Night', items: { total: 2 } }], next: null }; },
+    async getPlaylist(id: string) { calls.push(`playlist:${id}`); return { id, name: `ext ${id}`, items: { total: 1 } }; },
     async getPlaylistItems(id: string) {
       calls.push(`items:${id}`);
+      // GET /playlists/{id}/items wraps the track under `item`, not `track`.
       return id === 'PL1'
-        ? { items: [{ track: t1, added_at: '2024-01-01T00:00:00Z' }, { track: t2, added_at: '2024-01-02T00:00:00Z' }, { track: null }], next: null }
-        : { items: [{ track: comp }], next: null };
+        ? { items: [{ item: t1, added_at: '2024-01-01T00:00:00Z' }, { item: t2, added_at: '2024-01-02T00:00:00Z' }, { item: null }], next: null }
+        : { items: [{ item: comp }], next: null };
     },
     async getSavedTracks() {
       calls.push('saved');
       if (opts.failSaved) throw new Error('saved down');
+      // GET /me/tracks still says `track` — the other half of unwrapItem.
       return { items: [{ track: t1, added_at: '2023-01-01T00:00:00Z' }, { track: comp }], next: null }; // t1 is a dup
     },
     async getSavedAlbums() { calls.push('saved-albums'); return { items: [], next: null }; },
-    async getArtists(ids: string[]) {
-      calls.push(`artists:${ids.join('+')}`);
-      return { artists: ids.map((id) => ({ id, genres: id === 'ar1' ? ['trip hop'] : ['pop'] })) };
+    // The batch endpoint (GET /artists?ids=) was removed — one request each.
+    async getArtist(id: string) {
+      calls.push(`artist:${id}`);
+      if (opts.failArtists) throw new Error('artist down');
+      return { id, genres: id === 'ar1' ? ['trip hop'] : ['pop'] };
     },
     async *paginate<T>(page: (o: number) => Promise<any>) { const p = await page(0); for (const it of p.items ?? []) yield it as T; },
   };
@@ -146,16 +157,53 @@ test('the pool dedupes, caps, stamps genres and marks compilations untrusted', a
   assert.equal(p.tracks.size, 3, 'two playlist tracks + one saved, the duplicate collapsed');
   assert.equal(p.playlists.length, 2, 'the owned playlist and the configured external one');
   assert.ok(calls.includes('playlist:EXT1'), 'an unowned configured playlist is fetched by id');
-  assert.deepEqual(p.tracks.get('AAAAAAAAAAAAAAAAAAAAAA')!.genres, ['trip hop']);
+  assert.equal(p.playlists[0].songCount, 2, 'songCount reads the renamed items.total');
+  assert.deepEqual(p.tracks.get('AAAAAAAAAAAAAAAAAAAAAA')!.genres, ['trip hop'], 'an `item`-wrapped playlist row maps');
+  assert.ok(p.tracks.has('CCCCCCCCCCCCCCCCCCCCCC'), 'a `track`-wrapped saved row maps too');
   assert.equal(p.genres.get('trip hop'), 2);
   const c = p.tracks.get('CCCCCCCCCCCCCCCCCCCCCC')!;
   assert.equal(c.albumIsCompilation, true);
   assert.equal(c.albumEraUntrusted, true, 'the era pipeline reads this exactly as it does for Navidrome');
-  assert.equal(calls.filter((x) => x.startsWith('artists:')).length, 1, 'genres batched in one call');
+  assert.deepEqual(calls.filter((x) => x.startsWith('artist:')).sort(), ['artist:ar1', 'artist:ar2'], 'one request per distinct artist, no repeats');
   assert.equal(p.partial, false);
   // memoised
   await pool.get();
   assert.equal(calls.filter((x) => x === 'playlists').length, 1);
+});
+
+test('the artist-genre cache outlives a rebuild — a removed batch endpoint must not become N calls every 30 minutes', async () => {
+  const { client, calls } = fakeClient();
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }));
+  await pool.get();
+  const first = calls.filter((x) => x.startsWith('artist:')).length;
+  assert.ok(first > 0, 'the first build asks');
+  pool.invalidate();
+  const p = await pool.get();
+  assert.equal(calls.filter((x) => x.startsWith('artist:')).length, first, 'the rebuild re-walks the playlists but asks for no artist twice');
+  assert.deepEqual(p.tracks.get('AAAAAAAAAAAAAAAAAAAAAA')!.genres, ['trip hop'], 'and the genres are still stamped from the cache');
+});
+
+test('an empty, failed build is held only briefly — a 30-minute memo of nothing is 30 minutes of dead air', async () => {
+  const { POOL_TTL_MS, POOL_EMPTY_RETRY_MS } = await import('../src/music/sources/spotify/pool.js');
+  const { client, calls } = fakeClient({ failSaved: true });
+  // Every source fails: the playlist listing throws and saved tracks throw.
+  client.getMyPlaylists = async () => { throw new Error('403 Forbidden'); };
+  let now = 1_000_000;
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now);
+  const empty = await pool.get();
+  assert.equal(empty.tracks.size, 0);
+  assert.equal(empty.partial, true);
+  assert.ok(empty.notes.length > 0, 'the reason travels with the pool, not only to the log');
+
+  const builds = () => calls.filter((x) => x === 'saved').length;
+  const after = builds();
+  now += POOL_EMPTY_RETRY_MS - 1_000;
+  await pool.get();
+  assert.equal(builds(), after, 'still inside the short retry window');
+  now += 2_000;
+  await pool.get();
+  assert.ok(builds() > after, 'retried well before the full TTL');
+  assert.ok(POOL_EMPTY_RETRY_MS < POOL_TTL_MS);
 });
 
 test('a failed source page leaves the pool usable and marked partial; a cap stops the walk', async () => {
@@ -206,8 +254,11 @@ test('with music.source = spotify the facade routes to the Spotify source and de
   // The picker never offers the server-only tools.
   const ctx = buildPickerContext(pickerScope());
   const names = PICKER_TOOLS.filter((m) => !m.available || m.available(ctx)).map((m) => m.name);
-  for (const n of ['similarSongs']) assert.ok(!names.includes(n), `${n} off on spotify`);
-  for (const n of ['starredSongs', 'topSongsByArtist', 'recentlyAdded', 'searchLibrary', 'randomSongs']) assert.ok(names.includes(n), `${n} on for spotify`);
+  // topSongsByArtist is off since February 2026 removed /artists/{id}/top-tracks
+  // with no replacement — offering it would spend a discovery call on nothing.
+  for (const n of ['similarSongs', 'topSongsByArtist']) assert.ok(!names.includes(n), `${n} off on spotify`);
+  for (const n of ['starredSongs', 'recentlyAdded', 'searchLibrary', 'randomSongs']) assert.ok(names.includes(n), `${n} on for spotify`);
+  assert.deepEqual(await facade.getTopSongs('Portishead'), [], 'the facade answers the neutral empty rather than calling a dead endpoint');
   // and back to the default
   writeFileSync(path.join(stateRoot, 'settings.json'), '{}');
   setCache(null);

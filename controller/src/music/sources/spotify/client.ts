@@ -14,14 +14,40 @@
 // Retry posture is deliberately mild, per CLAUDE.md's "don't add aggressive
 // retry": one token refresh on 401, one bounded wait on 429, nothing else. A
 // failure surfaces as SpotifyApiError and the caller decides.
+//
+// THIS CLIENT TARGETS THE POST-FEBRUARY-2026 WEB API. Spotify removed a large
+// slice of the surface for Development Mode apps (enforced on existing apps
+// 2026-03-09); a removed route answers 403 with no useful body, which reads as
+// a permissions problem and is not one. What that costs us, so nobody
+// "restores" one of them:
+//   • GET /playlists/{id}/tracks → /playlists/{id}/items, and the row's `track`
+//     key is now `item` (map.ts:unwrapItem absorbs both). Page size max 50.
+//   • the batch reads (GET /tracks?ids, /albums?ids, /artists?ids) are gone —
+//     fetch by id, one at a time.
+//   • GET /artists/{id}/top-tracks is gone with NO replacement, which is why
+//     spotify declares hasTopSongs:false.
+//   • /search caps `limit` at 10 (was 50) — callers wanting more must page.
+//   • /me no longer reports `product` or `country`, so Premium is unprobeable.
+//   • `available_markets` and GET /markets are gone and nothing can derive a
+//     market any more, so the legacy `market=from_token` is not sent at all.
+//     The user token's own country applies server-side.
+// Extended-quota apps are exempt from all of it, but that needs Spotify's
+// commercial approval and is not something a station can count on.
 
 export const SPOTIFY_ACCOUNTS = 'https://accounts.spotify.com';
 export const SPOTIFY_API = 'https://api.spotify.com/v1';
 
+// Spotify's own caps, named because both this module and its callers page
+// against them. Passing more than the cap is not clamped politely: the server
+// trims the page, and `paginate` reads a short page as the last one.
+export const SPOTIFY_PAGE_MAX = 50;
+export const SPOTIFY_SEARCH_MAX = 10;
+
 // Scopes the station needs. `streaming` is for librespot's login (the Connect
 // receiver), the player scopes for commanding it, the rest for the catalog.
-// `user-read-private` is what makes /me report `product` — without it Spotify
-// silently omits the field and the Premium check can only answer "unknown".
+// `user-read-private` no longer buys `product` on /me (February 2026 removed
+// the field) but stays in the list: dropping it would force every connected
+// operator through the consent screen again for nothing.
 export const SPOTIFY_SCOPES = [
   'streaming',
   'user-read-private',
@@ -79,6 +105,14 @@ export function redactSpotify(text: string): string {
   return String(text ?? '')
     .replace(/(access_token|refresh_token|Authorization|Bearer|code)(["'=:\s]+)[A-Za-z0-9._~+/=-]{16,}/gi, '$1$2[redacted]')
     .replace(/[A-Za-z0-9_-]{100,}/g, '[redacted]');
+}
+
+// A page size Spotify will actually honour. Asking beyond the cap is worse than
+// it looks: the server trims the page and `paginate` reads a short page as the
+// last one, so an over-asked walk silently stops after its first page.
+export function clampPage(n: unknown, max = SPOTIFY_PAGE_MAX): number {
+  const v = Math.floor(Number(n));
+  return Number.isFinite(v) && v > 0 ? Math.min(v, max) : max;
 }
 
 export interface RequestOpts {
@@ -222,9 +256,17 @@ export class SpotifyClient {
     if (res.status === 204) return null;
     if (res.status === 404 && opts.allow404) return null;
     if (!res.ok) {
-      const j: any = await res.json().catch(() => ({}));
+      // Read the body ONCE, as text, then try to shape it. A removed endpoint
+      // answers 403 with no `error.message` at all — falling straight through
+      // to `statusText` printed a bare "Forbidden" that named nothing and cost
+      // an afternoon, so the raw prefix goes in the line too.
+      const raw = await res.text().catch(() => '');
+      let j: any = {};
+      try { j = raw ? JSON.parse(raw) : {}; } catch { /* not JSON — the prefix is all we get */ }
       const msg = j?.error?.message || j?.error_description || j?.error || res.statusText || `HTTP ${res.status}`;
-      this.log(`[spotify] ${endpoint} → ${res.status} ${redactSpotify(String(msg))}`);
+      const body = raw.trim().slice(0, 300);
+      const detail = body && !String(msg).includes(body) ? ` · body: ${redactSpotify(body)}` : '';
+      this.log(`[spotify] ${endpoint} → ${res.status} ${redactSpotify(String(msg))}${detail}`);
       throw new SpotifyApiError(res.status, `${endpoint} failed (${res.status}): ${msg}`, endpoint);
     }
     const text = await res.text();
@@ -233,28 +275,30 @@ export class SpotifyClient {
 
   // ── catalog ────────────────────────────────────────────────────────────────
 
-  search(q: string, types: Array<'track' | 'artist' | 'album' | 'playlist'>, opts: { limit?: number; offset?: number; market?: string } = {}) {
-    return this.api('/search', { query: { q, type: types.join(','), limit: opts.limit ?? 20, offset: opts.offset ?? 0, market: opts.market ?? 'from_token' } });
+  // `limit` caps at SPOTIFY_SEARCH_MAX (10) since February 2026 — a caller
+  // wanting 25 pages through `offset`, it does not ask for 25.
+  search(q: string, types: Array<'track' | 'artist' | 'album' | 'playlist'>, opts: { limit?: number; offset?: number } = {}) {
+    return this.api('/search', { query: { q, type: types.join(','), limit: clampPage(opts.limit, SPOTIFY_SEARCH_MAX), offset: opts.offset ?? 0 } });
   }
-  getTrack(id: string, market = 'from_token') { return this.api(`/tracks/${encodeURIComponent(id)}`, { query: { market }, allow404: true }); }
-  getTracks(ids: string[], market = 'from_token') { return this.api('/tracks', { query: { ids: ids.slice(0, 50).join(','), market } }); }
+  getTrack(id: string) { return this.api(`/tracks/${encodeURIComponent(id)}`, { allow404: true }); }
   getArtist(id: string) { return this.api(`/artists/${encodeURIComponent(id)}`, { allow404: true }); }
-  getArtists(ids: string[]) { return this.api('/artists', { query: { ids: ids.slice(0, 50).join(',') } }); }
-  getArtistTopTracks(id: string, market = 'from_token') { return this.api(`/artists/${encodeURIComponent(id)}/top-tracks`, { query: { market } }); }
-  getArtistAlbums(id: string, opts: { limit?: number; offset?: number; includeGroups?: string; market?: string } = {}) {
-    return this.api(`/artists/${encodeURIComponent(id)}/albums`, { query: { limit: opts.limit ?? 20, offset: opts.offset ?? 0, include_groups: opts.includeGroups ?? 'album,single', market: opts.market ?? 'from_token' } });
+  getArtistAlbums(id: string, opts: { limit?: number; offset?: number; includeGroups?: string } = {}) {
+    return this.api(`/artists/${encodeURIComponent(id)}/albums`, { query: { limit: clampPage(opts.limit ?? 20), offset: opts.offset ?? 0, include_groups: opts.includeGroups ?? 'album,single' } });
   }
-  getAlbum(id: string, market = 'from_token') { return this.api(`/albums/${encodeURIComponent(id)}`, { query: { market }, allow404: true }); }
-  getAlbumTracks(id: string, opts: { limit?: number; offset?: number; market?: string } = {}) {
-    return this.api(`/albums/${encodeURIComponent(id)}/tracks`, { query: { limit: opts.limit ?? 50, offset: opts.offset ?? 0, market: opts.market ?? 'from_token' } });
+  getAlbum(id: string) { return this.api(`/albums/${encodeURIComponent(id)}`, { allow404: true }); }
+  getAlbumTracks(id: string, opts: { limit?: number; offset?: number } = {}) {
+    return this.api(`/albums/${encodeURIComponent(id)}/tracks`, { query: { limit: clampPage(opts.limit), offset: opts.offset ?? 0 } });
   }
-  getMyPlaylists(opts: { limit?: number; offset?: number } = {}) { return this.api('/me/playlists', { query: { limit: opts.limit ?? 50, offset: opts.offset ?? 0 } }); }
-  getPlaylist(id: string) { return this.api(`/playlists/${encodeURIComponent(id)}`, { query: { fields: 'id,name,description,owner(display_name),tracks(total),images' }, allow404: true }); }
-  getPlaylistItems(id: string, opts: { limit?: number; offset?: number; market?: string } = {}) {
-    return this.api(`/playlists/${encodeURIComponent(id)}/tracks`, { query: { limit: opts.limit ?? 100, offset: opts.offset ?? 0, market: opts.market ?? 'from_token', additional_types: 'track' } });
+  getMyPlaylists(opts: { limit?: number; offset?: number } = {}) { return this.api('/me/playlists', { query: { limit: clampPage(opts.limit), offset: opts.offset ?? 0 } }); }
+  getPlaylist(id: string) { return this.api(`/playlists/${encodeURIComponent(id)}`, { query: { fields: 'id,name,description,owner(display_name),items(total),images' }, allow404: true }); }
+  // /items, not /tracks: the old route was removed and now 403s. Contents come
+  // back only for playlists the connected account owns or collaborates on —
+  // anything else answers metadata with an empty page, not an error.
+  getPlaylistItems(id: string, opts: { limit?: number; offset?: number } = {}) {
+    return this.api(`/playlists/${encodeURIComponent(id)}/items`, { query: { limit: clampPage(opts.limit), offset: opts.offset ?? 0, additional_types: 'track' } });
   }
-  getSavedTracks(opts: { limit?: number; offset?: number; market?: string } = {}) { return this.api('/me/tracks', { query: { limit: opts.limit ?? 50, offset: opts.offset ?? 0, market: opts.market ?? 'from_token' } }); }
-  getSavedAlbums(opts: { limit?: number; offset?: number; market?: string } = {}) { return this.api('/me/albums', { query: { limit: opts.limit ?? 50, offset: opts.offset ?? 0, market: opts.market ?? 'from_token' } }); }
+  getSavedTracks(opts: { limit?: number; offset?: number } = {}) { return this.api('/me/tracks', { query: { limit: clampPage(opts.limit), offset: opts.offset ?? 0 } }); }
+  getSavedAlbums(opts: { limit?: number; offset?: number } = {}) { return this.api('/me/albums', { query: { limit: clampPage(opts.limit), offset: opts.offset ?? 0 } }); }
   getMe() { return this.api('/me'); }
 
   // Walk a paginated endpoint: `page(offset)` returns Spotify's paging object.

@@ -18,7 +18,10 @@ const markers = await import('../src/broadcast/spotify-player.js');
 
 test('a well-formed event parses; junk in any field is dropped, not guessed', () => {
   const ok = parseSpotifyPlayerEvent({ event: 'track_changed', trackId: 'AAAAAAAAAAAAAAAAAAAAAA', uri: 'spotify:track:A', positionMs: 0, durationMs: 200000, at: 1700000000000 });
-  assert.deepEqual(ok, { event: 'track_changed', trackId: 'AAAAAAAAAAAAAAAAAAAAAA', positionMs: 0, durationMs: 200000, at: 1700000000000 });
+  // `seq` is the event-feed cursor; absent from a marker-only event, and null
+  // rather than missing so a reader never has to tell the two apart.
+  assert.deepEqual(ok, { event: 'track_changed', trackId: 'AAAAAAAAAAAAAAAAAAAAAA', positionMs: 0, durationMs: 200000, at: 1700000000000, seq: null });
+  assert.equal(parseSpotifyPlayerEvent({ event: 'playing', trackId: 'AAAAAAAAAAAAAAAAAAAAAA', at: 1700000000000, seq: 7 })!.seq, 7, 'a real cursor survives');
   assert.equal(parseSpotifyPlayerEvent(null), null);
   assert.equal(parseSpotifyPlayerEvent({ event: '', at: 1 }), null);
   assert.equal(parseSpotifyPlayerEvent({ event: 'playing', at: 0 }), null, 'a marker with no clock is unusable');

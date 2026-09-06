@@ -9,12 +9,17 @@
 //
 // Every song list passes through blocklist.rejectBlocked — the same chokepoint
 // the Subsonic client uses — so the never-play list is enforced identically.
+//
+// What February 2026's Web API restrictions cost this source (client.ts has the
+// full list): no top-songs at all (hasTopSongs:false), search answers ten at a
+// time so anything wanting more pages, and /me no longer reports the account
+// tier so ping() can require Premium but not verify it.
 
 import * as settings from '../../../settings.js';
 import * as blocklist from '../../blocklist.js';
 import { saveSecrets } from '../../../setup/secrets.js';
 import type { MusicSource, Song, Album, Artist, CoverArt, AnalyzableRef } from '../types.js';
-import { SpotifyClient, type SpotifyCredentials } from './client.js';
+import { SpotifyClient, SPOTIFY_PAGE_MAX, SPOTIFY_SEARCH_MAX, type SpotifyCredentials } from './client.js';
 import { SpotifyPoolCache, sample, type PoolConfig } from './pool.js';
 import { mapTrack, mapAlbum, mapArtist, mapPlaylist, unwrapItem, trackIdFromUri } from './map.js';
 
@@ -98,6 +103,25 @@ const normName = (s: unknown) => String(s ?? '')
   .normalize('NFD').replace(/[̀-ͯ]/g, '')
   .toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
 
+// /search caps `limit` at 10 since February 2026, but the picker asks for 25–40
+// in one call. Page until the caller's count is satisfied rather than silently
+// answering a tenth of what was asked for. Bounded: a search that has to walk
+// more than this is a search that isn't finding anything.
+const SEARCH_MAX_PAGES = 5;
+
+async function searchPaged(q: string, type: 'track' | 'artist', want: number, offset = 0): Promise<any[]> {
+  const c = spotifyClient();
+  const out: any[] = [];
+  const target = Math.max(1, want);
+  for (let page = 0; page < SEARCH_MAX_PAGES && out.length < target; page++) {
+    const r: any = await c.search(q, [type], { limit: SPOTIFY_SEARCH_MAX, offset: offset + page * SPOTIFY_SEARCH_MAX });
+    const items: any[] = (type === 'track' ? r?.tracks?.items : r?.artists?.items) ?? [];
+    out.push(...items);
+    if (items.length < SPOTIFY_SEARCH_MAX) break; // short page — that was the last one
+  }
+  return out.slice(0, target);
+}
+
 function yearOk(s: Song, fromYear?: number, toYear?: number): boolean {
   if (fromYear == null && toYear == null) return true;
   if (s.year == null) return false;
@@ -115,11 +139,16 @@ async function ping(): Promise<{ ok: boolean; reason?: string }> {
   }
   try {
     const me: any = await c.getMe();
+    // February 2026 removed `product` (and `country`) from /me, so Premium can
+    // no longer be PROBED — only required. Report what the account is, and say
+    // plainly that the tier is unknown rather than asserting "· premium" off a
+    // check that now always passes because the field is simply absent.
     const product = String(me?.product ?? '');
     if (product && product !== 'premium') {
       return { ok: false, reason: `Spotify account "${me?.display_name ?? me?.id}" is ${product}; Spotify Connect playback needs Premium` };
     }
-    return { ok: true, reason: `${me?.display_name ?? me?.id ?? 'account'} · premium` };
+    const who = me?.display_name ?? me?.id ?? 'account';
+    return { ok: true, reason: product ? `${who} · ${product}` : `${who} · connected (Spotify no longer reports the account tier; Connect playback needs Premium)` };
   } catch (err: any) {
     return { ok: false, reason: err?.message || 'unreachable' };
   }
@@ -134,8 +163,8 @@ async function search(query: any, { songCount = 20, songOffset = 0, includeBlock
     const one = await getSong(direct);
     return one ? keep([one], includeBlocked) : [];
   }
-  const r: any = await spotifyClient().search(q, ['track'], { limit: Math.min(50, Math.max(1, songCount)), offset: songOffset });
-  return withPoolGenres(keep((r?.tracks?.items ?? []).map((t: any) => mapTrack(t)), includeBlocked));
+  const items = await searchPaged(q, 'track', songCount, songOffset);
+  return withPoolGenres(keep(items.map((t: any) => mapTrack(t)), includeBlocked));
 }
 
 async function getSong(id: any): Promise<Song | null> {
@@ -154,7 +183,7 @@ async function getAlbum(id: any): Promise<Song[]> {
   const items: any[] = [...(a.tracks?.items ?? [])];
   // Albums over 50 tracks page.
   if (a.tracks?.next) {
-    for await (const t of c.paginate<any>((o) => c.getAlbumTracks(a.id, { offset: o, limit: 50 }))) {
+    for await (const t of c.paginate<any>((o) => c.getAlbumTracks(a.id, { offset: o, limit: SPOTIFY_PAGE_MAX }), { pageSize: SPOTIFY_PAGE_MAX })) {
       if (!items.some((x) => x.id === t.id)) items.push(t);
     }
   }
@@ -168,7 +197,7 @@ async function getArtist(id: any): Promise<Artist | null> {
   if (!artist) return null;
   let album: Album[] = [];
   try {
-    const r: any = await c.getArtistAlbums(artist.id, { limit: 50 });
+    const r: any = await c.getArtistAlbums(artist.id, { limit: SPOTIFY_PAGE_MAX });
     album = (r?.items ?? []).map(mapAlbum).filter(Boolean) as Album[];
   } catch { /* an artist with no readable albums is still an artist */ }
   return { ...artist, album };
@@ -177,8 +206,8 @@ async function getArtist(id: any): Promise<Artist | null> {
 async function searchArtists(query: any, { artistCount = 5 } = {}): Promise<Artist[]> {
   const q = String(query ?? '').trim();
   if (!q) return [];
-  const r: any = await spotifyClient().search(q, ['artist'], { limit: Math.min(50, Math.max(1, artistCount)) });
-  return (r?.artists?.items ?? []).map(mapArtist).filter(Boolean) as Artist[];
+  const items = await searchPaged(q, 'artist', artistCount);
+  return items.map(mapArtist).filter(Boolean) as Artist[];
 }
 
 async function getGenres() {
@@ -200,11 +229,11 @@ async function getSongsByGenre(genre: any, { count = 20 } = {}): Promise<Song[]>
   const fromPool = await getRandomSongs({ size: count, genre: String(genre) });
   if (fromPool.length) return fromPool;
   // Off-pool fallback: Spotify's own genre filter, at a random page so repeat
-  // calls do not return the same fifty.
+  // calls do not return the same handful.
   try {
-    const offset = Math.floor(Math.random() * 5) * 50;
-    const r: any = await spotifyClient().search(`genre:"${String(genre)}"`, ['track'], { limit: 50, offset });
-    return keep(sample((r?.tracks?.items ?? []).map((t: any) => mapTrack(t)), count));
+    const offset = Math.floor(Math.random() * 5) * SPOTIFY_SEARCH_MAX;
+    const items = await searchPaged(`genre:"${String(genre)}"`, 'track', count, offset);
+    return keep(sample(items.map((t: any) => mapTrack(t)), count));
   } catch {
     return [];
   }
@@ -275,7 +304,7 @@ async function getRecentSongsByArtist(artistName: any, { albums = 3, count = 20 
   const artist = await resolveArtist(artistName);
   if (!artist?.id) return [];
   const c = spotifyClient();
-  const r: any = await c.getArtistAlbums(artist.id, { limit: 50 });
+  const r: any = await c.getArtistAlbums(artist.id, { limit: SPOTIFY_PAGE_MAX });
   const list = ((r?.items ?? []) as any[])
     .sort((x, y) => String(y.release_date ?? '').localeCompare(String(x.release_date ?? '')))
     .slice(0, albums);
@@ -287,24 +316,23 @@ async function getRecentSongsByArtist(artistName: any, { albums = 3, count = 20 
   return songs.slice(0, count);
 }
 
-// ── optional (capabilities: starred, top songs, playlists, recently added) ──
+// ── optional (capabilities: starred, playlists, recently added) ─────────────
+//
+// No getTopSongs: February 2026 removed GET /artists/{id}/top-tracks with no
+// replacement, and `popularity` went with it, so there is nothing left to rank
+// by. capabilities.ts declares hasTopSongs:false for spotify rather than having
+// this return [] — a picker tool offered without a backing index spends the
+// model's discovery call on a guaranteed-empty answer.
 
 async function getStarred(): Promise<Song[]> {
   const c = spotifyClient();
   const out: Song[] = [];
-  for await (const item of c.paginate<any>((o) => c.getSavedTracks({ offset: o, limit: 50 }), { max: 100 })) {
+  for await (const item of c.paginate<any>((o) => c.getSavedTracks({ offset: o, limit: SPOTIFY_PAGE_MAX }), { pageSize: SPOTIFY_PAGE_MAX, max: 100 })) {
     const t = unwrapItem(item);
     const s = t ? mapTrack(t, { addedAt: item?.added_at }) : null;
     if (s) out.push(s);
   }
   return withPoolGenres(keep(out));
-}
-
-async function getTopSongs(artistName: any, { count = 10 } = {}): Promise<Song[]> {
-  const artist = await resolveArtist(artistName);
-  if (!artist?.id) return [];
-  const r: any = await spotifyClient().getArtistTopTracks(artist.id);
-  return withPoolGenres(keep((r?.tracks ?? []).map((t: any) => mapTrack(t)))).slice(0, count);
 }
 
 // Memoised: the admin's shows/blocklist tabs ask /dj/playlists on every render
@@ -316,7 +344,7 @@ async function getPlaylists() {
   if (playlistsMemo && Date.now() - playlistsMemo.at < PLAYLISTS_MEMO_MS) return playlistsMemo.value;
   const c = spotifyClient();
   const out: any[] = [];
-  for await (const p of c.paginate<any>((o) => c.getMyPlaylists({ offset: o, limit: 50 }))) {
+  for await (const p of c.paginate<any>((o) => c.getMyPlaylists({ offset: o, limit: SPOTIFY_PAGE_MAX }), { pageSize: SPOTIFY_PAGE_MAX })) {
     const m = mapPlaylist(p);
     if (m) out.push(m);
   }
@@ -327,7 +355,7 @@ async function getPlaylists() {
 async function getPlaylist(id: any): Promise<Song[]> {
   const c = spotifyClient();
   const out: Song[] = [];
-  for await (const item of c.paginate<any>((o) => c.getPlaylistItems(String(id), { offset: o, limit: 100 }), { pageSize: 100 })) {
+  for await (const item of c.paginate<any>((o) => c.getPlaylistItems(String(id), { offset: o, limit: SPOTIFY_PAGE_MAX }), { pageSize: SPOTIFY_PAGE_MAX })) {
     const t = unwrapItem(item);
     const s = t ? mapTrack(t, { addedAt: item?.added_at }) : null;
     if (s) out.push(s);
@@ -336,7 +364,7 @@ async function getPlaylist(id: any): Promise<Song[]> {
 }
 
 async function getRecentlyAddedAlbums({ size = 20 } = {}): Promise<Album[]> {
-  const r: any = await spotifyClient().getSavedAlbums({ limit: Math.min(50, size) });
+  const r: any = await spotifyClient().getSavedAlbums({ limit: Math.min(SPOTIFY_PAGE_MAX, size) });
   return ((r?.items ?? []) as any[])
     .map((it) => {
       const a = mapAlbum(it?.album);
@@ -368,7 +396,6 @@ export const spotifySource: MusicSource = {
   // No playback URI builders: Spotify plays through the live transport
   // (capabilities.hasLiveTransport) — the queue never asks for one.
   getStarred,
-  getTopSongs,
   getPlaylists,
   getPlaylist,
   getRecentlyAddedAlbums,

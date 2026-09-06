@@ -58,13 +58,17 @@ const CAPS: Record<string, SourceCapabilities> = {
   // structurally — audio bytes (a DRM stream, nothing to analyse). Playback is
   // a LIVE transport: the queue hands picks to the Spotify controller instead
   // of writing next.txt.
+  //
+  // hasTopSongs went off in the February 2026 API restrictions: Spotify removed
+  // GET /artists/{id}/top-tracks with no replacement and dropped `popularity`
+  // from track objects, so there is nothing left to rank an artist's songs by.
   spotify: {
     hasSimilar: false,
     hasSonicSimilarity: false,
     hasStarred: true,
     hasStar: false,
     hasScrobble: false,
-    hasTopSongs: true,
+    hasTopSongs: false,
     hasArtistInfo: false,
     hasLastfmTags: false,
     hasLyrics: false,

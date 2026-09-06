@@ -6,7 +6,13 @@
 //   • a rotated refresh token and every fresh access token reach their sinks;
 //   • no token ever appears in a log line;
 //   • 204 / allow404 return null, other errors throw SpotifyApiError with the
-//     endpoint and status.
+//     endpoint and status;
+//   • the POST-FEBRUARY-2026 endpoint surface at the wire — playlist contents
+//     come from /items not /tracks, page sizes never exceed Spotify's caps,
+//     search never asks for more than ten, and no call still sends the legacy
+//     market=from_token. Each of those was a silent failure mode: /tracks 403s,
+//     an over-asked page is trimmed and `paginate` reads the short page as the
+//     last one, and from_token has nothing left to resolve against.
 //
 // Run: npm test -- spotify-client
 
@@ -22,7 +28,9 @@ function fakeFetch(script: Step[]) {
     calls.push({ url: String(url), init });
     const step = script.shift();
     if (!step) throw new Error(`unexpected fetch: ${url}`);
-    const text = step.body === undefined ? '' : JSON.stringify(step.body);
+    // A raw string body goes out verbatim — that is how a removed endpoint
+    // answers (an HTML error page, not JSON), and the client must survive it.
+    const text = step.body === undefined ? '' : typeof step.body === 'string' ? step.body : JSON.stringify(step.body);
     return {
       ok: step.status >= 200 && step.status < 300,
       status: step.status,
@@ -152,6 +160,52 @@ test('authorizeUrl carries every scope librespot and the controller need', () =>
   const scopes = (u.searchParams.get('scope') ?? '').split(' ');
   for (const s of SPOTIFY_SCOPES) assert.ok(scopes.includes(s), `scope ${s}`);
   assert.ok(scopes.includes('streaming'), 'librespot login needs streaming');
+});
+
+test('playlist contents come from /items, capped at 50, with no market param', async () => {
+  const { fetchImpl, calls } = fakeFetch([tokenOk(), { status: 200, body: { items: [] } }, { status: 200, body: { items: [] } }]);
+  const c = new SpotifyClient({ fetch: fetchImpl, credentials: creds });
+  await c.getPlaylistItems('PL1');
+  await c.getPlaylistItems('PL1', { limit: 100, offset: 50 });
+  const u1 = new URL(calls[1].url);
+  assert.equal(u1.pathname, '/v1/playlists/PL1/items', '/tracks was REMOVED and now 403s');
+  assert.equal(u1.searchParams.get('limit'), '50');
+  assert.equal(u1.searchParams.get('additional_types'), 'track');
+  assert.equal(u1.searchParams.get('market'), null, 'from_token is gone — the user token carries the country');
+  assert.equal(new URL(calls[2].url).searchParams.get('limit'), '50', 'an over-asked page is clamped, not passed through');
+});
+
+test('search never asks for more than ten, and the removed batch/top-tracks calls are gone from the client', async () => {
+  const { fetchImpl, calls } = fakeFetch([tokenOk(), { status: 200, body: { tracks: { items: [] } } }, { status: 200, body: { tracks: { items: [] } } }]);
+  const c = new SpotifyClient({ fetch: fetchImpl, credentials: creds });
+  await c.search('portishead', ['track'], { limit: 50 });
+  await c.search('portishead', ['track'], {});
+  for (const i of [1, 2]) {
+    const u = new URL(calls[i].url);
+    assert.equal(u.searchParams.get('limit'), '10', 'Spotify caps /search at 10 — asking 50 returns a trimmed page');
+    assert.equal(u.searchParams.get('market'), null);
+  }
+  const surface = c as unknown as Record<string, unknown>;
+  for (const gone of ['getTracks', 'getArtists', 'getArtistTopTracks']) {
+    assert.equal(typeof surface[gone], 'undefined', `${gone} hits an endpoint Spotify removed`);
+  }
+  assert.equal(typeof c.getArtist, 'function', 'the per-id read is the replacement for the batch');
+});
+
+test('a failure with no error.message still says something — the bare "Forbidden" that named nothing', async () => {
+  const logs: string[] = [];
+  const { fetchImpl } = fakeFetch([tokenOk(), { status: 403, body: undefined }]);
+  const c = new SpotifyClient({ fetch: fetchImpl, credentials: creds, log: (l) => logs.push(l) });
+  await assert.rejects(c.getPlaylistItems('PL1'), (e: any) => e instanceof SpotifyApiError && e.status === 403);
+  assert.match(logs.join('\n'), /playlists\/PL1\/items → 403/);
+
+  // A non-JSON body — what a removed route actually answers — must not be
+  // swallowed: the raw prefix is the only clue the operator gets.
+  const logs2: string[] = [];
+  const html = fakeFetch([tokenOk(), { status: 403, body: '<html>Forbidden: endpoint removed</html>' }]);
+  const c2 = new SpotifyClient({ fetch: html.fetchImpl, credentials: creds, log: (l) => logs2.push(l) });
+  await assert.rejects(c2.api('/playlists/PL1/items'), (e: any) => e.status === 403);
+  assert.match(logs2.join('\n'), /endpoint removed/, 'the body reaches the log, not just "Forbidden"');
 });
 
 test('redactSpotify hides token-shaped values', () => {

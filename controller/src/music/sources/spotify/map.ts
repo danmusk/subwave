@@ -15,6 +15,10 @@
 //     the source, so the wire shape stays identical to Navidrome's.
 //   • `genres` come from the ARTIST (Spotify tags artists, never tracks); the
 //     walk fills them in when it has the artist cached, else they stay [].
+//   • `popularity` is read where Spotify still sends it, but February 2026
+//     removed the field from track/album/artist objects for Development Mode
+//     apps, so in practice it is now always undefined. The guards stay — they
+//     already fail soft, and an extended-quota app still gets the number.
 
 import type { Song, Album, Artist } from '../types.js';
 
@@ -136,16 +140,24 @@ export function mapPlaylist(p: any) {
     name: p.name ?? '',
     comment: p.description ?? undefined,
     owner: p.owner?.display_name ?? undefined,
-    songCount: typeof p.tracks?.total === 'number' ? p.tracks.total : undefined,
+    // `tracks` was renamed `items` in February 2026; read either.
+    songCount: typeof p.items?.total === 'number' ? p.items.total
+      : typeof p.tracks?.total === 'number' ? p.tracks.total : undefined,
     coverArt: p.id,
     _imageUrl: pickImage(p.images),
   };
 }
 
 // A playlist/saved item wraps the track; skip local files, episodes and
-// unavailable rows (Spotify returns `track: null` for a removed track).
+// unavailable rows (Spotify returns a null payload for a removed track).
+//
+// BOTH wrapper keys are read on purpose. February 2026 renamed the playlist
+// row's `track` to `item` (GET /playlists/{id}/items), while the saved-tracks
+// row (GET /me/tracks) still says `track`. This is the one function both walks
+// go through, so accepting either here is what keeps them a single seam
+// instead of two shapes drifting apart at their call sites.
 export function unwrapItem(item: any): any | null {
-  const t = item?.track ?? item;
+  const t = item?.item ?? item?.track ?? item;
   if (!t || t.is_local || t.type === 'episode' || typeof t.id !== 'string') return null;
   return t;
 }

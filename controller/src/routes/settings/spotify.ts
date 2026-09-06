@@ -43,6 +43,22 @@ export function spotifyRedirectUri(req: express.Request): string {
   return `${origin}/api/settings/spotify/callback`;
 }
 
+// The pool's own health, including WHY a build came back partial. `partial`
+// on its own only told the operator to go read container logs — which is how a
+// wave of 403s sat unnoticed while the station ran on the dead-air guard.
+export function poolStatus() {
+  const p = spotifyPool().peek();
+  if (!p) return null;
+  return {
+    tracks: p.tracks.size,
+    albums: p.albums.size,
+    playlists: p.playlists.length,
+    builtAt: p.builtAt,
+    partial: p.partial,
+    notes: p.notes,
+  };
+}
+
 export function spotifyStatus(req: express.Request) {
   const c = spotifyCredentials();
   return {
@@ -56,15 +72,7 @@ export function spotifyStatus(req: express.Request) {
     },
     redirectUri: spotifyRedirectUri(req),
     scopes: SPOTIFY_SCOPES,
-    pool: spotifyPool().peek()
-      ? {
-          tracks: spotifyPool().peek()!.tracks.size,
-          albums: spotifyPool().peek()!.albums.size,
-          playlists: spotifyPool().peek()!.playlists.length,
-          builtAt: spotifyPool().peek()!.builtAt,
-          partial: spotifyPool().peek()!.partial,
-        }
-      : null,
+    pool: poolStatus(),
   };
 }
 
@@ -154,14 +162,22 @@ router.post('/settings/spotify/token', requireAdmin, async (req, res) => {
   res.json({ ok: true, ...spotifyStatus(req) });
 });
 
-// Non-mutating probe: refreshes a token and asks who we are. Reports the
-// account product because Connect playback needs Premium.
+// Non-mutating probe: refreshes a token and asks who we are. It can no longer
+// report the account tier — February 2026 removed `product` and `country` from
+// /me — so it says so rather than reporting a misleading "unknown". Connect
+// playback still needs Premium; that is now a requirement, not a check.
 router.post('/settings/spotify/test', requireAdmin, async (_req, res) => {
   const c = spotifyClient();
   if (!c.hasCredentials()) return res.json({ ok: false, error: 'not connected' });
   try {
     const me: any = await c.getMe();
-    res.json({ ok: true, displayName: me?.display_name ?? me?.id, product: me?.product ?? 'unknown', country: me?.country });
+    res.json({
+      ok: true,
+      displayName: me?.display_name ?? me?.id,
+      product: me?.product ?? null,
+      country: me?.country ?? null,
+      note: me?.product ? undefined : 'Spotify no longer reports the account tier over the Web API. Connect playback needs Premium.',
+    });
   } catch (err: any) {
     res.json({ ok: false, error: err?.message || 'probe failed' });
   }
@@ -240,7 +256,7 @@ router.post('/settings/spotify/pool/refresh', requireAdmin, async (_req, res) =>
   try {
     spotifyPool().invalidate();
     const p = await spotifyPool().get();
-    res.json({ ok: true, tracks: p.tracks.size, albums: p.albums.size, playlists: p.playlists, genres: p.genres.size, partial: p.partial });
+    res.json({ ok: true, tracks: p.tracks.size, albums: p.albums.size, playlists: p.playlists, genres: p.genres.size, partial: p.partial, notes: p.notes });
   } catch (err: any) {
     res.status(502).json({ ok: false, error: err?.message || 'pool build failed' });
   }

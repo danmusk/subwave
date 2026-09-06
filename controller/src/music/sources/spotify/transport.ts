@@ -457,7 +457,15 @@ export async function startSpotifyTransportIfActive(): Promise<SpotifyTransport 
   // librespot credential cache re-signs in without the operator. Hourly
   // tokens, refreshed every 50 minutes; a failure just logs (the cache is the
   // normal path — this file is only read on a cold login).
+  //
+  // The receiver flow is a PUBLIC PKCE client, and Spotify ROTATES its refresh
+  // token on every refresh: the one we just spent is dead. Persisting the new
+  // one is therefore not an optimisation, it is the whole loop — without it the
+  // first successful refresh silently strands the stored token and every later
+  // attempt comes back "Refresh token revoked", hourly, forever. The app client
+  // has always done this (client.ts onRefreshToken); this half had not.
   const { refreshReceiverToken } = await import('./receiver-auth.js');
+  const { saveSecrets } = await import('../../../setup/secrets.js');
   const refresh = async () => {
     const rt = process.env.SPOTIFY_RECEIVER_REFRESH_TOKEN;
     if (!rt) return;
@@ -466,8 +474,21 @@ export async function startSpotifyTransportIfActive(): Promise<SpotifyTransport 
     try {
       const tok = await refreshReceiverToken(rt);
       await writeLibrespotToken(tok.accessToken, tok.expiresAt);
+      if (tok.refreshToken && tok.refreshToken !== rt) {
+        try { await saveSecrets({ SPOTIFY_RECEIVER_REFRESH_TOKEN: tok.refreshToken }); }
+        catch (err: any) { queue.log('error', `Spotify receiver: could not persist the rotated refresh token — the next refresh will be rejected: ${err?.message ?? err}`); }
+      }
     } catch (err: any) {
-      queue.log('error', `Spotify receiver token refresh failed: ${err?.message ?? err}`);
+      // A revoked or otherwise dead grant will never recover on its own. Drop
+      // it so the status reads "not signed in" and the operator is told what to
+      // do, instead of an hourly error against a token that cannot work.
+      const msg = String(err?.message ?? err);
+      if (/revoked|invalid_grant/i.test(msg)) {
+        try { await saveSecrets({ SPOTIFY_RECEIVER_REFRESH_TOKEN: '' }); } catch { /* the log below is what matters */ }
+        queue.log('error', 'Spotify receiver sign-in expired (refresh token revoked). Sign the receiver in again: Settings → Music source → Playback → Sign the receiver in.');
+        return;
+      }
+      queue.log('error', `Spotify receiver token refresh failed: ${msg}`);
     }
   };
   void refresh();

@@ -23,7 +23,10 @@ interface SpotifySectionProps {
   refresh: () => void;
 }
 
-type Probe = { ok: boolean; displayName?: string; product?: string; country?: string; error?: string };
+// `product` and `country` are null on every current Spotify app: February 2026
+// removed both fields from /me. The probe still names the account, and `note`
+// carries the explanation so the UI does not have to guess why they are absent.
+type Probe = { ok: boolean; displayName?: string; product?: string | null; country?: string | null; note?: string; error?: string };
 
 export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }: SpotifySectionProps) {
   const st = data.spotify;
@@ -189,13 +192,13 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
           {st?.connected ? <Btn sm onClick={disconnect} disabled={saving || !!st?.env?.refreshToken}>Disconnect</Btn> : null}
           <span className="text-sm opacity-80">
             {st?.connected ? 'connected' : 'not connected'}
-            {probe ? (probe.ok ? ` · ${probe.displayName} · ${probe.product}${probe.country ? ` · ${probe.country}` : ''}` : ` · ${probe.error}`) : ''}
+            {probe ? (probe.ok ? ` · ${probe.displayName}${probe.product ? ` · ${probe.product}` : ''}${probe.country ? ` · ${probe.country}` : ''}` : ` · ${probe.error}`) : ''}
           </span>
         </div>
-        {probe?.ok && probe.product === 'unknown' ? (
-          <div className="field-hint mt-2">Spotify did not report the account type — the token predates the <code>user-read-private</code> scope. Press <b>Reconnect Spotify</b> once to grant it.</div>
+        {probe?.ok && probe.note ? (
+          <div className="field-hint mt-2">{probe.note}</div>
         ) : null}
-        {probe?.ok && probe.product && probe.product !== 'unknown' && probe.product !== 'premium' ? (
+        {probe?.ok && probe.product && probe.product !== 'premium' ? (
           <div className="field-hint mt-2">This account is <b>{probe.product}</b>. Spotify Connect playback needs Premium.</div>
         ) : null}
         <details className="mt-3">
@@ -233,6 +236,20 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
               : 'pool not built yet — it builds on first use'}
           </span>
         </div>
+        {/* A partial build used to say only "partial", which sent the operator
+            to the container logs. The reasons ride out on the status now. */}
+        {st?.pool?.notes?.length ? (
+          <ul className="field-hint mt-2 list-disc pl-5">
+            {st.pool.notes.map((n) => <li key={n}>{n}</li>)}
+          </ul>
+        ) : null}
+        {st?.pool && st.pool.tracks === 0 ? (
+          <div className="field-hint mt-2">
+            An empty pool means nothing to play: the station falls back to the mixer&apos;s emergency loop.
+            Spotify serves playlist contents only for playlists this account <b>owns or collaborates on</b> — a followed
+            playlist resolves its name but returns no tracks.
+          </div>
+        ) : null}
       </Card>
 
       <Card title="Playback" sub="The Spotify Connect receiver (librespot) runs inside the broadcast container and is commanded by the station.">

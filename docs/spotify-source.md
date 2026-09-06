@@ -121,6 +121,18 @@ ReplayGain data via librespot instead. Also off: Last.fm similar-songs and the
 OpenSubsonic sonic extension (the picker tools for them are simply not
 offered), lyrics, Navidrome scrobbling/starring, playlist editing, beds.
 
+Spotify's own **February 2026 API restrictions** take a further slice, for every
+app that is not in extended quota mode:
+
+- **an artist's top songs are gone entirely** (`/artists/{id}/top-tracks` was
+  removed with no replacement, and `popularity` went with it), so the
+  `topSongsByArtist` picker tool is not offered on Spotify;
+- **the pool can only be built from playlists this account owns or collaborates
+  on** — a followed playlist gives its name and cover but no tracks;
+- **search answers ten results a page** instead of fifty, so wide searches page;
+- **the account tier is no longer readable**, so *Test* can confirm who you are
+  but not that you are Premium. Connect playback still requires it.
+
 Everything else is on: the agent and pool pickers, text tagging and
 embeddings over the pool, era filtering (album-level; compilations read as
 unknown-year as they do on Navidrome), requests, ducked links/idents/banter/
@@ -138,7 +150,10 @@ receiver launch flags and need a mixer restart; the rest apply live.
 | Emergency loop on air, `/state` says `musicStarved` | `docker compose logs broadcast` (`librespot-run:` lines) | receiver not running: not connected yet, token stale, or the image lacks librespot |
 | `librespot-run: no cached credentials and no token file` | admin → Music source → Playback | *Sign the receiver in* has not been done on this station |
 | `could not initialize spirc: … INVALID_CREDENTIALS` in the broadcast log | Playback card | the token file holds a Developer-app token (older build) — *Sign the receiver in*; a newer token replaces the stale credential cache |
-| Test says `free`/`open` | Spotify account | Premium required for Connect playback |
+| Pool builds to **0 tracks**, booth log says `nothing to play … the pool is empty` | admin → Music source → Library pool (it names the reason) | Spotify serves playlist CONTENTS only for playlists the connected account **owns or collaborates on** — a followed or someone else's playlist resolves its name and returns nothing. Put the tracks in a playlist this account owns, or turn on saved tracks/albums |
+| `Refresh token revoked` on the RECEIVER, hourly | Playback card | the receiver sign-in has expired — *Sign the receiver in* again. (Fixed at the source since the refresher now persists Spotify's rotated token; a token stranded by an older build still needs one manual re-sign-in) |
+| Test can't say whether the account is Premium | — | expected: Spotify removed `product` from `/me` in February 2026. Premium is still required, it just cannot be probed |
+| Any Web API call answering **403** on an endpoint that used to work | `docker compose logs controller` (`[spotify] GET … → 403 …`) | the February 2026 Development Mode restrictions removed a slice of the API. The station targets the new surface; a 403 on something else means another endpoint went the same way |
 | Receiver missing from the device list | `spotify.deviceName`, `docker compose logs broadcast` | librespot not authenticated; the name is matched case-insensitively |
 | Picks never start, booth log says `no-device` | as above | the receiver is down; picks stay queued until it returns |
 | `unavailable` in the booth log | track/market | not playable on this account or market — dropped and re-picked |

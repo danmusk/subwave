@@ -20,8 +20,30 @@ import {
   activeModelLabel,
 } from '../llm/provider.js';
 import { recentCalls } from '../llm/log.js';
+import { spotifyPool } from '../music/sources/spotify/source.js';
 import type { Finding, StationSettings } from './types.js';
 import { classifyModel, isSchemaFailure } from './util.js';
+
+// Whether the Spotify pool — the station's whole library in spotify mode — holds
+// anything. Reads the LAST BUILD rather than forcing one: doctor must not spend
+// a rebuild's worth of API calls, and a pool nobody has built yet is not a fault.
+function spotifyPoolFinding(): Finding[] {
+  const p = spotifyPool().peek();
+  if (!p) return [{ label: 'spotify pool', status: 'warn', detail: 'not built yet — it builds on first use' }];
+  const summary = `${p.tracks.size} tracks · ${p.albums.size} albums · ${p.playlists.length} playlists`;
+  if (p.tracks.size === 0) {
+    return [{
+      label: 'spotify pool',
+      status: 'fail',
+      detail: p.notes.length ? `empty — ${p.notes[0]}` : `empty (${summary})`,
+      hint: 'Nothing to play: the mixer\'s emergency loop covers the air. Spotify serves playlist contents only for playlists the connected account owns or collaborates on — check Settings → Music source → Library pool.',
+    }];
+  }
+  if (p.partial) {
+    return [{ label: 'spotify pool', status: 'warn', detail: `${summary} · partial — ${p.notes[0] ?? 'a source page failed'}` }];
+  }
+  return [{ label: 'spotify pool', status: 'ok', detail: summary }];
+}
 
 // ---------------------------------------------------------------------------
 // Sections
@@ -171,6 +193,11 @@ export async function checkNavidrome(): Promise<Finding[]> {
       detail: sp.reason || (sp.ok ? 'connected' : 'unreachable'),
       hint: sp.ok ? undefined : 'Settings → Music source: add the Spotify client id/secret and press Connect. Playback needs a Premium account.',
     });
+    // Connectivity is NOT the same finding as "there is music to play". The
+    // /me probe above keeps passing while every catalog call 403s, which is
+    // exactly how a station ran for hours on the dead-air guard with a green
+    // doctor. Judge the pool separately.
+    if (subsonic.activeSourceId() === 'spotify') out.push(...spotifyPoolFinding());
     return out;
   }
 

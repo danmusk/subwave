@@ -503,7 +503,9 @@ export interface SettingsData {
     connected?: boolean;
     env?: { clientId?: boolean; clientSecret?: boolean; refreshToken?: boolean };
     redirectUri?: string;
-    pool?: { tracks: number; albums: number; playlists: number; builtAt: number; partial: boolean } | null;
+    // `notes` is WHY a build came back partial, in operator words — `partial`
+    // on its own only pointed at the container logs.
+    pool?: { tracks: number; albums: number; playlists: number; builtAt: number; partial: boolean; notes?: string[] } | null;
     // The RECEIVER's (librespot) sign-in — a second login for Spotify's own
     // client id; see music/sources/spotify/receiver-auth.ts.
     receiver?: {
