@@ -250,6 +250,24 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
             playlist resolves its name but returns no tracks.
           </div>
         ) : null}
+        {/* Genre enrichment costs one request per artist (Spotify removed the
+            batch read), so it fills a little per rebuild and is cached on disk.
+            Without a progress line a converging background job looks broken. */}
+        {st?.pool && (st.pool.genresPending ?? 0) > 0 ? (
+          <div className="field-hint mt-2">
+            Artist genres: <b>{(st.pool.artists ?? 0) - (st.pool.genresPending ?? 0)}</b> of{' '}
+            <b>{st.pool.artists ?? 0}</b> artists tagged, {st.pool.genresPending} still to fetch.
+            Spotify charges one request per artist, so this fills a batch at a time and is remembered
+            across restarts — genre shows and genre picking improve as it goes.
+          </div>
+        ) : null}
+        {st?.pool && (st.pool.rateLimitedMs ?? 0) > 0 ? (
+          <div className="field-hint mt-2">
+            <b>Spotify is rate-limiting this app</b> — resuming in about {Math.ceil((st.pool.rateLimitedMs ?? 0) / 1000)}s.
+            The station holds off on its own; music keeps playing and enrichment continues when the window clears.
+            The limit belongs to Development Mode and cannot be raised.
+          </div>
+        ) : null}
       </Card>
 
       <Card title="Playback" sub="The Spotify Connect receiver (librespot) runs inside the broadcast container and is commanded by the station.">

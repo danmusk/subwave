@@ -131,7 +131,22 @@ app that is not in extended quota mode:
   on** — a followed playlist gives its name and cover but no tracks;
 - **search answers ten results a page** instead of fifty, so wide searches page;
 - **the account tier is no longer readable**, so *Test* can confirm who you are
-  but not that you are Premium. Connect playback still requires it.
+  but not that you are Premium. Connect playback still requires it;
+- **artist genres arrive gradually.** Spotify tags artists rather than tracks and
+  the batch lookup is gone, so genres cost one request per artist. The station
+  fetches a batch per pool rebuild, busiest artists first, and remembers the
+  answers on disk (`state/spotify/artist-genres.json`) — so coverage climbs over
+  a few hours and then costs nothing, surviving restarts. The Library pool card
+  shows the progress. Genre shows and genre-based picking sharpen as it fills.
+
+**You cannot leave Development Mode**, and you should not try. Since 15 May 2025
+Spotify accepts extended-quota applications only from **organisations** — a
+registered business with a launched service and at least 250k monthly active
+users. A personal station cannot qualify. Development Mode is fine here: its
+user allowlist only needs to hold you. What binds is the **rolling 30-second
+request window**, which is why the station paces itself rather than retrying
+harder — when Spotify says stop, every request in the controller stops together
+and the admin page shows the countdown.
 
 Everything else is on: the agent and pool pickers, text tagging and
 embeddings over the pool, era filtering (album-level; compilations read as
@@ -154,13 +169,16 @@ receiver launch flags and need a mixer restart; the rest apply live.
 | `Refresh token revoked` on the RECEIVER, hourly | Playback card | the receiver sign-in has expired — *Sign the receiver in* again. (Fixed at the source since the refresher now persists Spotify's rotated token; a token stranded by an older build still needs one manual re-sign-in) |
 | Test can't say whether the account is Premium | — | expected: Spotify removed `product` from `/me` in February 2026. Premium is still required, it just cannot be probed |
 | Any Web API call answering **403** on an endpoint that used to work | `docker compose logs controller` (`[spotify] GET … → 403 …`) | the February 2026 Development Mode restrictions removed a slice of the API. The station targets the new surface; a 403 on something else means another endpoint went the same way |
+| `rate limited … holding every request for Ns`, once | admin → Music source → Library pool | normal and self-healing: Spotify's rolling 30s window. Every request in the controller stands down together and genre enrichment resumes when it clears. One line per window — a *flood* of 429s means an older build |
+| Artist genres stuck at the same number | Library pool card | each rebuild spends a bounded batch (see `ARTIST_GENRE_BUDGET`); force one with *Rebuild pool now*. If it never moves, check for a rate-limit line |
 | Receiver missing from the device list | `spotify.deviceName`, `docker compose logs broadcast` | librespot not authenticated; the name is matched case-insensitively |
 | Picks never start, booth log says `no-device` | as above | the receiver is down; picks stay queued until it returns |
 | `unavailable` in the booth log | track/market | not playable on this account or market — dropped and re-picked |
 | Silence but `/state` transport shows `playing` | `state/spotify-audio.json` | receiver stalled; the transport re-commands after the idle window |
 | Doctor: `spotify connectivity` fails | credentials | refresh token revoked — reconnect |
 
-State files: `state/spotify/` (receiver credential cache, token),
+State files: `state/spotify/` (receiver credential cache, token,
+`artist-genres.json` — a rebuildable cache, deliberately not in backups),
 `state/spotify-player.json` (last player event), `state/spotify-audio.json`
 (silence detector), `state/logs/spotify-events.log` (rolling event log),
 `state/liquidsoap_music_mode.txt` and `state/liquidsoap_spotify.txt` (mixer

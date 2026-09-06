@@ -15,6 +15,28 @@
 // retry": one token refresh on 401, one bounded wait on 429, nothing else. A
 // failure surfaces as SpotifyApiError and the caller decides.
 //
+// RATE LIMITING IS SHARED STATE, and that is the load-bearing part. Spotify
+// meters a rolling 30-second window, and this station is stuck in Development
+// Mode for good (extended quota is organisations-only, ≥250k MAU), so the
+// window is not something we can buy our way out of — see docs/spotify-source.md.
+// A 429 therefore sets ONE gate that every other caller reads, instead of each
+// caller discovering the limit by spending a request against it. The measured
+// failure: the per-artist genre fill hit a long `Retry-After`, every worker
+// independently retried, and the old code — which only waited when Retry-After
+// fitted inside its cap and otherwise fell straight through to the throw —
+// spun through ~2000 remaining artists as fast as it could, turning a rate
+// limit into a rate-limit storm. Never restore per-request-only 429 handling.
+//
+// Two lanes, because a burst of enrichment must never delay the music:
+//   • FOREGROUND (default) — playing a track, walking the pool. Waits out a
+//     short window, gives up on a long one, and is never spaced.
+//   • BACKGROUND (`background: true`) — droppable enrichment. Spaced by a
+//     global promise chain, and while the gate is closed it does not send a
+//     request AT ALL. That is what turns 2000 doomed calls into zero.
+// Background is deliberately NOT put on the same queue as foreground: a line of
+// spaced enrichment requests sitting in front of a play command is exactly the
+// priority inversion this split exists to prevent.
+//
 // THIS CLIENT TARGETS THE POST-FEBRUARY-2026 WEB API. Spotify removed a large
 // slice of the surface for Development Mode apps (enforced on existing apps
 // 2026-03-09); a removed route answers 403 with no useful body, which reads as
@@ -75,15 +97,36 @@ export interface SpotifyClientDeps {
   // one (state/spotify/token) — see docker/spotify/librespot-run.sh.
   onAccessToken?: (token: string, expiresAt: number) => void | Promise<void>;
   log?: (line: string) => void;
-  // Max wait honoured on a 429 before giving up (ms). Bounded so a transition
-  // never stalls behind Spotify's rate limiter.
+  // Longest a FOREGROUND call will sit waiting for the rate-limit gate before
+  // giving up (ms). Bounded so a transition never stalls behind Spotify's
+  // limiter — the transport's own backoff is the better place to lose time.
+  // Background calls never wait at all.
   maxRetryAfterMs?: number;
+  // Minimum gap between BACKGROUND request starts (ms). The politeness floor
+  // that keeps a wide enrichment pool from becoming a burst.
+  backgroundGapMs?: number;
+  // Injected sleep, so the tests do not spend real seconds proving the waits.
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export class SpotifyApiError extends Error {
+  // How long Spotify said to wait, when it said so. Carried on the error so a
+  // caller can report the window instead of guessing from a log line.
+  public retryAfterMs?: number;
   constructor(public readonly status: number, message: string, public readonly endpoint: string) {
     super(message);
     this.name = 'SpotifyApiError';
+  }
+}
+
+// Thrown when the shared gate is closed and the caller was not willing to wait
+// it out. Distinct from a 429 that came back from Spotify: NO request was sent,
+// which is the whole point — a rate-limited station must stop asking.
+export class SpotifyRateLimitError extends SpotifyApiError {
+  constructor(endpoint: string, retryAfterMs: number) {
+    super(429, `${endpoint} skipped — Spotify rate limit, ${Math.ceil(retryAfterMs / 1000)}s left`, endpoint);
+    this.name = 'SpotifyRateLimitError';
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -115,6 +158,19 @@ export function clampPage(n: unknown, max = SPOTIFY_PAGE_MAX): number {
   return Number.isFinite(v) && v > 0 ? Math.min(v, max) : max;
 }
 
+// Default politeness floor between background request starts. 150ms ≈ 6/s ≈ 200
+// per rolling 30s window, comfortably under a Development Mode app's budget
+// while still filling a few thousand artists over a handful of pool builds.
+export const DEFAULT_BACKGROUND_GAP_MS = 150;
+
+// Spotify sends `Retry-After` in SECONDS. A 429 without one is still a 429, so
+// assume a window rather than treating it as "retry immediately" — guessing low
+// here is what keeps a limit alive.
+const FALLBACK_RETRY_AFTER_MS = 5_000;
+// Never trust a pathological header into a multi-hour hold; the gate is advisory
+// and the next build can ask again.
+const MAX_GATE_MS = 30 * 60_000;
+
 export interface RequestOpts {
   method?: 'GET' | 'PUT' | 'POST' | 'DELETE';
   query?: Record<string, string | number | boolean | undefined | null>;
@@ -122,6 +178,10 @@ export interface RequestOpts {
   // 404 on player endpoints means "no active device" — callers often want
   // null rather than a throw for that.
   allow404?: boolean;
+  // Droppable enrichment rather than something the station needs to keep
+  // playing. Spaced by the global gap, and abandoned outright — without
+  // reaching the network — while the rate-limit gate is closed.
+  background?: boolean;
 }
 
 export class SpotifyClient {
@@ -131,12 +191,71 @@ export class SpotifyClient {
   private readonly now: () => number;
   private readonly log: (line: string) => void;
   private readonly maxRetryAfterMs: number;
+  private readonly backgroundGapMs: number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  // The shared gate: ms-epoch until which Spotify has told us to stop asking.
+  private limitedUntil = 0;
+  // The window we have already logged, so a flood of callers hitting one limit
+  // produces ONE line instead of one per request.
+  private limitLogged = 0;
+  // Serialises background request STARTS, spacing them by backgroundGapMs.
+  // Foreground deliberately bypasses this queue (see the header note).
+  private bgGate: Promise<void> = Promise.resolve();
+  private bgLastStart = 0;
 
   constructor(private readonly deps: SpotifyClientDeps) {
     this.fetchImpl = deps.fetch ?? fetch;
     this.now = deps.now ?? Date.now;
     this.log = deps.log ?? (() => {});
-    this.maxRetryAfterMs = deps.maxRetryAfterMs ?? 5000;
+    this.maxRetryAfterMs = deps.maxRetryAfterMs ?? 10_000;
+    this.backgroundGapMs = deps.backgroundGapMs ?? DEFAULT_BACKGROUND_GAP_MS;
+    this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  }
+
+  // ── rate-limit gate ────────────────────────────────────────────────────────
+
+  // How long Spotify has told us to wait, 0 when clear. Callers use this to
+  // stand down (the genre fill) and the admin/doctor to say so out loud.
+  rateLimitedForMs(): number {
+    return Math.max(0, this.limitedUntil - this.now());
+  }
+
+  // Record a 429. Only ever EXTENDS the window — a later, shorter header must
+  // not shorten a hold another response already earned.
+  private noteRateLimited(retryAfterMs: number, endpoint: string): number {
+    const until = this.now() + Math.min(retryAfterMs, MAX_GATE_MS);
+    if (until > this.limitedUntil) this.limitedUntil = until;
+    const left = this.rateLimitedForMs();
+    if (this.limitedUntil > this.limitLogged) {
+      this.limitLogged = this.limitedUntil;
+      this.log(`[spotify] rate limited on ${endpoint} — holding every request for ${Math.ceil(left / 1000)}s`);
+    }
+    return left;
+  }
+
+  // Spotify's Retry-After is in SECONDS. A present-and-numeric header is taken
+  // at face value including 0, which means "you may retry now" — inventing a
+  // window there would hold the station off for no reason. Only a missing or
+  // unparseable header falls back, and it falls back to a real wait: a 429 is
+  // still a 429, and guessing low is how a limit stays alive.
+  private retryAfterFrom(res: { headers: { get(k: string): string | null } }): number {
+    const raw = res.headers.get('retry-after');
+    const n = Number(raw);
+    return raw != null && raw !== '' && Number.isFinite(n) && n >= 0 ? n * 1000 : FALLBACK_RETRY_AFTER_MS;
+  }
+
+  // Space background starts on one chain, so a wide pool stays polite.
+  private throttleBackground<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.bgGate.then(async () => {
+      const wait = this.bgLastStart + this.backgroundGapMs - this.now();
+      if (wait > 0) await this.sleep(wait);
+      this.bgLastStart = this.now();
+      return fn();
+    });
+    // Keep the chain alive past failures — a rejected link would poison every
+    // queued caller behind it (music/musicbrainz.ts learned this first).
+    this.bgGate = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   // ── OAuth ──────────────────────────────────────────────────────────────────
@@ -231,6 +350,27 @@ export class SpotifyClient {
       if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
     }
     const endpoint = `${opts.method ?? 'GET'} ${url.pathname}`;
+    return opts.background
+      ? this.throttleBackground(() => this.send<T>(url, endpoint, opts))
+      : this.send<T>(url, endpoint, opts);
+  }
+
+  private async send<T>(url: URL, endpoint: string, opts: RequestOpts): Promise<T | null> {
+    // The gate, consulted BEFORE the network. A caller that asks anyway is how
+    // a rate limit renews itself.
+    const held = this.rateLimitedForMs();
+    if (held > 0) {
+      // Background work is droppable by definition: stand down, cost nothing.
+      if (opts.background) throw new SpotifyRateLimitError(endpoint, held);
+      // Foreground waits out a SHORT window — a track boundary can afford a few
+      // seconds — and gives up on a long one so the transport's own backoff
+      // takes over rather than the seam hanging.
+      if (held > this.maxRetryAfterMs) throw new SpotifyRateLimitError(endpoint, held);
+      // Jitter, so a fleet released by one header does not stampede back in
+      // sync (llm/internal/core/retry.ts keeps it for the same reason).
+      await this.sleep(held + Math.floor(Math.random() * 200));
+    }
+
     const attempt = async (token: string) => this.fetchImpl(url.toString(), {
       method: opts.method ?? 'GET',
       headers: {
@@ -246,11 +386,15 @@ export class SpotifyClient {
       res = await attempt(await this.accessToken(true));
     }
     if (res.status === 429) {
-      const after = Number(res.headers.get('retry-after') || '1') * 1000;
-      if (after <= this.maxRetryAfterMs) {
-        this.log(`[spotify] 429 on ${endpoint} — waiting ${after}ms once`);
-        await new Promise((r) => setTimeout(r, after));
+      // Publish the window to every other caller FIRST — that is what stops the
+      // storm — then decide whether this one call can afford to wait it out.
+      const left = this.noteRateLimited(this.retryAfterFrom(res), endpoint);
+      // `left <= max` includes 0 — a Retry-After of 0 is a licence to retry at
+      // once, not a reason to skip the retry.
+      if (!opts.background && left <= this.maxRetryAfterMs) {
+        await this.sleep(left + Math.floor(Math.random() * 200));
         res = await attempt(await this.accessToken());
+        if (res.status === 429) this.noteRateLimited(this.retryAfterFrom(res), endpoint);
       }
     }
     if (res.status === 204) return null;
@@ -266,8 +410,12 @@ export class SpotifyClient {
       const msg = j?.error?.message || j?.error_description || j?.error || res.statusText || `HTTP ${res.status}`;
       const body = raw.trim().slice(0, 300);
       const detail = body && !String(msg).includes(body) ? ` · body: ${redactSpotify(body)}` : '';
-      this.log(`[spotify] ${endpoint} → ${res.status} ${redactSpotify(String(msg))}${detail}`);
-      throw new SpotifyApiError(res.status, `${endpoint} failed (${res.status}): ${msg}`, endpoint);
+      // A 429 has already been logged ONCE by noteRateLimited, for the window
+      // rather than the request. Logging it again here is precisely the flood.
+      if (res.status !== 429) this.log(`[spotify] ${endpoint} → ${res.status} ${redactSpotify(String(msg))}${detail}`);
+      const err = new SpotifyApiError(res.status, `${endpoint} failed (${res.status}): ${msg}`, endpoint);
+      if (res.status === 429) err.retryAfterMs = this.rateLimitedForMs();
+      throw err;
     }
     const text = await res.text();
     return text ? (JSON.parse(text) as T) : null;
@@ -281,7 +429,12 @@ export class SpotifyClient {
     return this.api('/search', { query: { q, type: types.join(','), limit: clampPage(opts.limit, SPOTIFY_SEARCH_MAX), offset: opts.offset ?? 0 } });
   }
   getTrack(id: string) { return this.api(`/tracks/${encodeURIComponent(id)}`, { allow404: true }); }
-  getArtist(id: string) { return this.api(`/artists/${encodeURIComponent(id)}`, { allow404: true }); }
+  // `background` marks the pool's genre fill: droppable, spaced, and abandoned
+  // without a request while the rate-limit gate is closed. The batch read this
+  // replaced is gone, so this is the highest-volume call the station makes.
+  getArtist(id: string, opts: { background?: boolean } = {}) {
+    return this.api(`/artists/${encodeURIComponent(id)}`, { allow404: true, background: opts.background });
+  }
   getArtistAlbums(id: string, opts: { limit?: number; offset?: number; includeGroups?: string } = {}) {
     return this.api(`/artists/${encodeURIComponent(id)}/albums`, { query: { limit: clampPage(opts.limit ?? 20), offset: opts.offset ?? 0, include_groups: opts.includeGroups ?? 'album,single' } });
   }

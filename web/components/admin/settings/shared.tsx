@@ -504,8 +504,14 @@ export interface SettingsData {
     env?: { clientId?: boolean; clientSecret?: boolean; refreshToken?: boolean };
     redirectUri?: string;
     // `notes` is WHY a build came back partial, in operator words — `partial`
-    // on its own only pointed at the container logs.
-    pool?: { tracks: number; albums: number; playlists: number; builtAt: number; partial: boolean; notes?: string[] } | null;
+    // on its own only pointed at the container logs. `genresPending` and
+    // `rateLimitedMs` describe the artist-genre fill, which converges over
+    // several builds and pauses when Spotify holds us off.
+    pool?: {
+      tracks: number; albums: number; playlists: number; builtAt: number;
+      partial: boolean; notes?: string[];
+      artists?: number; genresPending?: number; rateLimitedMs?: number;
+    } | null;
     // The RECEIVER's (librespot) sign-in — a second login for Spotify's own
     // client id; see music/sources/spotify/receiver-auth.ts.
     receiver?: {

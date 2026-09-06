@@ -18,7 +18,11 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { SpotifyClient, SpotifyApiError, SpotifyAuthError, redactSpotify, SPOTIFY_SCOPES } from '../src/music/sources/spotify/client.js';
+import { SpotifyClient, SpotifyApiError, SpotifyAuthError, SpotifyRateLimitError, redactSpotify, SPOTIFY_SCOPES } from '../src/music/sources/spotify/client.js';
+
+// The waits are policy, not duration — assert on what was requested, never
+// spend the seconds.
+const noSleep = async () => {};
 
 type Step = { status: number; body?: unknown; headers?: Record<string, string> };
 
@@ -73,13 +77,84 @@ test('a 401 refreshes once and retries; a second 401 surfaces as SpotifyApiError
 });
 
 test('a 429 within the cap is waited out once; beyond the cap it surfaces', async () => {
-  const { fetchImpl } = fakeFetch([tokenOk(), { status: 429, headers: { 'retry-after': '0' } }, { status: 200, body: { after: true } }]);
-  const c = new SpotifyClient({ fetch: fetchImpl, credentials: creds, maxRetryAfterMs: 1000 });
+  const { fetchImpl } = fakeFetch([tokenOk(), { status: 429, headers: { 'retry-after': '1' } }, { status: 200, body: { after: true } }]);
+  const c = new SpotifyClient({ fetch: fetchImpl, credentials: creds, maxRetryAfterMs: 5000, sleep: noSleep });
   assert.deepEqual(await c.api('/search'), { after: true });
 
   const slow = fakeFetch([tokenOk(), { status: 429, headers: { 'retry-after': '30' }, body: { error: { message: 'rate' } } }]);
-  const c2 = new SpotifyClient({ fetch: slow.fetchImpl, credentials: creds, maxRetryAfterMs: 1000 });
-  await assert.rejects(c2.api('/search'), (e: any) => e instanceof SpotifyApiError && e.status === 429);
+  const c2 = new SpotifyClient({ fetch: slow.fetchImpl, credentials: creds, maxRetryAfterMs: 1000, sleep: noSleep });
+  await assert.rejects(c2.api('/search'), (e: any) => e instanceof SpotifyApiError && e.status === 429 && e.retryAfterMs > 0);
+});
+
+// The storm this whole gate exists to stop: the per-artist genre fill hit a long
+// Retry-After, and because 429 handling was per-request, every remaining call
+// went to the network to discover the same limit for itself.
+test('one 429 closes the gate for EVERY other caller — a background call then sends no request at all', async () => {
+  const { fetchImpl, calls } = fakeFetch([
+    tokenOk(),
+    { status: 429, headers: { 'retry-after': '600' }, body: { error: { message: 'API rate limit exceeded' } } },
+  ]);
+  const logs: string[] = [];
+  let now = 1_000_000;
+  const c = new SpotifyClient({ fetch: fetchImpl, credentials: creds, now: () => now, log: (l) => logs.push(l), sleep: noSleep });
+
+  await assert.rejects(c.getArtist('A1', { background: true }), (e: any) => e.status === 429);
+  const spent = calls.length;
+  assert.equal(c.rateLimitedForMs(), 600_000, 'the window is shared state, not per-request');
+
+  // Fifty more background calls: not one of them may reach the network.
+  for (let i = 0; i < 50; i++) {
+    await assert.rejects(c.getArtist(`A${i}`, { background: true }), (e: any) => e instanceof SpotifyRateLimitError);
+  }
+  assert.equal(calls.length, spent, '50 doomed calls, zero requests');
+
+  // A foreground call facing a 10-minute window gives up rather than stalling
+  // the seam — the transport's own backoff is the better place to lose time.
+  await assert.rejects(c.api('/me/player/play', { method: 'PUT' }), (e: any) => e instanceof SpotifyRateLimitError);
+  assert.equal(calls.length, spent);
+
+  assert.equal(logs.filter((l) => /rate limit/i.test(l)).length, 1, 'one line per window, not one per request');
+
+  // …and it clears itself.
+  now += 600_001;
+  assert.equal(c.rateLimitedForMs(), 0);
+});
+
+test('a foreground call waits out a SHORT window; background never waits', async () => {
+  const { fetchImpl, calls } = fakeFetch([
+    tokenOk(),
+    { status: 429, headers: { 'retry-after': '2' }, body: { error: { message: 'rate' } } },
+    { status: 200, body: { ok: 1 } },
+  ]);
+  const slept: number[] = [];
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, maxRetryAfterMs: 10_000,
+    sleep: async (ms) => { slept.push(ms); },
+  });
+  // The 429 arrives on the first call, which then waits and succeeds.
+  assert.deepEqual(await c.api('/search'), { ok: 1 });
+  assert.equal(calls.length, 3);
+  assert.ok(slept.some((ms) => ms >= 2000), `waited out the window: ${slept}`);
+});
+
+test('background calls are spaced; foreground is never queued behind them', async () => {
+  const script: Step[] = [tokenOk()];
+  for (let i = 0; i < 4; i++) script.push({ status: 200, body: { id: `A${i}` } });
+  const { fetchImpl } = fakeFetch(script);
+  const slept: number[] = [];
+  let now = 1_000_000;
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, backgroundGapMs: 150,
+    now: () => now, sleep: async (ms) => { slept.push(ms); now += ms; },
+  });
+  await c.getArtist('A0', { background: true });
+  await c.getArtist('A1', { background: true });
+  await c.getArtist('A2', { background: true });
+  assert.ok(slept.length >= 2 && slept.every((ms) => ms <= 150), `spaced by the gap: ${slept}`);
+
+  const before = slept.length;
+  await c.getMe(); // foreground
+  assert.equal(slept.length, before, 'foreground is not spaced — music must not queue behind enrichment');
 });
 
 test('missing credentials fail with a SpotifyAuthError that names the three env keys', async () => {

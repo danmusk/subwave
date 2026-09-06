@@ -20,7 +20,7 @@ import {
   activeModelLabel,
 } from '../llm/provider.js';
 import { recentCalls } from '../llm/log.js';
-import { spotifyPool } from '../music/sources/spotify/source.js';
+import { spotifyPool, spotifyClient } from '../music/sources/spotify/source.js';
 import type { Finding, StationSettings } from './types.js';
 import { classifyModel, isSchemaFailure } from './util.js';
 
@@ -31,16 +31,33 @@ function spotifyPoolFinding(): Finding[] {
   const p = spotifyPool().peek();
   if (!p) return [{ label: 'spotify pool', status: 'warn', detail: 'not built yet — it builds on first use' }];
   const summary = `${p.tracks.size} tracks · ${p.albums.size} albums · ${p.playlists.length} playlists`;
+  // A rate-limit hold is context, never the verdict: it explains a stalled genre
+  // fill and a pool that is not rebuilding, and it clears itself. Severity still
+  // follows whether there is music, because an empty pool is dead air whatever
+  // the reason.
+  const heldMs = spotifyClient().rateLimitedForMs();
+  const limited = heldMs > 0 ? ` · Spotify rate limit, ${Math.ceil(heldMs / 1000)}s left` : '';
+  const limitHint = 'Development Mode meters a rolling 30s window and cannot be raised (extended quota is organisations-only). The station backs off on its own and resumes when the window clears.';
+
   if (p.tracks.size === 0) {
     return [{
       label: 'spotify pool',
       status: 'fail',
-      detail: p.notes.length ? `empty — ${p.notes[0]}` : `empty (${summary})`,
-      hint: 'Nothing to play: the mixer\'s emergency loop covers the air. Spotify serves playlist contents only for playlists the connected account owns or collaborates on — check Settings → Music source → Library pool.',
+      detail: `${p.notes.length ? `empty — ${p.notes[0]}` : `empty (${summary})`}${limited}`,
+      hint: heldMs > 0 ? limitHint : 'Nothing to play: the mixer\'s emergency loop covers the air. Spotify serves playlist contents only for playlists the connected account owns or collaborates on — check Settings → Music source → Library pool.',
     }];
   }
   if (p.partial) {
-    return [{ label: 'spotify pool', status: 'warn', detail: `${summary} · partial — ${p.notes[0] ?? 'a source page failed'}` }];
+    return [{ label: 'spotify pool', status: 'warn', detail: `${summary} · partial — ${p.notes[0] ?? 'a source page failed'}${limited}`, hint: heldMs > 0 ? limitHint : undefined }];
+  }
+  // Pending genres are enrichment in flight, not a fault — say so at ok.
+  if (p.genresPending > 0 || heldMs > 0) {
+    return [{
+      label: 'spotify pool',
+      status: 'ok',
+      detail: `${summary} · ${p.genresPending} artists awaiting genres${limited}`,
+      hint: heldMs > 0 ? limitHint : undefined,
+    }];
   }
   return [{ label: 'spotify pool', status: 'ok', detail: summary }];
 }

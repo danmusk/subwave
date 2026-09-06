@@ -115,7 +115,13 @@ test('sample is a permutation prefix', () => {
 
 // ── the pool ───────────────────────────────────────────────────────────────
 
-function fakeClient(opts: { failSaved?: boolean; failArtists?: boolean } = {}) {
+// The genre cache is PERSISTED now, so every test that must start cold needs a
+// file of its own — sharing one would let an earlier test's fill satisfy a
+// later test's budget and quietly prove nothing.
+let cacheSeq = 0;
+const freshCachePath = () => path.join(stateRoot, `genre-cache-${++cacheSeq}.json`);
+
+function fakeClient(opts: { failSaved?: boolean; failArtists?: boolean; limitedMs?: number } = {}) {
   const calls: string[] = [];
   const t1 = track('AAAAAAAAAAAAAAAAAAAAAA', 'Glory Box');
   const t2 = track('BBBBBBBBBBBBBBBBBBBBBB', 'Roads');
@@ -142,9 +148,11 @@ function fakeClient(opts: { failSaved?: boolean; failArtists?: boolean } = {}) {
     // The batch endpoint (GET /artists?ids=) was removed — one request each.
     async getArtist(id: string) {
       calls.push(`artist:${id}`);
-      if (opts.failArtists) throw new Error('artist down');
+      if (opts.failArtists) throw Object.assign(new Error('rate limited'), { status: 429 });
       return { id, genres: id === 'ar1' ? ['trip hop'] : ['pop'] };
     },
+    // The shared rate-limit gate the pool stands down on.
+    rateLimitedForMs: () => opts.limitedMs ?? 0,
     async *paginate<T>(page: (o: number) => Promise<any>) { const p = await page(0); for (const it of p.items ?? []) yield it as T; },
   };
   return { client, calls };
@@ -152,7 +160,7 @@ function fakeClient(opts: { failSaved?: boolean; failArtists?: boolean } = {}) {
 
 test('the pool dedupes, caps, stamps genres and marks compilations untrusted', async () => {
   const { client, calls } = fakeClient();
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1', 'EXT1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }));
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1', 'EXT1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
   const p = await pool.get();
   assert.equal(p.tracks.size, 3, 'two playlist tracks + one saved, the duplicate collapsed');
   assert.equal(p.playlists.length, 2, 'the owned playlist and the configured external one');
@@ -173,7 +181,7 @@ test('the pool dedupes, caps, stamps genres and marks compilations untrusted', a
 
 test('the artist-genre cache outlives a rebuild — a removed batch endpoint must not become N calls every 30 minutes', async () => {
   const { client, calls } = fakeClient();
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }));
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
   await pool.get();
   const first = calls.filter((x) => x.startsWith('artist:')).length;
   assert.ok(first > 0, 'the first build asks');
@@ -183,13 +191,111 @@ test('the artist-genre cache outlives a rebuild — a removed batch endpoint mus
   assert.deepEqual(p.tracks.get('AAAAAAAAAAAAAAAAAAAAAA')!.genres, ['trip hop'], 'and the genres are still stamped from the cache');
 });
 
+// The cache the in-memory version could only promise: a restart used to re-ask
+// Spotify for every artist one at a time, which is the rate-limit incident.
+test('the genre cache is on DISK, so a fresh cache over the same file asks for nothing', async () => {
+  const shared = freshCachePath();
+  const cfg = () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 });
+  const first = fakeClient();
+  await new SpotifyPoolCache(() => first.client, cfg, () => {}, Date.now, shared).get();
+  assert.ok(first.calls.filter((x) => x.startsWith('artist:')).length > 0, 'the cold station asks');
+
+  // A whole new process, same state dir.
+  const second = fakeClient();
+  const p = await new SpotifyPoolCache(() => second.client, cfg, () => {}, Date.now, shared).get();
+  assert.deepEqual(second.calls.filter((x) => x.startsWith('artist:')), [], 'the warm station asks for nothing');
+  assert.deepEqual(p.tracks.get('AAAAAAAAAAAAAAAAAAAAAA')!.genres, ['trip hop'], 'and still knows the genres');
+  assert.equal(p.genresPending, 0);
+});
+
+test('the genre fill is BUDGETED — a build is never a burst, and the rest carries to the next one', async () => {
+  const { ARTIST_GENRE_BUDGET } = await import('../src/music/sources/spotify/pool.js');
+  // More distinct artists than one build may spend.
+  const many = ARTIST_GENRE_BUDGET + 40;
+  const items = Array.from({ length: many }, (_, i) => ({
+    item: track(`T${String(i).padStart(21, '0')}`, `Song ${i}`, { artists: [artist(`ar${i}`, `Artist ${i}`)] }),
+  }));
+  const calls: string[] = [];
+  const client: any = {
+    async getMyPlaylists() { return { items: [{ id: 'PL1', name: 'Big', items: { total: many } }], next: null }; },
+    async getPlaylistItems() { return { items, next: null }; },
+    async getSavedTracks() { return { items: [], next: null }; },
+    async getSavedAlbums() { return { items: [], next: null }; },
+    async getArtist(id: string) { calls.push(id); return { id, genres: ['pop'] }; },
+    rateLimitedForMs: () => 0,
+    async *paginate<T>(page: (o: number) => Promise<any>) { const p = await page(0); for (const it of p.items ?? []) yield it as T; },
+  };
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: false, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
+
+  const p1 = await pool.get();
+  assert.equal(calls.length, ARTIST_GENRE_BUDGET, 'exactly the budget, not the whole queue');
+  assert.equal(p1.genresPending, many - ARTIST_GENRE_BUDGET, 'the remainder is pending, not lost');
+  assert.equal(p1.partial, false, 'unfilled genres are enrichment in flight, NOT a broken pool');
+
+  pool.invalidate();
+  const p2 = await pool.get();
+  assert.equal(calls.length, Math.min(many, ARTIST_GENRE_BUDGET * 2), 'the next build spends another budget');
+  assert.ok(p2.genresPending < p1.genresPending, 'and converges');
+});
+
+test('the fill ranks by track count, so a budget buys the most coverage', async () => {
+  // ar1 owns two tracks, ar2 one. With a budget of one, ar1 must win.
+  const { client, calls } = fakeClient();
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
+  await pool.get();
+  const asked = calls.filter((x) => x.startsWith('artist:'));
+  assert.equal(asked[0], 'artist:ar1', 'the artist with the most pool tracks goes first');
+});
+
+test('a rate limit stops the fill dead and is not cached as a miss', async () => {
+  const { client, calls } = fakeClient({ failArtists: true });
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
+  const p = await pool.get();
+  assert.ok(p.tracks.size > 0, 'the pool still plays music');
+  assert.equal(p.partial, false, 'a rate-limited fill is not a broken pool');
+  assert.ok(p.genresPending > 0);
+  // One worker's 429 ends the pass rather than every remaining artist asking.
+  assert.ok(calls.filter((x) => x.startsWith('artist:')).length <= 2, `stood down early: ${calls.filter((x) => x.startsWith('artist:')).length}`);
+
+  // A 429 must NOT be remembered as "this artist has no genres" — that would
+  // write an artist off permanently over a moment.
+  const healthy = fakeClient();
+  client.getArtist = healthy.client.getArtist;
+  pool.invalidate();
+  const p2 = await pool.get();
+  assert.deepEqual(p2.tracks.get('AAAAAAAAAAAAAAAAAAAAAA')!.genres, ['trip hop'], 'retried once the limit cleared');
+});
+
+test('a closed rate-limit gate suppresses the rebuild — the short empty retry must not become a hammer loop', async () => {
+  const { POOL_EMPTY_RETRY_MS } = await import('../src/music/sources/spotify/pool.js');
+  const { client, calls } = fakeClient({ failSaved: true });
+  client.getMyPlaylists = async () => { throw new Error('429 rate limited'); };
+  let limited = 0;
+  client.rateLimitedForMs = () => limited;
+  let now = 1_000_000;
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now, freshCachePath());
+  await pool.get();
+  const after = calls.filter((x) => x === 'saved').length;
+
+  // The window closes; the retry deadline passes. Without the gate check this
+  // is a rebuild every two minutes into a live rate limit.
+  limited = 10 * 60_000;
+  now += POOL_EMPTY_RETRY_MS + 1_000;
+  await pool.get();
+  assert.equal(calls.filter((x) => x === 'saved').length, after, 'held off while Spotify is holding us off');
+
+  limited = 0;
+  await pool.get();
+  assert.ok(calls.filter((x) => x === 'saved').length > after, 'and resumes once the window clears');
+});
+
 test('an empty, failed build is held only briefly — a 30-minute memo of nothing is 30 minutes of dead air', async () => {
   const { POOL_TTL_MS, POOL_EMPTY_RETRY_MS } = await import('../src/music/sources/spotify/pool.js');
   const { client, calls } = fakeClient({ failSaved: true });
   // Every source fails: the playlist listing throws and saved tracks throw.
   client.getMyPlaylists = async () => { throw new Error('403 Forbidden'); };
   let now = 1_000_000;
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now);
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now, freshCachePath());
   const empty = await pool.get();
   assert.equal(empty.tracks.size, 0);
   assert.equal(empty.partial, true);
@@ -208,19 +314,19 @@ test('an empty, failed build is held only briefly — a 30-minute memo of nothin
 
 test('a failed source page leaves the pool usable and marked partial; a cap stops the walk', async () => {
   const { client } = fakeClient({ failSaved: true });
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }));
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
   const p = await pool.get();
   assert.equal(p.partial, true);
   assert.equal(p.tracks.size, 2);
 
-  const capped = new SpotifyPoolCache(() => fakeClient().client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 1 }));
+  const capped = new SpotifyPoolCache(() => fakeClient().client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 1 }), () => {}, Date.now, freshCachePath());
   assert.equal((await capped.get()).tracks.size, 1);
 });
 
 test('a pool-definition change rebuilds on the next get() without an explicit invalidate', async () => {
   const { client, calls } = fakeClient();
   let ids = ['PL1'];
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ids, includeSaved: false, includeSavedAlbums: false, maxTracks: 5000 }));
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ids, includeSaved: false, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
   await pool.get();
   ids = ['PL1', 'EXT1'];
   const p = await pool.get();

@@ -56,6 +56,14 @@ export function poolStatus() {
     builtAt: p.builtAt,
     partial: p.partial,
     notes: p.notes,
+    // Genre enrichment converges over several builds (one request per artist
+    // since Spotify removed the batch read), so the operator needs to see it
+    // moving — a quiet background job with no progress line reads as broken.
+    artists: p.artistGenres.size,
+    genresPending: p.genresPending,
+    // Non-zero while Spotify is holding us off. Surfaced so a paused fill looks
+    // like a pause rather than a failure.
+    rateLimitedMs: spotifyClient().rateLimitedForMs(),
   };
 }
 

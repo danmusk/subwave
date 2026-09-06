@@ -9,18 +9,40 @@
 // INJECTED so the build is testable against canned pages
 // (scripts/spotify-source.test.ts).
 //
-// Artist genres used to come from the batch endpoint, 50 ids per call.
-// February 2026 removed GET /artists?ids=, so they are fetched one at a time —
-// which is why the genre cache lives on the CACHE rather than inside a build
-// and survives invalidate(). A 5000-track pool holds low thousands of distinct
-// artists; re-asking for all of them every 30 minutes would be a rate-limit
-// incident, and artist genres do not change. Only genuinely new artists cost a
-// request, at bounded concurrency, and a miss is remembered as a miss.
+// ARTIST GENRES ARE THE EXPENSIVE PART, and the reason this file has a budget.
+// Spotify tags ARTISTS, never tracks, and February 2026 removed the batch read
+// (GET /artists?ids=), so genres now cost ONE REQUEST PER ARTIST — low thousands
+// on a 5000-track pool. Asking for all of them in one build is a rate-limit
+// incident, and this station cannot buy its way out of the limit: extended quota
+// is organisations-only (≥250k MAU), so Development Mode's rolling 30-second
+// window is permanent. Spotify's own advice for rate limits is "use the batch
+// APIs" — the very thing that was taken away. So the answer has to be FEWER
+// REQUESTS, and three rules deliver it:
+//
+//   1. the cache is PERSISTED (state/spotify/artist-genres.json). In memory
+//      alone it was a promise the code could not keep: every restart re-asked
+//      for every artist. Artist genres do not change, so on disk this is a
+//      one-time cost for the life of the station.
+//   2. each build fills at most ARTIST_GENRE_BUDGET NEW artists, hardest-working
+//      first (most pool tracks), so a build is never a burst and the budget buys
+//      the most coverage per request. A warm pool spends nothing here.
+//   3. the fill is BACKGROUND work: it stands down the instant the client's
+//      shared rate-limit gate closes, and an unfilled genre is `genresPending`,
+//      NOT `partial` — an enrichment that has not finished is not a broken pool,
+//      and conflating the two would drive the empty-pool retry and the doctor.
+//
+// A miss is remembered as a miss so it is not re-queried every pass.
 
+import { mkdirSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import type { Song, Album } from '../types.js';
 import type { SpotifyClient } from './client.js';
 import { mapTrack, mapAlbum, unwrapItem } from './map.js';
 import { albumEraSuspect } from '../../era-suspect.js';
+import { mapPool } from '../../../util/async-pool.js';
+import { writeFileAtomic } from '../../../util/atomic-file.js';
+import { SPOTIFY_STATE_DIR } from './token-file.js';
 
 export const POOL_TTL_MS = 30 * 60 * 1000;
 
@@ -33,8 +55,19 @@ export const POOL_EMPTY_RETRY_MS = 2 * 60 * 1000;
 // trims the page and `paginate` reads a short page as the last one.
 const PAGE = 50;
 
-// Concurrent GET /artists/{id} calls during a genre fill.
-const ARTIST_FETCH_CONCURRENCY = 4;
+// NEW artists a single build may look up. Cached ones are free, so this bounds
+// the burst, not the coverage: the rest fill on later builds and the disk cache
+// makes that progress permanent.
+export const ARTIST_GENRE_BUDGET = 100;
+// Concurrent GET /artists/{id} calls during a genre fill. Low on purpose — the
+// client also spaces background starts, so width here buys very little and
+// costs a deeper hole when the limit does bite.
+const ARTIST_FETCH_CONCURRENCY = 2;
+
+// Where the persisted genre cache lives. Not a credential, so no 0600 — and
+// deliberately NOT in routes/backup.ts's INCLUDE_FILES: it is a cache, and it
+// should rebuild rather than restore.
+export const ARTIST_GENRE_CACHE_PATH = path.join(SPOTIFY_STATE_DIR, 'artist-genres.json');
 
 export interface PoolConfig {
   playlistIds: string[];
@@ -59,6 +92,10 @@ export interface SpotifyPool {
   // the container logs to find out what broke, which is where an afternoon of
   // 403s went unread; these ride out on /settings/spotify instead.
   notes: string[];
+  // Artists in the pool whose genres are not looked up yet. Enrichment still to
+  // do — NOT a fault, and deliberately not folded into `partial`, which drives
+  // the empty-pool retry and the doctor.
+  genresPending: number;
   // The pool definition it was built from; a settings edit changes it and the
   // next get() rebuilds rather than serving a stale curation.
   cfgSig: string;
@@ -72,15 +109,20 @@ export class SpotifyPoolCache {
   private pool: SpotifyPool | null = null;
   private building: Promise<SpotifyPool> | null = null;
   // artist id → genres, or null for "asked, Spotify had nothing". Deliberately
-  // OUTSIDE the pool object: it survives invalidate() and every rebuild, which
-  // is what makes one-request-per-artist affordable.
+  // OUTSIDE the pool object: it survives invalidate() and every rebuild, and it
+  // is mirrored to disk, which together are what make one-request-per-artist
+  // affordable at all.
   private readonly genreCache = new Map<string, string[] | null>();
+  private genreCacheLoaded = false;
+  private genreCacheDirty = false;
 
   constructor(
     private readonly client: () => SpotifyClient,
     private readonly cfg: () => PoolConfig,
     private readonly log: (line: string) => void = () => {},
     private readonly now: () => number = Date.now,
+    // Injected so the tests can drive the persisted cache without a state dir.
+    private readonly cachePath: string = ARTIST_GENRE_CACHE_PATH,
   ) {}
 
   invalidate(): void { this.pool = null; }
@@ -96,34 +138,98 @@ export class SpotifyPoolCache {
 
   async get(): Promise<SpotifyPool> {
     if (this.pool && this.now() - this.pool.builtAt < this.ttlFor(this.pool) && this.pool.cfgSig === poolConfigSignature(this.cfg())) return this.pool;
+    // Never rebuild into a closed rate-limit gate. The short empty-pool retry
+    // exists so a transient failure costs one track instead of half an hour —
+    // but if the emptiness IS the rate limit, retrying every two minutes is
+    // just the same storm on a timer. Serve what we have and wait it out.
+    if (this.pool && this.client().rateLimitedForMs() > 0) return this.pool;
     if (!this.building) {
       this.building = this.build().finally(() => { this.building = null; });
     }
     return this.building;
   }
 
+  // ── persisted genre cache ──────────────────────────────────────────────────
+  //
+  // Load-once, repair rows, never block boot: a missing file is the normal first
+  // run and a corrupt one starts empty rather than wedging the station
+  // (music/blocklist.ts's load() is the pattern).
+  private async loadGenreCache(): Promise<void> {
+    if (this.genreCacheLoaded) return;
+    this.genreCacheLoaded = true;
+    try {
+      const raw = JSON.parse(await readFile(this.cachePath, 'utf8'));
+      let kept = 0;
+      for (const [id, genres] of Object.entries(raw ?? {})) {
+        if (typeof id !== 'string' || !id) continue;
+        if (genres === null) { this.genreCache.set(id, null); kept++; continue; }
+        if (Array.isArray(genres)) { this.genreCache.set(id, genres.map(String)); kept++; }
+      }
+      if (kept) this.log(`[spotify] artist genre cache: ${kept} artists loaded from disk`);
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT') this.log(`[spotify] artist genre cache unreadable, starting empty: ${err?.message ?? err}`);
+    }
+  }
+
+  private async saveGenreCache(): Promise<void> {
+    if (!this.genreCacheDirty) return;
+    this.genreCacheDirty = false;
+    try {
+      mkdirSync(path.dirname(this.cachePath), { recursive: true });
+      await writeFileAtomic(this.cachePath, JSON.stringify(Object.fromEntries(this.genreCache)));
+    } catch (err: any) {
+      // A cache that cannot be written is slower, not broken.
+      this.log(`[spotify] artist genre cache could not be saved: ${err?.message ?? err}`);
+    }
+  }
+
   // Fill `genreCache` for every id it does not already hold, at bounded
   // concurrency. Returns true when every fetch succeeded.
-  private async fetchArtistGenres(ids: string[]): Promise<boolean> {
-    const missing = ids.filter((id) => !this.genreCache.has(id));
-    if (!missing.length) return true;
+  // Look up genres for at most ARTIST_GENRE_BUDGET artists this build, busiest
+  // first. `ranked` is every artist in the pool ordered by track count, so the
+  // budget always buys the most genre coverage per request — an artist with one
+  // track can wait for a later build.
+  //
+  // Returns how many artists still have no entry afterwards, which is the
+  // pool's `genresPending`. Note what this does NOT do: it never reports a
+  // failure as a broken pool, and it stops the moment the client's shared gate
+  // closes rather than grinding the remaining queue into a live rate limit.
+  private async fetchArtistGenres(ranked: string[]): Promise<number> {
+    await this.loadGenreCache();
+    const missing = ranked.filter((id) => !this.genreCache.has(id));
+    if (!missing.length) return 0;
+
     const c = this.client();
-    let ok = true;
-    let cursor = 0;
-    const worker = async () => {
-      while (cursor < missing.length) {
-        const id = missing[cursor++];
-        try {
-          const a: any = await c.getArtist(id);
-          this.genreCache.set(id, Array.isArray(a?.genres) ? a.genres.map(String) : null);
-        } catch (err: any) {
-          ok = false;
-          this.log(`[spotify] artist ${id} genres failed: ${err?.message ?? err}`);
-        }
+    const batch = missing.slice(0, ARTIST_GENRE_BUDGET);
+    let done = 0;
+    let limited = false;
+
+    await mapPool(batch, ARTIST_FETCH_CONCURRENCY, async (id) => {
+      // One worker hitting the limit ends the pass for all of them; the client
+      // would refuse these anyway, and asking is how a limit renews itself.
+      if (limited || c.rateLimitedForMs() > 0) { limited = true; return; }
+      try {
+        const a: any = await c.getArtist(id, { background: true });
+        this.genreCache.set(id, Array.isArray(a?.genres) ? a.genres.map(String) : null);
+        this.genreCacheDirty = true;
+        done++;
+      } catch (err: any) {
+        // A 429 is transient and must NOT be cached as a miss, or the artist is
+        // written off permanently over a moment. Anything else already resolved
+        // to null via allow404, so this is a genuine failure: leave it unset and
+        // let a later build retry it.
+        if (err?.status === 429) limited = true;
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(ARTIST_FETCH_CONCURRENCY, missing.length) }, worker));
-    return ok;
+    });
+
+    await this.saveGenreCache();
+    const pending = ranked.filter((id) => !this.genreCache.has(id)).length;
+    if (done || pending) {
+      const held = c.rateLimitedForMs();
+      const why = limited && held > 0 ? `, paused ${Math.ceil(held / 1000)}s by Spotify's rate limit` : '';
+      this.log(`[spotify] artist genres: +${done} this build, ${pending} still pending${why}`);
+    }
+    return pending;
   }
 
   private async build(): Promise<SpotifyPool> {
@@ -239,11 +345,19 @@ export class SpotifyPoolCache {
     }
 
     // 4. Artist genres. Spotify tags ARTISTS, so this is the only genre signal
-    //    the pool has; a failed fetch leaves those tracks untagged. One request
-    //    per artist since the batch endpoint was removed — see the cache note
-    //    at the top of this file for why that is affordable.
-    const artistIds = [...new Set([...tracks.values()].map((s) => s.artistId).filter((x): x is string => !!x))];
-    if (!(await this.fetchArtistGenres(artistIds))) fail('some artist genres could not be read — those tracks stay untagged');
+    //    the pool has, and since the batch endpoint was removed each one costs a
+    //    request — so the fill is budgeted and ranked rather than exhaustive.
+    //    Rank by how many pool tracks the artist has: coverage per request is
+    //    the whole game when the budget is 100 and the queue is thousands.
+    const trackCount = new Map<string, number>();
+    for (const s of tracks.values()) {
+      if (s.artistId) trackCount.set(s.artistId, (trackCount.get(s.artistId) ?? 0) + 1);
+    }
+    const artistIds = [...trackCount.keys()].sort((a, b) => (trackCount.get(b) ?? 0) - (trackCount.get(a) ?? 0));
+    // Deliberately NOT `fail()`: unfilled genres are enrichment still to do, not
+    // a broken pool. Calling it partial would drive the empty-pool retry and
+    // turn a cosmetic gap into a rebuild loop against a live rate limit.
+    const genresPending = await this.fetchArtistGenres(artistIds);
     for (const id of artistIds) artistGenres.set(id, this.genreCache.get(id) ?? []);
     const genres = new Map<string, number>();
     for (const s of tracks.values()) {
@@ -274,9 +388,10 @@ export class SpotifyPoolCache {
       }
     }
 
-    this.pool = { tracks, albums, artistGenres, genres, playlists, builtAt: this.now(), partial, notes, cfgSig: poolConfigSignature(cfg) };
+    this.pool = { tracks, albums, artistGenres, genres, playlists, builtAt: this.now(), partial, notes, genresPending, cfgSig: poolConfigSignature(cfg) };
     const retry = this.ttlFor(this.pool) === POOL_EMPTY_RETRY_MS ? `, retrying in ${Math.round(POOL_EMPTY_RETRY_MS / 1000)}s` : '';
-    this.log(`[spotify] pool built: ${tracks.size} tracks, ${albums.size} albums, ${playlists.length} playlists, ${genres.size} genres in ${Math.round((this.now() - started) / 1000)}s${partial ? ' (partial)' : ''}${retry}`);
+    const pending = genresPending ? `, ${genresPending} artists awaiting genres` : '';
+    this.log(`[spotify] pool built: ${tracks.size} tracks, ${albums.size} albums, ${playlists.length} playlists, ${genres.size} genres in ${Math.round((this.now() - started) / 1000)}s${partial ? ' (partial)' : ''}${pending}${retry}`);
     return this.pool;
   }
 }
