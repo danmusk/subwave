@@ -31,8 +31,9 @@ test('an absent block loads as the shipped defaults (byte-identical upgrade)', a
   const s = await coldLoad({});
   assert.deepEqual(s.spotify, {
     deviceName: '', bitrate: 320,
-    pool: { playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 },
-    seamLeadMs: 1500, healthPollSec: 60, mismatch: 'reclaim',
+    pool: { playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000, fullWalkHours: 24 },
+    quota: { requestsPer30s: 90, genresPerHour: 60 },
+    seamLeadMs: 1500, mismatch: 'reclaim',
   });
   assert.equal(s.music.source, 'subsonic');
 });
@@ -42,8 +43,9 @@ test('every field survives a controller restart', async () => {
     music: { source: 'spotify' },
     spotify: {
       deviceName: 'SUB/WAVE booth', bitrate: 160,
-      pool: { playlistIds: ['37i9dQZF1DXcBWIGoYBM5M', '37i9dQZF1DX0XUsuxWHRQd'], includeSaved: false, includeSavedAlbums: true, maxTracks: 1200 },
-      seamLeadMs: 3000, healthPollSec: 120, mismatch: 'follow',
+      pool: { playlistIds: ['37i9dQZF1DXcBWIGoYBM5M', '37i9dQZF1DX0XUsuxWHRQd'], includeSaved: false, includeSavedAlbums: true, maxTracks: 1200, fullWalkHours: 6 },
+      quota: { requestsPer30s: 40, genresPerHour: 0 },
+      seamLeadMs: 3000, mismatch: 'follow',
     },
   });
   assert.equal(s.music.source, 'spotify');
@@ -53,25 +55,40 @@ test('every field survives a controller restart', async () => {
   assert.equal(s.spotify.pool.includeSaved, false);
   assert.equal(s.spotify.pool.includeSavedAlbums, true);
   assert.equal(s.spotify.pool.maxTracks, 1200);
+  // The three-edit rule's sharp end: each of these is dead on the next restart
+  // if it is missing from load()'s composition, and an in-process assertion
+  // would still pass. coldLoad() is what makes this test able to fail.
+  assert.equal(s.spotify.pool.fullWalkHours, 6);
+  assert.equal(s.spotify.quota.requestsPer30s, 40);
+  assert.equal(s.spotify.quota.genresPerHour, 0, '0 is a real value — genre enrichment off, not "unset, use the default"');
   assert.equal(s.spotify.seamLeadMs, 3000);
-  assert.equal(s.spotify.healthPollSec, 120);
   assert.equal(s.spotify.mismatch, 'follow');
 });
 
 test('a hand-edited block repairs rather than wedging boot', async () => {
-  const s = await coldLoad({ spotify: { bitrate: 999, mismatch: 'panic', pool: { playlistIds: 'nope', maxTracks: -5 }, seamLeadMs: 'x', healthPollSec: 99999 } });
+  const s = await coldLoad({ spotify: { bitrate: 999, mismatch: 'panic', pool: { playlistIds: 'nope', maxTracks: -5, fullWalkHours: 0 }, quota: { requestsPer30s: 'lots', genresPerHour: 99999 }, seamLeadMs: 'x', healthPollSec: 99999 } });
+  // healthPollSec was a knob that was defaulted, clamped, patchable, schema'd
+  // and documented — and read by nothing. It is gone; a stored value is now
+  // stripped like any other unknown key rather than pretending to do something.
+  assert.equal('healthPollSec' in s.spotify, false, 'the dead knob does not come back from a hand-edited file');
   assert.equal(s.spotify.bitrate, 320);
   assert.equal(s.spotify.mismatch, 'reclaim');
   assert.deepEqual(s.spotify.pool.playlistIds, []);
   assert.equal(s.spotify.pool.maxTracks, 100, 'clamped to the floor');
   assert.equal(s.spotify.seamLeadMs, 1500);
-  assert.equal(s.spotify.healthPollSec, 600, 'clamped to the ceiling');
+  assert.equal(s.spotify.pool.fullWalkHours, 1, 'clamped to the floor — 0 would mean a full walk every get()');
+  assert.equal(s.spotify.quota.requestsPer30s, 90, 'unparseable falls back to the default rather than NaN');
+  assert.equal(s.spotify.quota.genresPerHour, 5000, 'clamped to the ceiling');
 });
 
 test('the patch path is strict where load() is lenient', () => {
   assert.equal(spotifyPatchSchema.safeParse({ bitrate: 999 }).success, false);
   assert.equal(spotifyPatchSchema.safeParse({ mismatch: 'panic' }).success, false);
   assert.equal(spotifyPatchSchema.safeParse({ pool: { maxTracks: 5 } }).success, false);
+  assert.equal(spotifyPatchSchema.safeParse({ pool: { fullWalkHours: 0 } }).success, false);
+  assert.equal(spotifyPatchSchema.safeParse({ quota: { requestsPer30s: 1 } }).success, false);
+  assert.equal(spotifyPatchSchema.safeParse({ quota: { genresPerHour: -1 } }).success, false);
+  assert.equal(spotifyPatchSchema.parse({ quota: { genresPerHour: '0' } }).quota?.genresPerHour, 0, 'off is a legal setting, not a rejected one');
   const ok = spotifyPatchSchema.parse({ bitrate: '160', pool: { includeSaved: 'true', maxTracks: '250.4' }, deviceName: ' Booth ' });
   assert.equal(ok.bitrate, 160);
   assert.equal(ok.pool?.includeSaved, true);

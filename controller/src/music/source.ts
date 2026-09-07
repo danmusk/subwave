@@ -26,7 +26,7 @@
 import type * as client from './subsonic.js';
 import { activeSource, activeSourceId } from './sources/registry.js';
 import { capabilitiesFor } from './sources/capabilities.js';
-import type { CoverArt, AnalyzableRef, CatalogHealth } from './sources/types.js';
+import type { Song, CoverArt, AnalyzableRef, CatalogHealth } from './sources/types.js';
 
 // Pure helpers that never touch a server — shared by every source and by the
 // Liquidsoap annotation builders. Re-exported from the client verbatim.
@@ -188,3 +188,11 @@ export const getFrequentAlbums: typeof client.getFrequentAlbums = async (...a) =
   if (!capabilitiesFor(src.id).hasFrequent) return [];
   return (await src.getFrequentAlbums?.(...a)) ?? [];
 };
+// The newest TRACKS, straight from the source. Neutral empty when the source
+// cannot serve them, which the caller reads as "compose it yourself from newest
+// albums" — the shape /dj/recent has always used and Subsonic still uses.
+export async function getRecentSongs(opts?: { size?: number }): Promise<Song[]> {
+  const src = activeSource();
+  if (!capabilitiesFor(src.id).hasRecentSongs) return [];
+  return (await src.getRecentSongs?.(opts)) ?? [];
+}

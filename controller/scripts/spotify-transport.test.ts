@@ -192,3 +192,42 @@ test('15s of silence while a track should be playing ends it (a receiver that re
   assert.deepEqual(h.calls, ['gap:true', `play:${ID_B}`].filter((c) => h.calls.includes(c)).length ? h.calls : [], 'commanded the pending pick');
   assert.ok(h.calls.includes(`play:${ID_B}`));
 });
+
+// An empty pool is a FAILURE and must back off like one.
+//
+// This branch used to return without touching `lastCommandAt`, `failStreak` or
+// `holdUntil` — and since the seam returns `command-next` unconditionally once
+// the current track has ended, the 500 ms tick called it ~7,200 times an hour.
+// Every call reaches `fallbackSong()` → `pool.get()`, and an empty pool has a
+// two-minute TTL, so every other minute it fell through to a FULL catalogue
+// walk: on the order of 1,800–4,500 requests an hour against a metered quota.
+// `logOnce`'s 60-second throttle printed one line a minute, so it looked idle.
+test('an empty pool backs the transport off instead of asking every tick', async () => {
+  const h = harness({ fallbackSong: async () => null });
+  h.emit('track_changed', { trackId: ID_A, durationMs: 200_000 });
+  await h.t.tick();
+  h.advance(200_000); // A ends
+  h.emit('end_of_track', { trackId: ID_A });
+  await h.t.tick();
+
+  // Drive a minute of ticks at the real 500 ms cadence.
+  let asks = 0;
+  const counted = harness({
+    fallbackSong: async () => { asks++; return null; },
+  });
+  counted.emit('track_changed', { trackId: ID_A, durationMs: 1_000 });
+  await counted.t.tick();
+  counted.advance(2_000);
+  counted.emit('end_of_track', { trackId: ID_A });
+  for (let i = 0; i < 120; i++) {
+    await counted.t.tick();
+    counted.advance(500);
+  }
+  // Without the backoff this is one ask per tick. With it, the 30s→10min hold
+  // takes over after the second failure.
+  assert.ok(asks <= 4, `the empty pool is asked a handful of times a minute, not 120 (got ${asks})`);
+  assert.ok(
+    counted.logs.some((l) => /failures in a row/.test(l)),
+    'and the operator is told the transport is holding off',
+  );
+});

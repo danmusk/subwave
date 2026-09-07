@@ -988,11 +988,25 @@ router.get('/dj/playlists', requireAdmin, async (_req, res) => {
 // GET /dj/recent — most recently added tracks, for the manual queue UI.
 // Navidrome only sorts albums by recency, so we expand the newest albums into
 // their songs and flatten. Results are queue-ready /dj/search-shaped objects.
+//
+// A source that can answer "newest tracks" itself is asked FIRST, because the
+// album fan-out below is one request per album — fine against a local Navidrome,
+// and the single most expensive call in the codebase against a per-request
+// metered source (~51 requests for one panel at limit=50). The capability is
+// declared in music/sources/capabilities.ts and the facade returns the neutral
+// empty for a source that lacks it, so this stays one code path rather than a
+// branch on the source id.
 // ---------------------------------------------------------------------------
 router.get('/dj/recent', requireAdmin, async (req, res) => {
   const limit = Math.min(Math.max(parseInt(String(req.query?.limit || ''), 10) || 20, 1), 50);
   try {
     await library.load();
+    // Empty means "cannot answer right now" (a pool not built yet), NOT "there
+    // are none" — so fall through to the fan-out rather than rendering blank.
+    const direct = await subsonic.getRecentSongs({ size: limit });
+    if (direct.length) {
+      return res.json({ results: direct.slice(0, limit).map(toAdminRow) });
+    }
     const albums = await subsonic.getRecentlyAddedAlbums({ size: limit });
     // Bounded fan-out: an unbounded Promise.all fired one getAlbum per album
     // (~21 parallel Navidrome calls at the default limit), which tipped a

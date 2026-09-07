@@ -20,6 +20,10 @@ export interface SourceCapabilities {
   hasPlaylists: boolean;       // getPlaylists + getPlaylist
   hasPlaylistWrite: boolean;   // create/add/remove/update/delete playlists
   hasRecentlyAdded: boolean;   // "newest" albums
+  // The source can answer "newest TRACKS" directly. Without it a caller has to
+  // ask for the newest ALBUMS and then fetch each album's tracks, which on a
+  // per-request-metered source is one request per album for one admin panel.
+  hasRecentSongs: boolean;     // getRecentSongs
   hasFrequent: boolean;        // play-count-ranked albums
   // Fetchable audio bytes (URL or shared-mount path) for the analyzer, the
   // loudness measurement, silence trim and stem rendering. False means every
@@ -46,6 +50,7 @@ const CAPS: Record<string, SourceCapabilities> = {
     hasPlaylists: true,
     hasPlaylistWrite: true,
     hasRecentlyAdded: true,
+    hasRecentSongs: false,
     hasFrequent: true,
     hasAudio: true,
     hasLiveTransport: false,
@@ -58,6 +63,10 @@ const CAPS: Record<string, SourceCapabilities> = {
   // structurally — audio bytes (a DRM stream, nothing to analyse). Playback is
   // a LIVE transport: the queue hands picks to the Spotify controller instead
   // of writing next.txt.
+  //
+  // hasRecentSongs is ON because the pool already stamps each track's `added_at`
+  // as `created` (sources/spotify/map.ts), so "newest tracks" is a sort over
+  // memory. Answering it from albums instead cost one request per album.
   //
   // hasTopSongs went off in the February 2026 API restrictions: Spotify removed
   // GET /artists/{id}/top-tracks with no replacement and dropped `popularity`
@@ -75,6 +84,7 @@ const CAPS: Record<string, SourceCapabilities> = {
     hasPlaylists: true,
     hasPlaylistWrite: false,
     hasRecentlyAdded: true,
+    hasRecentSongs: true,
     hasFrequent: false,
     hasAudio: false,
     hasLiveTransport: true,
@@ -95,6 +105,7 @@ export const DEFAULT_CAPS: SourceCapabilities = {
   hasPlaylists: false,
   hasPlaylistWrite: false,
   hasRecentlyAdded: false,
+  hasRecentSongs: false,
   hasFrequent: false,
   hasAudio: false,
   hasLiveTransport: false,

@@ -151,4 +151,16 @@ export interface MusicSource {
   deletePlaylist?: typeof client.deletePlaylist;
   getRecentlyAddedAlbums?: typeof client.getRecentlyAddedAlbums;
   getFrequentAlbums?: typeof client.getFrequentAlbums;
+
+  // The newest TRACKS, newest first — a direct answer to the question
+  // `GET /dj/recent` actually asks. This has no Subsonic client counterpart on
+  // purpose: there the answer is composed cheaply from newest-albums plus an
+  // album fetch each, and that composition stays in the route. A source whose
+  // per-request cost makes that fan-out unaffordable (Spotify meters every
+  // call, and the pool already holds each track's `added_at` as `created`)
+  // implements this instead and the route asks here first.
+  //
+  // An empty array means "I cannot answer right now" — not "there are none" —
+  // so the caller falls back to the fan-out rather than rendering a blank list.
+  getRecentSongs?(opts?: { size?: number }): Promise<Song[]>;
 }

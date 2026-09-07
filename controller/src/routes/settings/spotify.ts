@@ -15,6 +15,7 @@ import { requireAdmin } from '../../middleware/auth.js';
 import { saveSecrets } from '../../setup/secrets.js';
 import { SpotifyClient, SPOTIFY_SCOPES } from '../../music/sources/spotify/client.js';
 import { spotifyClient, spotifyCredentials, spotifyPool } from '../../music/sources/spotify/source.js';
+import { spotifyReadStats } from '../../music/sources/spotify/reads.js';
 import { writeLibrespotToken, readLibrespotToken, LIBRESPOT_CACHE_DIR } from '../../music/sources/spotify/token-file.js';
 import { beginReceiverAuth, takeReceiverVerifier, exchangeReceiverCode, parseReceiverRedirect, LIBRESPOT_REDIRECT_URI } from '../../music/sources/spotify/receiver-auth.js';
 import { existsSync } from 'node:fs';
@@ -48,12 +49,25 @@ export function spotifyRedirectUri(req: express.Request): string {
 // wave of 403s sat unnoticed while the station ran on the dead-air guard.
 export function poolStatus() {
   const p = spotifyPool().peek();
+  // No pool, nothing to report — and the client is only reached AFTER that
+  // check, so a station that does not use Spotify never constructs one just
+  // because the admin page is open. /settings is polled every 3 seconds.
   if (!p) return null;
+  const c = spotifyClient();
+  const hold = c.rateLimitHold();
+  const pacer = c.pacerState();
   return {
     tracks: p.tracks.size,
     albums: p.albums.size,
     playlists: p.playlists.length,
     builtAt: p.builtAt,
+    // When a FULL catalogue walk last ran, as opposed to a cheap revalidate.
+    walkedAt: p.walkedAt,
+    // This pool came off the saved snapshot and has not been re-checked against
+    // Spotify since the controller started. Not a fault — it is why the station
+    // was playing seconds after boot — but it does mean the orphan reconcile
+    // stands down, so the operator should be able to see it.
+    fromDisk: p.fromDisk,
     partial: p.partial,
     notes: p.notes,
     // Genre enrichment converges over several builds (one request per artist
@@ -61,9 +75,25 @@ export function poolStatus() {
     // moving — a quiet background job with no progress line reads as broken.
     artists: p.artistGenres.size,
     genresPending: p.genresPending,
+    // Why the drip did nothing last tick — null when it is working. Without
+    // this the admin card could only show a number that was not moving, which
+    // is what let a paused drip look identical to a finished one for a day.
+    dripSkip: p.dripSkip,
+    dripAt: p.dripAt,
     // Non-zero while Spotify is holding us off. Surfaced so a paused fill looks
-    // like a pause rather than a failure.
-    rateLimitedMs: spotifyClient().rateLimitedForMs(),
+    // like a pause rather than a failure. `hold.kind` separates the rolling
+    // 30-second window from an exhausted developer-account quota, which since
+    // July 2026 is shared with every other app on the account and clears on
+    // Spotify's schedule rather than in seconds.
+    rateLimitedMs: hold.msLeft,
+    hold: { kind: hold.kind, msLeft: hold.msLeft, endpoint: hold.endpoint },
+    // What the client is currently willing to spend. A slow catalogue walk
+    // should read as pacing, not as a fault.
+    pacer,
+    // What the shared read memos are holding. A cache nobody can see is a cache
+    // nobody trusts, and these are the ones that turned the per-pick album and
+    // search fan-outs from a few hundred requests an hour into a handful.
+    reads: spotifyReadStats(),
     // The walk stopped at maxTracks, so it is a prefix of the library. Worth
     // saying out loud: it also permanently disables the tagger's orphan
     // reconcile, which must never delete against an incomplete walk.
@@ -182,7 +212,12 @@ router.post('/settings/spotify/test', requireAdmin, async (_req, res) => {
   const c = spotifyClient();
   if (!c.hasCredentials()) return res.json({ ok: false, error: 'not connected' });
   try {
-    const me: any = await c.getMe();
+    // `operator: true` — an explicit button press bypasses the rate-limit gate,
+    // per CLAUDE.md's rule that manual operator triggers are exempt from every
+    // automatic gate. It is one request. Refusing it meant that during a hold
+    // the only diagnostic on this page answered "skipped — Spotify rate limit"
+    // and told the operator nothing about whether their credentials worked.
+    const me: any = await c.getMe({ operator: true });
     res.json({
       ok: true,
       displayName: me?.display_name ?? me?.id,
@@ -193,6 +228,17 @@ router.post('/settings/spotify/test', requireAdmin, async (_req, res) => {
   } catch (err: any) {
     res.json({ ok: false, error: err?.message || 'probe failed' });
   }
+});
+
+// Forget a rate-limit / quota hold. The escape hatch: before this existed the
+// only way out of a stuck hold was to exec into the container and delete
+// state/spotify/rate-limit.json, and disconnecting Spotify did not help either
+// (the client is a process singleton and resetToken() clears only the access
+// token). Clearing does not make Spotify any more willing — it just lets the
+// station ask once and find out where it really stands.
+router.post('/settings/spotify/hold/clear', requireAdmin, (_req, res) => {
+  spotifyClient().clearHold();
+  res.json({ ok: true, pool: poolStatus() });
 });
 
 router.post('/settings/spotify/disconnect', requireAdmin, async (req, res) => {
@@ -264,10 +310,12 @@ router.post('/settings/spotify/receiver/code', requireAdmin, async (req, res) =>
 });
 
 // Rebuild the pool now (after editing playlists) rather than waiting out the TTL.
+// rebuild() rather than invalidate()+get(): an operator pressing this is saying
+// they do not trust what is cached, so it forces a FULL walk instead of the
+// cheap snapshot_id revalidate a normal refresh does.
 router.post('/settings/spotify/pool/refresh', requireAdmin, async (_req, res) => {
   try {
-    spotifyPool().invalidate();
-    const p = await spotifyPool().get();
+    const p = await spotifyPool().rebuild();
     res.json({ ok: true, tracks: p.tracks.size, albums: p.albums.size, playlists: p.playlists, genres: p.genres.size, partial: p.partial, notes: p.notes });
   } catch (err: any) {
     res.status(502).json({ ok: false, error: err?.message || 'pool build failed' });

@@ -134,19 +134,57 @@ app that is not in extended quota mode:
   but not that you are Premium. Connect playback still requires it;
 - **artist genres arrive gradually.** Spotify tags artists rather than tracks and
   the batch lookup is gone, so genres cost one request per artist. The station
-  fetches a batch per pool rebuild, busiest artists first, and remembers the
-  answers on disk (`state/spotify/artist-genres.json`) — so coverage climbs over
-  a few hours and then costs nothing, surviving restarts. The Library pool card
-  shows the progress. Genre shows and genre-based picking sharpen as it fills.
+  fills them as a **background drip** (`spotify.quota.genresPerHour`, default
+  750), busiest artists first, and remembers the answers on disk
+  (`state/spotify/artist-genres.json`) — so coverage climbs over a few hours and
+  then costs nothing, surviving restarts. The drip runs on its own rather than
+  inside a pool rebuild, so it keeps going between rebuilds and picks itself back
+  up after a rate-limit pause. The Library pool card shows the progress. Genre
+  shows and genre-based picking sharpen as it fills.
 
 **You cannot leave Development Mode**, and you should not try. Since 15 May 2025
 Spotify accepts extended-quota applications only from **organisations** — a
 registered business with a launched service and at least 250k monthly active
 users. A personal station cannot qualify. Development Mode is fine here: its
-user allowlist only needs to hold you. What binds is the **rolling 30-second
-request window**, which is why the station paces itself rather than retrying
-harder — when Spotify says stop, every request in the controller stops together
-and the admin page shows the countdown.
+user allowlist only needs to hold you.
+
+What binds is the **rolling 30-second request window** — and, since **23 July
+2026**, a quota counted per developer **account** rather than per app, shared by
+every app that account owns. Spotify publishes no number for either. So the
+station does three things instead of retrying harder:
+
+- **it paces itself.** A ceiling on non-critical requests per rolling 30 seconds
+  (`spotify.quota.requestsPer30s`, default 90) that **halves whenever Spotify
+  refuses one and eases back over quiet windows** — since no figure is published,
+  the only correct ceiling is one that finds the real limit. Playback commands
+  are exempt and never wait: the music does not stop for a quota.
+- **it asks for less.** The pool is saved to disk, so a restart costs nothing,
+  and a refresh re-reads only the playlists whose Spotify `snapshot_id` moved —
+  a handful of requests where a full walk costs one per fifty tracks. A full walk
+  still runs on `spotify.pool.fullWalkHours` (default 24). Albums and searches
+  the DJ keeps asking for are remembered too: an album's tracks used to cost a
+  request every time a pick looked at it (the picker fans out over five to
+  fourteen albums *per track it picks*), and one search is three requests because
+  a page holds ten results, so the same query recurring across picks was the
+  single largest repeat bill. The Library pool card shows how many are being
+  reused.
+- **it stops when told.** When Spotify says stop, catalogue requests stand down
+  together, the hold is **written to disk so a restart respects it**, and the
+  admin page shows the countdown — labelled *rate limit* or *quota*, which are
+  different things with different waits.
+
+**A hold is a deadline, and it always counts down.** Playback commands are
+exempt from the hold so music never stops — and because they are exempt, their
+own refusals are *reported but never allowed to extend it*. (An earlier build
+let them, which meant a player command every couple of minutes kept pushing the
+deadline out: the station sat locked out for a day, restarts included. If you
+are on that build, the symptom is a hold that never reaches zero.) A hold you
+believe is wrong can be cleared: **Settings → Music source → Library pool →
+Clear hold**, or delete `state/spotify/rate-limit.json` and restart. Clearing
+does not make Spotify more willing — it lets the station ask once and find out.
+
+The **Test** button is exempt too. A diagnostic you cannot run during an outage
+is a diagnostic you do not have.
 
 Everything else is on: the agent and pool pickers, text tagging and
 embeddings over the pool, era filtering (album-level; compilations read as
@@ -154,8 +192,9 @@ unknown-year as they do on Navidrome), requests, ducked links/idents/banter/
 programmes, jingles, sfx, likes, webhooks, Last.fm/ListenBrainz scrobbling,
 all skins, the MCP server.
 
-Settings under `spotify`: `deviceName`, `bitrate` (96/160/320), `pool.*`,
-`seamLeadMs`, `healthPollSec`, `mismatch`. Device name and bitrate are
+Settings under `spotify`: `deviceName`, `bitrate` (96/160/320), `pool.*`
+(including `pool.fullWalkHours`), `quota.requestsPer30s`, `quota.genresPerHour`,
+`seamLeadMs`, `mismatch`. Device name and bitrate are
 receiver launch flags and need a mixer restart; the rest apply live.
 
 ## Troubleshooting
@@ -171,7 +210,11 @@ receiver launch flags and need a mixer restart; the rest apply live.
 | Test can't say whether the account is Premium | — | expected: Spotify removed `product` from `/me` in February 2026. Premium is still required, it just cannot be probed |
 | Any Web API call answering **403** on an endpoint that used to work | `docker compose logs controller` (`[spotify] GET … → 403 …`) | the February 2026 Development Mode restrictions removed a slice of the API. The station targets the new surface; a 403 on something else means another endpoint went the same way |
 | `rate limited … holding every request for Ns`, once | admin → Music source → Library pool | normal and self-healing: Spotify's rolling 30s window. Every request in the controller stands down together and genre enrichment resumes when it clears. One line per window — a *flood* of 429s means an older build |
-| Artist genres stuck at the same number | Library pool card | each rebuild spends a bounded batch (see `ARTIST_GENRE_BUDGET`); force one with *Rebuild pool now*. If it never moves, check for a rate-limit line |
+| `the developer account's Web API QUOTA is exhausted`, and the card says *quota* not *rate limit* | Library pool card, and your other Spotify apps | a different limit: since July 2026 the Development Mode budget is counted per developer **account** and shared by every app on it. Waiting is the fix — the hold survives a restart on purpose. If it recurs, lower `spotify.quota.genresPerHour`, raise `spotify.pool.fullWalkHours`, or check what else is spending the account's budget |
+| A hold that **never counts down**, and is still there after a restart | Library pool card | an older build, where a playback command's own refusal could push the deadline out — and playback is never gated, so it did that forever. Update, then *Clear hold* (or delete `state/spotify/rate-limit.json`) |
+| Artist genres stuck at the same number | Library pool card — it now says WHY | the drip is paused or off, and the card says which. Check for a rate-limit/quota line, and that `spotify.quota.genresPerHour` is not 0. It fills continuously in the background — no rebuild is needed and *Rebuild pool now* will not speed it up |
+| Banner: *Can't reach Spotify* with a rate-limit reason | — | not an outage and nothing to reconnect. **Do not disconnect or re-enter credentials over a hold** — that rebuilds the pool for no reason. It clears itself |
+| Pool card says *from the saved snapshot*, and the tagger reports a skipped prune | Library pool card | expected right after a restart: the pool was restored from disk (which is why the station was playing immediately) and has not been re-checked against Spotify yet. The next refresh clears it. The tagger never deletes against a view it has not confirmed itself |
 | Receiver missing from the device list | `spotify.deviceName`, `docker compose logs broadcast` | librespot not authenticated; the name is matched case-insensitively |
 | Picks never start, booth log says `no-device` | as above | the receiver is down; picks stay queued until it returns |
 | `unavailable` in the booth log | track/market | not playable on this account or market — dropped and re-picked |
@@ -179,7 +222,8 @@ receiver launch flags and need a mixer restart; the rest apply live.
 | Doctor: `spotify connectivity` fails | credentials | refresh token revoked — reconnect |
 
 State files: `state/spotify/` (receiver credential cache, token,
-`artist-genres.json` — a rebuildable cache, deliberately not in backups),
+`artist-genres.json`, `pool.json` and `rate-limit.json` — all rebuildable
+caches, deliberately not in backups; delete them and the station re-walks),
 `state/spotify-player.json` (last player event), `state/spotify-audio.json`
 (silence detector), `state/logs/spotify-events.log` (rolling event log),
 `state/liquidsoap_music_mode.txt` and `state/liquidsoap_spotify.txt` (mixer

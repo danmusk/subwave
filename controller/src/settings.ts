@@ -93,9 +93,11 @@ import {
   MUSIC_SOURCES,
   PICKER_ALBUM_HOURS_BOUNDS,
   SPOTIFY_BITRATES,
-  SPOTIFY_HEALTH_POLL_SEC_BOUNDS,
   SPOTIFY_MISMATCH_MODES,
   SPOTIFY_POOL_MAX_TRACKS_BOUNDS,
+  SPOTIFY_POOL_FULL_WALK_HOURS_BOUNDS,
+  SPOTIFY_REQUESTS_PER_30S_BOUNDS,
+  SPOTIFY_GENRES_PER_HOUR_BOUNDS,
   SPOTIFY_SEAM_LEAD_MS_BOUNDS,
   STREAM_BUFFER_SECONDS_BOUNDS,
   STREAM_COUNTRY_HEADER_RE,
@@ -1152,13 +1154,21 @@ export async function load() {
         maxTracks: Number.isFinite(Number(stored.spotify?.pool?.maxTracks))
           ? Math.round(Math.min(SPOTIFY_POOL_MAX_TRACKS_BOUNDS.max, Math.max(SPOTIFY_POOL_MAX_TRACKS_BOUNDS.min, Number(stored.spotify.pool.maxTracks))))
           : DEFAULTS.spotify.pool.maxTracks,
+        fullWalkHours: Number.isFinite(Number(stored.spotify?.pool?.fullWalkHours))
+          ? Math.round(Math.min(SPOTIFY_POOL_FULL_WALK_HOURS_BOUNDS.max, Math.max(SPOTIFY_POOL_FULL_WALK_HOURS_BOUNDS.min, Number(stored.spotify.pool.fullWalkHours))))
+          : DEFAULTS.spotify.pool.fullWalkHours,
+      },
+      quota: {
+        requestsPer30s: Number.isFinite(Number(stored.spotify?.quota?.requestsPer30s))
+          ? Math.round(Math.min(SPOTIFY_REQUESTS_PER_30S_BOUNDS.max, Math.max(SPOTIFY_REQUESTS_PER_30S_BOUNDS.min, Number(stored.spotify.quota.requestsPer30s))))
+          : DEFAULTS.spotify.quota.requestsPer30s,
+        genresPerHour: Number.isFinite(Number(stored.spotify?.quota?.genresPerHour))
+          ? Math.round(Math.min(SPOTIFY_GENRES_PER_HOUR_BOUNDS.max, Math.max(SPOTIFY_GENRES_PER_HOUR_BOUNDS.min, Number(stored.spotify.quota.genresPerHour))))
+          : DEFAULTS.spotify.quota.genresPerHour,
       },
       seamLeadMs: Number.isFinite(Number(stored.spotify?.seamLeadMs))
         ? Math.round(Math.min(SPOTIFY_SEAM_LEAD_MS_BOUNDS.max, Math.max(SPOTIFY_SEAM_LEAD_MS_BOUNDS.min, Number(stored.spotify.seamLeadMs))))
         : DEFAULTS.spotify.seamLeadMs,
-      healthPollSec: Number.isFinite(Number(stored.spotify?.healthPollSec))
-        ? Math.round(Math.min(SPOTIFY_HEALTH_POLL_SEC_BOUNDS.max, Math.max(SPOTIFY_HEALTH_POLL_SEC_BOUNDS.min, Number(stored.spotify.healthPollSec))))
-        : DEFAULTS.spotify.healthPollSec,
       mismatch: SPOTIFY_MISMATCH_MODES.includes(stored.spotify?.mismatch)
         ? stored.spotify.mismatch
         : DEFAULTS.spotify.mismatch,

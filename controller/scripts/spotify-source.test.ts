@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { beforeEach } from 'node:test';
 
 const stateRoot = mkdtempSync(path.join(tmpdir(), 'subwave-spotify-source-'));
 process.env.STATE_DIR = stateRoot;
@@ -37,6 +37,16 @@ const { capabilitiesFor } = await import('../src/music/sources/capabilities.js')
 const { buildPickerContext } = await import('../src/llm/internal/tools/picker/scope.js');
 const { PICKER_TOOLS } = await import('../src/llm/internal/tools/picker/index.js');
 const { pickerScope } = await import('../src/llm/internal/tools/picker/scope.js');
+const { invalidateSpotifyReads } = await import('../src/music/sources/spotify/reads.js');
+
+// The shared catalogue reads (reads.ts) are memoised at MODULE scope, because
+// the client they wrap is a process singleton — that is what lets one
+// /me/playlists walk serve both the admin's playlist pickers and every pool
+// build. Tests are the one place that is wrong: each builds its own client with
+// its own `calls` log, and a memo carried over would let an earlier test's
+// listing answer a later test's build and quietly prove nothing. Same reasoning
+// as freshCachePath() below, and the same fix — start every test cold.
+beforeEach(() => { invalidateSpotifyReads(); });
 
 // ── fixtures ───────────────────────────────────────────────────────────────
 
@@ -139,6 +149,12 @@ test('sample is a permutation prefix', () => {
 // later test's budget and quietly prove nothing.
 let cacheSeq = 0;
 const freshCachePath = () => path.join(stateRoot, `genre-cache-${++cacheSeq}.json`);
+// The POOL is persisted now too (pool-store.ts), and for the same reason each
+// test needs a file of its own: sharing one would let an earlier test's snapshot
+// be restored by a later one, which would then assert that no requests were made
+// while proving only that the previous test had already made them.
+let snapSeq = 0;
+const freshSnapshotPath = () => path.join(stateRoot, `pool-snapshot-${++snapSeq}.json`);
 
 function fakeClient(opts: { failSaved?: boolean; failArtists?: boolean; limitedMs?: number } = {}) {
   const calls: string[] = [];
@@ -179,7 +195,7 @@ function fakeClient(opts: { failSaved?: boolean; failArtists?: boolean; limitedM
 
 test('the pool dedupes, caps, stamps genres and marks compilations untrusted', async () => {
   const { client, calls } = fakeClient();
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1', 'EXT1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1', 'EXT1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath(), freshSnapshotPath());
   const p = await pool.get();
   assert.equal(p.tracks.size, 3, 'two playlist tracks + one saved, the duplicate collapsed');
   assert.equal(p.playlists.length, 2, 'the owned playlist and the configured external one');
@@ -200,7 +216,7 @@ test('the pool dedupes, caps, stamps genres and marks compilations untrusted', a
 
 test('the artist-genre cache outlives a rebuild — a removed batch endpoint must not become N calls every 30 minutes', async () => {
   const { client, calls } = fakeClient();
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath(), freshSnapshotPath());
   await pool.get();
   const first = calls.filter((x) => x.startsWith('artist:')).length;
   assert.ok(first > 0, 'the first build asks');
@@ -244,15 +260,18 @@ test('the genre fill is BUDGETED — a build is never a burst, and the rest carr
     rateLimitedForMs: () => 0,
     async *paginate<T>(page: (o: number) => Promise<any>) { const p = await page(0); for (const it of p.items ?? []) yield it as T; },
   };
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: false, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: false, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath(), freshSnapshotPath());
 
   const p1 = await pool.get();
   assert.equal(calls.length, ARTIST_GENRE_BUDGET, 'exactly the budget, not the whole queue');
   assert.equal(p1.genresPending, many - ARTIST_GENRE_BUDGET, 'the remainder is pending, not lost');
   assert.equal(p1.partial, false, 'unfilled genres are enrichment in flight, NOT a broken pool');
 
-  pool.invalidate();
-  const p2 = await pool.get();
+  // rebuild(), not invalidate()+get(): invalidate() deliberately keeps serving
+  // the pool it has while the replacement is fetched, so the station never
+  // waits on Spotify to answer a pick. Only an operator asking for a rebuild
+  // blocks on the result.
+  const p2 = await pool.rebuild();
   assert.equal(calls.length, Math.min(many, ARTIST_GENRE_BUDGET * 2), 'the next build spends another budget');
   assert.ok(p2.genresPending < p1.genresPending, 'and converges');
 });
@@ -260,7 +279,7 @@ test('the genre fill is BUDGETED — a build is never a burst, and the rest carr
 test('the fill ranks by track count, so a budget buys the most coverage', async () => {
   // ar1 owns two tracks, ar2 one. With a budget of one, ar1 must win.
   const { client, calls } = fakeClient();
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath(), freshSnapshotPath());
   await pool.get();
   const asked = calls.filter((x) => x.startsWith('artist:'));
   assert.equal(asked[0], 'artist:ar1', 'the artist with the most pool tracks goes first');
@@ -268,7 +287,7 @@ test('the fill ranks by track count, so a budget buys the most coverage', async 
 
 test('a rate limit stops the fill dead and is not cached as a miss', async () => {
   const { client, calls } = fakeClient({ failArtists: true });
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ['PL1'], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath(), freshSnapshotPath());
   const p = await pool.get();
   assert.ok(p.tracks.size > 0, 'the pool still plays music');
   assert.equal(p.partial, false, 'a rate-limited fill is not a broken pool');
@@ -280,8 +299,7 @@ test('a rate limit stops the fill dead and is not cached as a miss', async () =>
   // write an artist off permanently over a moment.
   const healthy = fakeClient();
   client.getArtist = healthy.client.getArtist;
-  pool.invalidate();
-  const p2 = await pool.get();
+  const p2 = await pool.rebuild();
   assert.deepEqual(p2.tracks.get('AAAAAAAAAAAAAAAAAAAAAA')!.genres, ['trip hop'], 'retried once the limit cleared');
 });
 
@@ -292,7 +310,7 @@ test('a closed rate-limit gate suppresses the rebuild — the short empty retry 
   let limited = 0;
   client.rateLimitedForMs = () => limited;
   let now = 1_000_000;
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now, freshCachePath());
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now, freshCachePath(), freshSnapshotPath());
   await pool.get();
   const after = calls.filter((x) => x === 'saved').length;
 
@@ -320,7 +338,7 @@ test('an empty playlist listing explains itself, is not called a failure, and is
   client.getMyPlaylists = async () => { calls.push('playlists'); return { items: [], next: null }; };
   client.getSavedTracks = async () => { calls.push('saved'); return { items: [], next: null }; };
   let now = 1_000_000;
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now, freshCachePath());
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now, freshCachePath(), freshSnapshotPath());
 
   const p = await pool.get();
   assert.equal(p.tracks.size, 0);
@@ -342,7 +360,7 @@ test('an empty, failed build is held only briefly — a 30-minute memo of nothin
   // Every source fails: the playlist listing throws and saved tracks throw.
   client.getMyPlaylists = async () => { throw new Error('403 Forbidden'); };
   let now = 1_000_000;
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now, freshCachePath());
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, () => now, freshCachePath(), freshSnapshotPath());
   const empty = await pool.get();
   assert.equal(empty.tracks.size, 0);
   assert.equal(empty.partial, true);
@@ -361,12 +379,12 @@ test('an empty, failed build is held only briefly — a 30-minute memo of nothin
 
 test('a failed source page leaves the pool usable and marked partial; a cap stops the walk', async () => {
   const { client } = fakeClient({ failSaved: true });
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath(), freshSnapshotPath());
   const p = await pool.get();
   assert.equal(p.partial, true);
   assert.equal(p.tracks.size, 2);
 
-  const capped = new SpotifyPoolCache(() => fakeClient().client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 1 }), () => {}, Date.now, freshCachePath());
+  const capped = new SpotifyPoolCache(() => fakeClient().client, () => ({ playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 1 }), () => {}, Date.now, freshCachePath(), freshSnapshotPath());
   const cappedPool = await capped.get();
   assert.equal(cappedPool.tracks.size, 1);
   assert.equal(cappedPool.truncated, true, 'a capped walk is a PREFIX of the library — the reconcile must not delete against it');
@@ -376,12 +394,21 @@ test('a failed source page leaves the pool usable and marked partial; a cap stop
 test('a pool-definition change rebuilds on the next get() without an explicit invalidate', async () => {
   const { client, calls } = fakeClient();
   let ids = ['PL1'];
-  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ids, includeSaved: false, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath());
+  const pool = new SpotifyPoolCache(() => client, () => ({ playlistIds: ids, includeSaved: false, includeSavedAlbums: false, maxTracks: 5000 }), () => {}, Date.now, freshCachePath(), freshSnapshotPath());
   await pool.get();
+  const walks = () => calls.filter((x) => x.startsWith('items:')).length;
+  const before = walks();
   ids = ['PL1', 'EXT1'];
   const p = await pool.get();
   assert.equal(p.playlists.length, 2);
-  assert.equal(calls.filter((x) => x === 'playlists').length, 2);
+  assert.ok(walks() > before, 'the definition changed, so the playlists are walked again');
+  assert.ok(calls.includes('playlist:EXT1'), 'and the newly configured external playlist is resolved');
+  // The ACCOUNT LISTING is not re-walked, and that is the point of sharing it
+  // (reads.ts): which playlists the operator owns did not change just because
+  // the pool now selects two of them. Only an event that changes the account —
+  // a connect, a token paste, a disconnect, or the operator pressing "Rebuild
+  // pool now" — goes through invalidate() and drops it.
+  assert.equal(calls.filter((x) => x === 'playlists').length, 1, 'the account listing is shared, not re-walked per rebuild');
 });
 
 // ── through the facade ─────────────────────────────────────────────────────
@@ -482,6 +509,71 @@ test('the library walk yields a blocklisted track; the pick paths still refuse i
     assert.deepEqual(await facade.catalogHealth(), { complete: true });
   } finally {
     await blocklist.remove('track', BLOCKED).catch(() => {});
+    stubRoutes = [];
+    delete process.env.SPOTIFY_CLIENT_ID;
+    delete process.env.SPOTIFY_CLIENT_SECRET;
+    delete process.env.SPOTIFY_REFRESH_TOKEN;
+    writeFileSync(path.join(stateRoot, 'settings.json'), '{}');
+    setCache(null);
+    await settings.load();
+  }
+});
+
+// GET /dj/recent asked for newest ALBUMS and then fetched every album's tracks
+// — one request per album, ~51 for one admin panel at limit=50, and the most
+// expensive call in the codebase with no cache anywhere on the path. The pool
+// already stamps each track's `added_at` as `created`, so the answer was in
+// memory the whole time. Driven through the real singleton source, because the
+// route reaches it through the facade.
+test('the newest tracks come out of the pool, newest first, costing nothing', async () => {
+  const { spotifySource, spotifyPool, spotifyClient } = await import('../src/music/sources/spotify/source.js');
+  const page = (items: any[]) => ({ items, next: null });
+  stubRoutes = [
+    [/accounts\.spotify\.com\/api\/token/, { access_token: 'T', expires_in: 3600 }],
+    [/\/me\/playlists/, page([{ id: 'PL1', name: 'Night', items: { total: 2 } }])],
+    [/\/playlists\/PL1\/items/, page([
+      { item: track('AAAAAAAAAAAAAAAAAAAAAA', 'Older'), added_at: '2024-01-01T00:00:00Z' },
+      { item: track('BBBBBBBBBBBBBBBBBBBBBB', 'Newer'), added_at: '2025-06-01T00:00:00Z' },
+    ])],
+    [/\/me\/tracks/, page([])],
+    [/\/me\/albums/, page([])],
+    [/\/artists\//, { id: 'ar1', genres: [] }],
+  ];
+  process.env.SPOTIFY_CLIENT_ID = 'id';
+  process.env.SPOTIFY_CLIENT_SECRET = 'secret';
+  process.env.SPOTIFY_REFRESH_TOKEN = 'refresh';
+  try {
+    writeFileSync(path.join(stateRoot, 'settings.json'), JSON.stringify({ music: { source: 'spotify' } }));
+    setCache(null);
+    await settings.load();
+    spotifyClient().resetToken();
+    await spotifyPool().rebuild();
+
+    const recent = await spotifySource.getRecentSongs!({ size: 10 });
+    assert.deepEqual(recent.map((s: any) => s.title), ['Newer', 'Older'], 'newest first, by the added_at the pool already holds');
+
+    // Through the facade, which is what routes/dj.ts calls. The capability is
+    // what keeps that route ONE code path instead of a source-id branch.
+    assert.equal(capabilitiesFor('spotify').hasRecentSongs, true);
+    assert.equal(capabilitiesFor('subsonic').hasRecentSongs, false, 'Navidrome keeps composing it from albums — that fan-out is cheap there');
+    assert.equal((await facade.getRecentSongs({ size: 1 })).length, 1);
+
+    // THE LANDMINE TEST. A rebuild that cannot read anything — every request
+    // refused, which is what a rate-limit hold looks like — must leave the
+    // working library exactly where it was. It used to discard the pool BEFORE
+    // attempting, publish an empty one, and mark the disk snapshot as already
+    // read, so pressing "Rebuild pool now" during a hold took the station to
+    // dead air until it was restarted.
+    stubRoutes = [[/accounts\.spotify\.com\/api\/token/, { access_token: 'T', expires_in: 3600 }]];
+    const survived = await spotifyPool().rebuild();
+    assert.equal(survived.tracks.size, 2, 'the library survives a rebuild that could not read anything');
+    assert.equal(survived.partial, true, 'and says it is incomplete, which stands the reconcile down');
+    assert.deepEqual(
+      (await spotifySource.getRecentSongs!({ size: 10 })).map((s: any) => s.title),
+      ['Newer', 'Older'],
+      'so the station keeps answering picks from what it already had',
+    );
+  } finally {
     stubRoutes = [];
     delete process.env.SPOTIFY_CLIENT_ID;
     delete process.env.SPOTIFY_CLIENT_SECRET;

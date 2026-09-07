@@ -344,6 +344,16 @@ export class SpotifyTransport implements PlaybackTransport {
     if (!song?.id) {
       this.logOnce('no-fallback', 'error', `Spotify transport: nothing to play (${reason}) and the pool is empty — the mixer's emergency loop covers the air`);
       await this.setGap(false); // let the guard speak
+      // AN EMPTY POOL IS A FAILURE AND MUST BE BACKED OFF LIKE ONE. This branch
+      // used to return without touching `lastCommandAt`, `failStreak` or
+      // `holdUntil` — and since seam-pure returns `command-next` unconditionally
+      // once the current track has ended, the 500 ms tick called this ~7,200
+      // times an hour. Each call reaches `fallbackSong()` → `pool.get()`, and an
+      // empty pool has a two-minute TTL, so every other minute it fell through
+      // to a FULL catalogue walk: on the order of 1,800–4,500 requests an hour
+      // against a metered quota, with `logOnce`'s 60 s throttle printing one
+      // line a minute so it looked idle.
+      this.noteFailure('the pool is empty');
       return;
     }
     this.deps.log('scheduler', `Spotify transport: no pick ready (${reason}) — playing "${song.title}" from the pool`);
@@ -406,6 +416,16 @@ let instance: SpotifyTransport | null = null;
 export async function startSpotifyTransportIfActive(): Promise<SpotifyTransport | null> {
   const source = await import('../../source.js');
   if (!source.activeCapabilities().hasLiveTransport || source.activeSourceId() !== 'spotify') return null;
+
+  // Start the genre drip FIRST, and on its own. It used to be the last
+  // statement of this function, behind ~50 lines and six dynamic imports that
+  // can throw — and server.ts swallows a throw here into one console line, so
+  // any transport-start failure silently switched enrichment off for the life
+  // of the process with nothing to distinguish it from "nothing left to do".
+  // The drip needs only the pool, so it should not be able to fail with the
+  // receiver.
+  const { startSpotifyGenreDrip } = await import('./source.js');
+  startSpotifyGenreDrip();
   const { queue } = await import('../../../broadcast/queue.js');
   const { setLiveTransport } = await import('../../../broadcast/queue/transport.js');
   const liq = await import('../../../broadcast/liquidsoap-control.js');

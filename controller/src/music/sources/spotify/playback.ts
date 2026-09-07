@@ -20,8 +20,21 @@ export interface PlaybackControllerDeps {
 
 export interface SpotifyDevice { id: string; name: string; is_active: boolean; type?: string; volume_percent?: number }
 
+// Longer than a track, deliberately. At 60s against an average ~200s track the
+// cache never once hit in the healthy steady state, so EVERY track paid a fresh
+// GET /me/player/devices on top of its play — doubling the player lane's spend
+// on a device id that is stable for the whole librespot session. A stale id
+// costs one refused play, which `play()` already retries with `force`.
+export const DEVICE_CACHE_MS = 10 * 60_000;
+// A MISS is remembered too, briefly. Only successes were cached, so while the
+// receiver was down every single call re-asked — the worst possible moment to
+// be spending requests, and the transport's own backoff could not help because
+// the lookup happens before the command it is backing off.
+export const DEVICE_MISS_TTL_MS = 15_000;
+
 export class SpotifyPlaybackController {
   private device: { id: string; at: number } | null = null;
+  private missAt = 0;
   private readonly log: (line: string) => void;
   private readonly now: () => number;
   private readonly cacheMs: number;
@@ -29,13 +42,16 @@ export class SpotifyPlaybackController {
   constructor(private readonly deps: PlaybackControllerDeps) {
     this.log = deps.log ?? (() => {});
     this.now = deps.now ?? Date.now;
-    this.cacheMs = deps.deviceCacheMs ?? 60_000;
+    this.cacheMs = deps.deviceCacheMs ?? DEVICE_CACHE_MS;
   }
 
   // The receiver's device id, by name. Cached — Spotify's device list is a
   // slow call and the id is stable for a librespot session.
   async deviceId(force = false): Promise<string | null> {
     if (!force && this.device && this.now() - this.device.at < this.cacheMs) return this.device.id;
+    // A recent miss is an answer too. `force` still overrides it, so a reclaim
+    // or a post-404 retry always looks again.
+    if (!force && this.missAt && this.now() - this.missAt < DEVICE_MISS_TTL_MS) return null;
     const want = this.deps.deviceName().trim().toLowerCase();
     const r: any = await this.deps.client().getDevices();
     const devices: SpotifyDevice[] = Array.isArray(r?.devices) ? r.devices : [];
@@ -43,6 +59,7 @@ export class SpotifyPlaybackController {
       ?? devices.find((d) => String(d.name ?? '').trim().toLowerCase().startsWith(want));
     if (!hit?.id) {
       this.device = null;
+      this.missAt = this.now();
       // Name the log. Liquidsoap owns the wrapper's stderr and does not forward
       // it to the container log, so the REASON the receiver is absent is only
       // ever written to state/logs/librespot.log — and nothing else points
@@ -56,6 +73,7 @@ export class SpotifyPlaybackController {
       return null;
     }
     this.device = { id: hit.id, at: this.now() };
+    this.missAt = 0;
     return hit.id;
   }
 

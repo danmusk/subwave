@@ -333,3 +333,339 @@ test('redactSpotify hides token-shaped values', () => {
   const s = redactSpotify('access_token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd Bearer ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210zyxw');
   assert.ok(!/ABCDEFGHIJKLMNOP|ZYXWVUTSRQ/.test(s), s);
 });
+
+// ── the pacer, the quota reason, and the hold that outlives a restart ───────
+
+// The gate above is REACTIVE: it only learns about a limit by being refused by
+// one. The pacer is the other half — a ceiling on non-critical request STARTS,
+// so the catalogue walk (~100 back-to-back foreground requests on a 5000-track
+// pool, previously unspaced) cannot earn the 429 in the first place.
+test('the pacer holds background work at the ceiling; critical is never paced', async () => {
+  const script: Step[] = [tokenOk()];
+  for (let i = 0; i < 40; i++) script.push({ status: 200, body: { id: 'A' } });
+  const { fetchImpl, calls } = fakeFetch(script);
+  let now = 1_000_000;
+  const waits: number[] = [];
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, now: () => now,
+    requestsPer30s: () => 10,
+    backgroundGapMs: 0,
+    // Advancing the clock inside the injected sleep is what makes the window
+    // actually roll; without it the pacer would spin.
+    sleep: async (ms) => { waits.push(ms); now += ms; },
+  });
+
+  for (let i = 0; i < 10; i++) await c.getArtist('A' + i, { background: true });
+  assert.equal(waits.length, 0, 'the first window-full goes straight through');
+  assert.equal(c.pacerState().usedInWindow, 10);
+
+  // The eleventh has to wait for the first to fall out of the rolling window.
+  await c.getArtist('A10', { background: true });
+  assert.equal(waits.length, 1, 'the ceiling is enforced, not merely reported');
+  assert.ok(waits[0] > 0 && waits[0] <= 30_100, `a wait bounded by the window, got ${waits[0]}`);
+
+  // Critical never queues behind any of it — the lane rule this whole file is
+  // built on. A player command is what keeps music on air.
+  const before = waits.length;
+  await c.getPlaybackState();
+  assert.equal(waits.length, before, 'a player command is not paced');
+  assert.ok(calls.length > 10);
+});
+
+// A FOREGROUND call is something an operator or a track boundary is waiting on,
+// and the ceiling is our guess at a limit Spotify does not publish. Holding a
+// search for half a minute on a guess is worse than spending the request and
+// letting the real 429 answer.
+test('a foreground call waits only a short while for the pacer, then goes anyway', async () => {
+  const script: Step[] = [tokenOk()];
+  for (let i = 0; i < 20; i++) script.push({ status: 200, body: { ok: true } });
+  const { fetchImpl, calls } = fakeFetch(script);
+  let now = 1_000_000;
+  const waits: number[] = [];
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, now: () => now,
+    requestsPer30s: () => 5, maxRetryAfterMs: 1_000,
+    sleep: async (ms) => { waits.push(ms); now += ms; },
+  });
+  for (let i = 0; i < 5; i++) await c.getMe();
+  const spent = calls.length;
+  await c.getMe();
+  assert.equal(waits.length, 0, 'the wait would exceed maxRetryAfterMs, so it is not taken');
+  assert.equal(calls.length, spent + 1, 'and the request is sent rather than stalled');
+});
+
+// Spotify publishes no Development Mode number, and since 2026-07-23 the budget
+// is shared with every other app on the developer account — so the ceiling has
+// to find the real limit rather than assume one.
+test('the ceiling halves on a 429 and eases back over clean windows', async () => {
+  const { fetchImpl } = fakeFetch([
+    tokenOk(),
+    { status: 429, headers: { 'retry-after': '1' }, body: { error: { message: 'rate limit' } } },
+    { status: 200, body: { ok: true } },
+    { status: 200, body: { ok: true } },
+    { status: 200, body: { ok: true } },
+  ]);
+  let now = 1_000_000;
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, now: () => now,
+    requestsPer30s: () => 100, sleep: async (ms) => { now += ms; },
+  });
+  assert.equal(c.pacerState().ceiling, 100);
+  await c.getMe();
+  assert.equal(c.pacerState().ceiling, 50, 'a refusal halves it');
+
+  // Recovery is at most once per window, and slow — climbing fast is how the
+  // halving gets undone before the real limit has been felt.
+  now += 30_001;
+  await c.getMe();
+  assert.equal(c.pacerState().ceiling, 55);
+  now += 30_001;
+  await c.getMe();
+  assert.equal(c.pacerState().ceiling, 61);
+  assert.equal(c.pacerState().configured, 100, 'it climbs back towards the configured value, never past it');
+});
+
+// Two different refusals wearing the same status code. A rolling-window 429
+// clears in seconds; an exhausted account budget clears on Spotify's schedule,
+// so clamping it to the window's 30-minute bound would have the station asking
+// again with hours left to run.
+test('QUOTA_EXCEEDED is held longer than a rolling-window 429 and is named as itself', async () => {
+  const { fetchImpl } = fakeFetch([
+    tokenOk(),
+    // No Retry-After: the fallback is what is being tested.
+    { status: 429, body: { reason: 'QUOTA_EXCEEDED', error: { message: 'quota exceeded' } } },
+  ]);
+  const logs: string[] = [];
+  const now = 1_000_000;
+  const c = new SpotifyClient({ fetch: fetchImpl, credentials: creds, now: () => now, log: (l) => logs.push(l), sleep: noSleep });
+
+  await assert.rejects(c.getArtist('A1', { background: true }), (e: any) => e.status === 429);
+  const hold = c.rateLimitHold();
+  assert.equal(hold.kind, 'quota');
+  assert.ok(hold.msLeft > 5_000, `an unlabelled 429 falls back to 5s; a quota one must not, got ${hold.msLeft}`);
+  assert.match(logs.join('|'), /QUOTA/, 'the operator is told which refusal this is');
+  assert.match(logs.join('|'), /shared by every app/, 'and that it is an account-wide budget, not a 30-second blip');
+});
+
+// A restart is exactly when the pool gets rebuilt, so a forgotten window means
+// walking the whole catalogue straight back into it — and Docker restart
+// policies make that a loop.
+test('a hold outlives the process: it is saved on a 429 and restored by the next client', async () => {
+  const { fetchImpl } = fakeFetch([tokenOk(), { status: 429, headers: { 'retry-after': '600' }, body: {} }]);
+  const now = 1_000_000;
+  let saved: any = null;
+  const first = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, now: () => now, sleep: noSleep,
+    saveHold: (h) => { saved = h; },
+  });
+  await assert.rejects(first.getArtist('A1', { background: true }), (e: any) => e.status === 429);
+  assert.ok(saved, 'the hold reached the sink');
+  assert.equal(saved.until, 1_000_000 + 600_000);
+  assert.equal(saved.kind, 'rate-limit');
+
+  // A brand-new client — the restart — reads it back and asks for nothing.
+  const logs: string[] = [];
+  const { fetchImpl: f2, calls: c2 } = fakeFetch([tokenOk()]);
+  const second = new SpotifyClient({
+    fetch: f2, credentials: creds, now: () => now, sleep: noSleep, log: (l) => logs.push(l),
+    loadHold: () => saved,
+  });
+  assert.equal(second.rateLimitedForMs(), 600_000, 'the window survived the restart');
+  await assert.rejects(second.getArtist('A1', { background: true }), (e: any) => e instanceof SpotifyRateLimitError);
+  assert.equal(c2.length, 0, 'not one request — this is the walk that used to renew the limit');
+  assert.match(logs.join('|'), /before the restart/, 'a deliberately quiet station says so');
+
+  // An expired hold on disk is simply not a hold.
+  const third = new SpotifyClient({ fetch: f2, credentials: creds, now: () => now + 600_001, loadHold: () => saved });
+  assert.equal(third.rateLimitedForMs(), 0);
+});
+
+// ── the lockout: a hold must be a DEADLINE, not a sliding window ────────────
+
+// THE REGRESSION TEST FOR THE WHOLE INCIDENT.
+//
+// The hold used to be recomputed as `now + Retry-After` on every 429 and kept
+// whenever it was later than the current one — which, with a constant header,
+// is always, because the clock has moved on. Every refusal slid the wall a full
+// window further out. And the `critical` lane bypasses the gate so music keeps
+// playing, so a track every few minutes kept re-arming a 3706-second hold about
+// every hundred seconds. The station sat locked out for a full day, restarts
+// included, because the slid deadline was also written to disk each time.
+test('a player 429 every minute cannot hold the gate open — it counts down and clears', async () => {
+  const script: Step[] = [tokenOk(), { status: 429, headers: { 'retry-after': '600' }, body: {} }];
+  // Then a player command 429ing over and over, exactly as an exhausted account
+  // answers every request.
+  for (let i = 0; i < 60; i++) script.push({ status: 429, headers: { 'retry-after': '600' }, body: {} });
+  const { fetchImpl } = fakeFetch(script);
+  let now = 1_000_000;
+  const saved: any[] = [];
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, now: () => now, sleep: noSleep,
+    saveHold: (h) => saved.push(h),
+  });
+
+  // A gated lane asks, is refused, and opens the episode.
+  await assert.rejects(c.getArtist('A1', { background: true }), (e: any) => e.status === 429);
+  const openedAt = now;
+  assert.equal(c.rateLimitedForMs(), 600_000);
+
+  // Now the player keeps working, and keeps being refused, for the whole window.
+  for (let i = 0; i < 59; i++) {
+    now += 10_000;
+    await c.play({ uris: ['spotify:track:x'] }).catch(() => {});
+    assert.equal(
+      c.rateLimitedForMs(),
+      Math.max(0, openedAt + 600_000 - now),
+      `the deadline must not move (minute ${i})`,
+    );
+  }
+
+  // …and it is gone on schedule rather than a day later.
+  assert.equal(c.rateLimitedForMs(), 10_000);
+  now += 10_001;
+  assert.equal(c.rateLimitedForMs(), 0, 'the hold cleared itself — this is what could not happen');
+  assert.equal(saved.length, 1, 'and it was written to disk ONCE, not re-armed on every refusal');
+});
+
+test('a critical refusal never arms a gate that is open, and never moves the pacer', async () => {
+  const { fetchImpl, calls } = fakeFetch([
+    tokenOk(),
+    { status: 429, headers: { 'retry-after': '600' }, body: { reason: 'QUOTA_EXCEEDED' } },
+    { status: 200, body: { ok: true } },
+  ]);
+  let now = 1_000_000;
+  let saved = 0;
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, now: () => now, sleep: noSleep,
+    requestsPer30s: () => 100, saveHold: () => { saved++; },
+  });
+
+  await c.play({ uris: ['spotify:track:x'] }).catch(() => {});
+  assert.equal(c.rateLimitedForMs(), 0, 'a player refusal does not stop catalogue work');
+  assert.equal(saved, 0, 'and nothing is persisted for it');
+  assert.equal(c.pacerState().ceiling, 100, 'the pacer cannot slow the critical lane, so it must not be halved by it');
+  assert.equal(calls.length, 2, 'and it is not retried — the transport owns that backoff, and retrying doubles the rate during the outage');
+
+  // The catalogue lane still works, which is the whole point.
+  assert.deepEqual(await c.getMe(), { ok: true });
+  const spent = calls.length;
+  assert.ok(spent >= 3);
+});
+
+test('the kind downgrades — a quota hold does not brand every later window', async () => {
+  const { fetchImpl } = fakeFetch([
+    tokenOk(),
+    { status: 429, headers: { 'retry-after': '600' }, body: { reason: 'QUOTA_EXCEEDED' } },
+    { status: 429, headers: { 'retry-after': '5' }, body: {} },
+  ]);
+  let now = 1_000_000;
+  const c = new SpotifyClient({ fetch: fetchImpl, credentials: creds, now: () => now, sleep: noSleep });
+
+  await assert.rejects(c.getArtist('A1', { background: true }), (e: any) => e.status === 429);
+  assert.equal(c.rateLimitHold().kind, 'quota');
+
+  // The window passes; the next refusal is an ordinary rolling-window one.
+  now += 600_001;
+  await assert.rejects(c.getArtist('A2', { background: true }), (e: any) => e.status === 429);
+  assert.equal(c.rateLimitHold().kind, 'rate-limit', 'once quota, always quota was carrying a 6-hour cap into a 5-second window');
+  assert.equal(c.rateLimitedForMs(), 5_000);
+});
+
+test('an operator press reaches the network while the gate is shut', async () => {
+  const { fetchImpl, calls } = fakeFetch([
+    tokenOk(),
+    { status: 429, headers: { 'retry-after': '3706' }, body: { reason: 'QUOTA_EXCEEDED' } },
+    { status: 200, body: { display_name: 'the operator' } },
+  ]);
+  const now = 1_000_000;
+  const c = new SpotifyClient({ fetch: fetchImpl, credentials: creds, now: () => now, sleep: noSleep });
+
+  await assert.rejects(c.getArtist('A1', { background: true }), (e: any) => e.status === 429);
+  const spent = calls.length;
+
+  // An ordinary catalogue read is refused without a request, as it should be…
+  await assert.rejects(c.getMe(), (e: any) => e instanceof SpotifyRateLimitError);
+  assert.equal(calls.length, spent);
+  // …and the error names the refusal correctly rather than calling an exhausted
+  // account budget a "rate limit" the operator should wait thirty seconds for.
+  await c.getMe().catch((e: any) => {
+    assert.equal(e.kind, 'quota');
+    assert.match(e.message, /quota exhausted/);
+  });
+
+  // But the button they just pressed answers.
+  const me: any = await c.getMe({ operator: true });
+  assert.equal(me.display_name, 'the operator');
+  assert.ok(calls.length > spent, 'the operator lane reached the network');
+});
+
+test('clearHold forgets the hold in memory and on disk', async () => {
+  const { fetchImpl } = fakeFetch([tokenOk(), { status: 429, headers: { 'retry-after': '600' }, body: {} }]);
+  const now = 1_000_000;
+  let cleared = 0;
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, now: () => now, sleep: noSleep,
+    clearHold: () => { cleared++; },
+  });
+  await assert.rejects(c.getArtist('A1', { background: true }), (e: any) => e.status === 429);
+  assert.equal(c.rateLimitedForMs(), 600_000);
+  c.clearHold();
+  assert.equal(c.rateLimitedForMs(), 0);
+  assert.equal(cleared, 1, 'the persisted hold goes too, or the next restart restores it');
+});
+
+test('an implausible saved hold is not honoured across a restart', async () => {
+  const { fetchImpl } = fakeFetch([tokenOk(), { status: 200, body: { ok: true } }]);
+  const now = 1_000_000;
+  let cleared = 0;
+  const logs: string[] = [];
+  // A six-hour deadline is what the sliding-hold bug wrote. A station that boots
+  // into one can never recover on its own, so it is treated as the corruption
+  // it is: ask once and find out where we really stand.
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, now: () => now, sleep: noSleep, log: (l) => logs.push(l),
+    loadHold: () => ({ until: now + 6 * 60 * 60_000, kind: 'quota', at: now }),
+    clearHold: () => { cleared++; },
+  });
+  assert.equal(c.rateLimitedForMs(), 0, 'not honoured');
+  assert.equal(cleared, 1);
+  assert.match(logs.join('|'), /ignoring a saved hold/);
+  assert.deepEqual(await c.getMe(), { ok: true }, 'and the station asks');
+});
+
+// The pacer used to recover only when a non-critical request was made — and
+// during a hold, by definition, none is. So it sat at its floor of 10 and then
+// climbed +1 per window, needing ~80 requests to get back to 90: throttled by
+// exactly the traffic the throttle was suppressing.
+test('the ceiling recovers on the clock, not on traffic', async () => {
+  const { fetchImpl } = fakeFetch([
+    tokenOk(),
+    { status: 429, headers: { 'retry-after': '600' }, body: {} },
+  ]);
+  let now = 1_000_000;
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, now: () => now, sleep: noSleep,
+    requestsPer30s: () => 90,
+  });
+  await assert.rejects(c.getArtist('A1', { background: true }), (e: any) => e.status === 429);
+  assert.equal(c.pacerState().ceiling, 45);
+
+  // A quiet hour passes with no requests at all — which is exactly what a hold
+  // looks like from in here.
+  now += 60 * 60_000;
+  assert.equal(c.pacerState().ceiling, 90, 'fully recovered without a single request to drive it');
+});
+
+test('lowering the configured ceiling applies at once', async () => {
+  const { fetchImpl } = fakeFetch([tokenOk(), { status: 200, body: { ok: true } }]);
+  const now = 1_000_000;
+  let configured = 90;
+  const c = new SpotifyClient({
+    fetch: fetchImpl, credentials: creds, now: () => now, sleep: noSleep,
+    requestsPer30s: () => configured,
+  });
+  await c.getMe();
+  assert.equal(c.pacerState().ceiling, 90);
+  configured = 20;
+  assert.equal(c.pacerState().ceiling, 20, 'an operator turning it down is not something to climb down to');
+});

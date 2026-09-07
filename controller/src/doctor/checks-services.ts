@@ -36,9 +36,19 @@ function spotifyPoolFinding(): Finding[] {
   // fill and a pool that is not rebuilding, and it clears itself. Severity still
   // follows whether there is music, because an empty pool is dead air whatever
   // the reason.
-  const heldMs = spotifyClient().rateLimitedForMs();
-  const limited = heldMs > 0 ? ` · Spotify rate limit, ${Math.ceil(heldMs / 1000)}s left` : '';
-  const limitHint = 'Development Mode meters a rolling 30s window and cannot be raised (extended quota is organisations-only). The station backs off on its own and resumes when the window clears.';
+  const hold = spotifyClient().rateLimitHold();
+  const heldMs = hold.msLeft;
+  const quota = hold.kind === 'quota';
+  const limited = heldMs > 0
+    ? ` · ${quota ? 'Spotify quota exhausted' : 'Spotify rate limit'}, ${Math.ceil(heldMs / 1000)}s left`
+    : '';
+  // Two different refusals, and telling them apart is the difference between
+  // "wait a moment" and "something else on this developer account is spending
+  // the budget". Since July 2026 the Development Mode quota is counted per
+  // ACCOUNT, shared by every app it owns.
+  const limitHint = quota
+    ? 'This is the developer ACCOUNT quota, not the 30-second rate limit: since July 2026 it is shared by every app on the account. The station stops asking until it clears and resumes on its own. Lower spotify.quota.genresPerHour, or raise spotify.pool.fullWalkHours, if it keeps happening.'
+    : 'Development Mode meters a rolling 30s window and cannot be raised (extended quota is organisations-only). The station backs off on its own and resumes when the window clears.';
 
   if (p.tracks.size === 0) {
     return [{
@@ -255,6 +265,24 @@ export async function checkNavidrome(): Promise<Finding[]> {
   // Another active source owns its own connectivity story; the Navidrome
   // creds are simply not in play. (Spotify: the account + Premium check.)
   if (subsonic.activeSourceId() !== 'subsonic') {
+    // A rate-limit / quota hold is NOT a connectivity fault, and must never be
+    // reported as one. The old finding said `fail` with the hint "add the
+    // Spotify client id/secret and press Connect" — which sent operators to a
+    // reconnect that invalidates the pool, i.e. straight into a worse state,
+    // over a limit that clears itself. spotifyPoolFinding() below already
+    // treats a hold as context rather than a verdict; this reads the same way.
+    if (subsonic.activeSourceId() === 'spotify') {
+      const hold = spotifyClient().rateLimitHold();
+      if (hold.msLeft > 0) {
+        out.push({
+          label: 'spotify connectivity',
+          status: 'warn',
+          detail: `${hold.kind === 'quota' ? "the developer account's Web API quota is exhausted" : 'Spotify is rate-limiting the station'} — ${Math.ceil(hold.msLeft / 1000)}s left. Playback is unaffected.`,
+          hint: 'Nothing to fix and nothing to reconnect: the station stops asking and resumes on its own. Do NOT disconnect or re-enter credentials over this.',
+        });
+        return out;
+      }
+    }
     const sp = await subsonic.ping();
     out.push({
       label: `${subsonic.activeSourceId()} connectivity`,
@@ -344,24 +372,55 @@ export async function checkNavidrome(): Promise<Finding[]> {
 }
 
 // Cached live-config Navidrome connectivity for the always-on admin banner.
-// The banner polls this from every admin page every ~30s; a short cache keeps
-// that from becoming a steady drip of Subsonic `ping` calls (and shields a
-// flapping Navidrome). Shares subsonic.ping() — the same never-throwing check
-// checkNavidrome() uses — so the banner and the Doctor's connectivity finding
-// can never disagree.
+// The banner polls this from every admin page every ~30s; the cache keeps that
+// from becoming a steady drip of `ping` calls (and shields a flapping server).
+// Shares subsonic.ping() — the same never-throwing check checkNavidrome() uses
+// — so the banner and the Doctor's connectivity finding can never disagree.
+//
+// THE TTL MUST COMFORTABLY EXCEED THE POLL INTERVAL, which is the whole reason
+// it exists. At 20s against a 30s poll it deduplicated nothing: every poll
+// found the entry expired and took a fresh reading, so the cache only ever
+// coalesced extra TABS inside one window. That was invisible on Navidrome,
+// where a ping is a local HTTP call — and expensive once `ping` became the
+// FACADE, because on Spotify it is `GET /me` against a rolling 30-second quota:
+// ~120 metered requests an hour for as long as any admin page was open, spent
+// on a green dot. Five minutes is right for a liveness indicator; the Doctor's
+// own run does not come through here (checkNavidrome calls subsonic.ping()
+// directly), so a full check is still live, and clearNavidromeCache() below
+// keeps a creds change from waiting the TTL out.
 let navidromeCache: { at: number; result: { ok: boolean; reason?: string } } | null = null;
-const NAVIDROME_TTL_MS = 20_000;
+const NAVIDROME_TTL_MS = 5 * 60_000;
 
 export async function navidromeConnectivity(): Promise<{
   ok: boolean;
   reason?: string;
   url: string;
+  source: string;
+  holding?: boolean;
 }> {
+  const source = subsonic.activeSourceId();
+  // A rate-limit / quota hold is not an outage, and the banner this feeds must
+  // not tell the operator their music server is down over one. It clears
+  // itself, playback is unaffected, and the advice the banner gives for a real
+  // outage ("check the connection") is actively harmful here — reconnecting
+  // rebuilds the pool.
+  if (source === 'spotify') {
+    const hold = spotifyClient().rateLimitHold();
+    if (hold.msLeft > 0) {
+      return {
+        ok: true,
+        holding: true,
+        source,
+        reason: `${hold.kind === 'quota' ? "Spotify's developer-account quota is exhausted" : 'Spotify is rate-limiting the station'} — about ${Math.ceil(hold.msLeft / 1000)}s left. Playback is unaffected and it clears on its own.`,
+        url: config.navidrome.url,
+      };
+    }
+  }
   const now = Date.now();
   if (!navidromeCache || now - navidromeCache.at > NAVIDROME_TTL_MS) {
     navidromeCache = { at: now, result: await subsonic.ping() };
   }
-  return { ...navidromeCache.result, url: config.navidrome.url };
+  return { ...navidromeCache.result, url: config.navidrome.url, source };
 }
 
 // Drop the cached ping so the banner/Doctor re-probe immediately — called when

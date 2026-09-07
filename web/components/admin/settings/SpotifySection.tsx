@@ -41,7 +41,19 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
   const [playlistText, setPlaylistText] = useState(() => (sp?.pool?.playlistIds ?? []).join('\n'));
   const [deviceName, setDeviceName] = useState(() => sp?.deviceName ?? '');
   const [receiverPaste, setReceiverPaste] = useState('');
+  const [rps, setRps] = useState(() => String(sp?.quota?.requestsPer30s ?? 90));
+  const [genresPerHour, setGenresPerHour] = useState(() => String(sp?.quota?.genresPerHour ?? 750));
+  const [fullWalkHours, setFullWalkHours] = useState(() => String(sp?.pool?.fullWalkHours ?? 24));
   const rx = st?.receiver;
+
+  // Save a number field on blur, and only when it actually changed. Saving an
+  // unchanged value would have the 3-second /settings poll fighting the operator
+  // for the contents of the input they are still in.
+  const commitNumber = (raw: string, current: number, save: (n: number) => void) => {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n === current) return;
+    save(Math.round(n));
+  };
 
   // The OAuth callbacks bounce back here with ?spotify=… (the app) or
   // ?receiver=… (librespot): connected | error:<why>.
@@ -134,6 +146,16 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
       refresh();
     } catch (err) { notify.err(errorMessage(err)); }
     finally { setPoolBusy(false); }
+  };
+
+  const clearHold = async () => {
+    setSaving(true);
+    try {
+      await post('/settings/spotify/hold/clear');
+      notify.ok('Rate-limit hold cleared — the station will ask again');
+      refresh();
+    } catch (err) { notify.err(errorMessage(err)); }
+    finally { setSaving(false); }
   };
 
   const savePool = () => saveSettings({ spotify: { pool: { playlistIds: playlistText } } });
@@ -232,7 +254,7 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
           <Btn sm onClick={rebuildPool} disabled={poolBusy || !st?.connected}>{poolBusy ? 'Rebuilding…' : 'Rebuild pool now'}</Btn>
           <span className="text-sm opacity-80">
             {st?.pool
-              ? `${st.pool.tracks} tracks · ${st.pool.albums} albums · ${st.pool.playlists} playlists${st.pool.partial ? ' · partial' : ''}`
+              ? `${st.pool.tracks} tracks · ${st.pool.albums} albums · ${st.pool.playlists} playlists${st.pool.partial ? ' · partial' : ''}${st.pool.fromDisk ? ' · from the saved snapshot' : ''}`
               : 'pool not built yet — it builds on first use'}
           </span>
         </div>
@@ -257,8 +279,10 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
           <div className="field-hint mt-2">
             Artist genres: <b>{(st.pool.artists ?? 0) - (st.pool.genresPending ?? 0)}</b> of{' '}
             <b>{st.pool.artists ?? 0}</b> artists tagged, {st.pool.genresPending} still to fetch.
-            Spotify charges one request per artist, so this fills a batch at a time and is remembered
-            across restarts — genre shows and genre picking improve as it goes.
+            Spotify charges one request per artist, so this fills in the background at about{' '}
+            <b>{sp?.quota?.genresPerHour ?? 750}/hour</b> and is remembered across restarts — genre shows and
+            genre picking sharpen as it goes. It pauses while Spotify is holding the station off, and picks
+            itself back up afterwards.
           </div>
         ) : null}
         {st?.pool?.truncated ? (
@@ -271,11 +295,83 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
         ) : null}
         {st?.pool && (st.pool.rateLimitedMs ?? 0) > 0 ? (
           <div className="field-hint mt-2">
-            <b>Spotify is rate-limiting this app</b> — resuming in about {Math.ceil((st.pool.rateLimitedMs ?? 0) / 1000)}s.
-            The station holds off on its own; music keeps playing and enrichment continues when the window clears.
-            The limit belongs to Development Mode and cannot be raised.
+            {st.pool.hold?.kind === 'quota' ? (
+              <>
+                <b>Spotify&apos;s developer-account quota is exhausted</b> — resuming in about{' '}
+                {Math.ceil((st.pool.rateLimitedMs ?? 0) / 1000)}s. This is not the 30-second rate limit: since July
+                2026 the Development Mode quota is counted per developer <b>account</b> and shared by every app on
+                it. Music keeps playing throughout. If it keeps happening, ease the figures below down.
+              </>
+            ) : (
+              <>
+                <b>Spotify is rate-limiting this app</b> — resuming in about {Math.ceil((st.pool.rateLimitedMs ?? 0) / 1000)}s.
+                The station holds off on its own; music keeps playing and enrichment continues when the window clears.
+                The limit belongs to Development Mode and cannot be raised.
+              </>
+            )}
+            <div className="mt-2">
+              <Btn sm onClick={clearHold} disabled={saving}>Clear hold</Btn>
+              <span className="ml-2">
+                Only if you believe the hold is wrong — clearing it does not make Spotify more willing, it just lets
+                the station ask once and find out.
+              </span>
+            </div>
           </div>
         ) : null}
+        {/* The drip is the one background job with nothing on air to show for
+            itself, so when it is standing down it has to say so. Eight hours of
+            "0 of 123 tagged" with no explanation is what this line is for. */}
+        {st?.pool?.dripSkip ? (
+          <div className="field-hint mt-2">Artist genres: {st.pool.dripSkip}.</div>
+        ) : null}
+        {st?.pool?.fromDisk ? (
+          <div className="field-hint mt-2">
+            This pool was restored from its saved snapshot, which is why the station was playing seconds after
+            starting rather than walking your whole library first. It is re-checked against Spotify on the next
+            refresh; until then the tagger will not remove tracks, since it never deletes against a view it has
+            not confirmed itself.
+          </div>
+        ) : null}
+      </Card>
+
+      <Card title="Spotify quota" sub="Spotify meters this app on a rolling 30-second window, and since July 2026 the Development Mode budget is shared across every app on your developer account. These bound what the station spends on the catalogue; playback is exempt and never waits on them.">
+        <div className="grid gap-4 md:grid-cols-3">
+          <div>
+            <Label htmlFor="sp-rps">Requests per 30s</Label>
+            <Input id="sp-rps" type="number" min={10} max={1000} value={rps} disabled={busy}
+              onChange={(e) => setRps(e.target.value)}
+              onBlur={() => commitNumber(rps, sp?.quota?.requestsPer30s ?? 90, (n) => saveSettings({ spotify: { quota: { requestsPer30s: n } } }))} />
+            <div className="field-hint">
+              A starting ceiling rather than a promise: Spotify publishes no figure for Development Mode, so the
+              station halves this whenever it is refused and eases back over quiet windows. Lower it if other apps
+              share this developer account.
+              {st?.pool?.pacer ? ` Currently allowing ${st.pool.pacer.ceiling}, with ${st.pool.pacer.usedInWindow ?? 0} used this window.` : ''}
+              {st?.pool?.reads ? ` Reusing ${st.pool.reads.albums ?? 0} cached albums and ${st.pool.reads.searches ?? 0} searches.` : ''}
+            </div>
+          </div>
+          <div>
+            <Label htmlFor="sp-genres">Artist genres per hour</Label>
+            <Input id="sp-genres" type="number" min={0} max={5000} value={genresPerHour} disabled={busy}
+              onChange={(e) => setGenresPerHour(e.target.value)}
+              onBlur={() => commitNumber(genresPerHour, sp?.quota?.genresPerHour ?? 750, (n) => saveSettings({ spotify: { quota: { genresPerHour: n } } }))} />
+            <div className="field-hint">
+              Spotify tags artists rather than tracks and removed the batch lookup, so each artist costs one request.
+              This is a background drip that stops on its own once every artist is known. <b>0</b> turns it off and
+              leaves whatever is already cached.
+            </div>
+          </div>
+          <div>
+            <Label htmlFor="sp-fullwalk">Full re-walk every (hours)</Label>
+            <Input id="sp-fullwalk" type="number" min={1} max={168} value={fullWalkHours} disabled={busy}
+              onChange={(e) => setFullWalkHours(e.target.value)}
+              onBlur={() => commitNumber(fullWalkHours, sp?.pool?.fullWalkHours ?? 24, (n) => saveSettings({ spotify: { pool: { fullWalkHours: n } } }))} />
+            <div className="field-hint">
+              Most refreshes only re-read the playlists Spotify says have changed, which costs a handful of requests
+              instead of one per fifty tracks. A full walk reads everything, and catches the rare edit that leaves a
+              playlist&apos;s length and newest track untouched.
+            </div>
+          </div>
+        </div>
       </Card>
 
       <Card title="Playback" sub="The Spotify Connect receiver (librespot) runs inside the broadcast container and is commanded by the station.">

@@ -2750,7 +2750,23 @@ export const SPOTIFY_BITRATES: readonly number[] = [96, 160, 320];
 export const SPOTIFY_MISMATCH_MODES: readonly string[] = ['reclaim', 'follow'];
 export const SPOTIFY_POOL_MAX_TRACKS_BOUNDS: SettingsNumericBound = { min: 100, max: 50_000 };
 export const SPOTIFY_SEAM_LEAD_MS_BOUNDS: SettingsNumericBound = { min: 0, max: 10_000 };
-export const SPOTIFY_HEALTH_POLL_SEC_BOUNDS: SettingsNumericBound = { min: 15, max: 600 };
+// How often a FULL catalogue walk replaces a cheap snapshot revalidate. A
+// revalidate re-walks only the playlists whose `snapshot_id` moved, so it costs
+// a handful of requests where a full walk costs one per fifty tracks; the full
+// walk still runs on this cadence because the saved-tracks fingerprint is a
+// count plus a newest id and cannot see a swap that keeps both.
+export const SPOTIFY_POOL_FULL_WALK_HOURS_BOUNDS: SettingsNumericBound = { min: 1, max: 168 };
+// The pacer's ceiling for NON-CRITICAL requests in a rolling 30-second window.
+// A starting point, not a contract: Spotify publishes no number for Development
+// Mode, and since July 2026 the budget is shared with every other app on the
+// developer account, so the client halves this on a 429 and eases back. Lower it
+// on an account that runs other apps.
+export const SPOTIFY_REQUESTS_PER_30S_BOUNDS: SettingsNumericBound = { min: 10, max: 1000 };
+// Artist genres cost ONE REQUEST EACH (the batch read was removed in February
+// 2026 and not restored), so enrichment is a paced drip rather than a burst.
+// 0 turns it off: the pool still plays, genre shows and genre picking just stay
+// as sparse as whatever is already cached on disk.
+export const SPOTIFY_GENRES_PER_HOUR_BOUNDS: SettingsNumericBound = { min: 0, max: 5000 };
 export const SPOTIFY_ID_RE = /^[0-9A-Za-z]{22}$/;
 
 // A list of Spotify playlist ids. Accepts an array or a comma/newline-separated
@@ -2802,14 +2818,24 @@ export const spotifyPatchSchema = settingsBlockOf({
       SPOTIFY_POOL_MAX_TRACKS_BOUNDS,
       `spotify.pool.maxTracks must be between ${SPOTIFY_POOL_MAX_TRACKS_BOUNDS.min} and ${SPOTIFY_POOL_MAX_TRACKS_BOUNDS.max}`,
     ),
+    fullWalkHours: settingsNumberRoundLike(
+      SPOTIFY_POOL_FULL_WALK_HOURS_BOUNDS,
+      `spotify.pool.fullWalkHours must be between ${SPOTIFY_POOL_FULL_WALK_HOURS_BOUNDS.min} and ${SPOTIFY_POOL_FULL_WALK_HOURS_BOUNDS.max}`,
+    ),
+  }),
+  quota: settingsBlockOf({
+    requestsPer30s: settingsNumberRoundLike(
+      SPOTIFY_REQUESTS_PER_30S_BOUNDS,
+      `spotify.quota.requestsPer30s must be between ${SPOTIFY_REQUESTS_PER_30S_BOUNDS.min} and ${SPOTIFY_REQUESTS_PER_30S_BOUNDS.max}`,
+    ),
+    genresPerHour: settingsNumberRoundLike(
+      SPOTIFY_GENRES_PER_HOUR_BOUNDS,
+      `spotify.quota.genresPerHour must be between ${SPOTIFY_GENRES_PER_HOUR_BOUNDS.min} and ${SPOTIFY_GENRES_PER_HOUR_BOUNDS.max} (0 = off)`,
+    ),
   }),
   seamLeadMs: settingsNumberRoundLike(
     SPOTIFY_SEAM_LEAD_MS_BOUNDS,
     `spotify.seamLeadMs must be between ${SPOTIFY_SEAM_LEAD_MS_BOUNDS.min} and ${SPOTIFY_SEAM_LEAD_MS_BOUNDS.max}`,
-  ),
-  healthPollSec: settingsNumberRoundLike(
-    SPOTIFY_HEALTH_POLL_SEC_BOUNDS,
-    `spotify.healthPollSec must be between ${SPOTIFY_HEALTH_POLL_SEC_BOUNDS.min} and ${SPOTIFY_HEALTH_POLL_SEC_BOUNDS.max}`,
   ),
   mismatch: settingsStrictOneOf(
     SPOTIFY_MISMATCH_MODES,

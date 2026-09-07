@@ -662,9 +662,28 @@ export const DEFAULTS = {
       includeSaved: true,
       includeSavedAlbums: false,
       maxTracks: 5000,
+      // A snapshot revalidate re-walks only the playlists Spotify says changed;
+      // a full walk is one request per fifty tracks. Daily is often enough to
+      // catch what the saved-tracks fingerprint (count + newest id) cannot see.
+      fullWalkHours: 24,
+    },
+    // What the station may spend on Spotify. `requestsPer30s` is the pacer's
+    // STARTING ceiling for everything except the player commands that keep the
+    // music on air — Spotify publishes no Development Mode number and since
+    // July 2026 the budget is shared across the whole developer account, so the
+    // client halves this on a 429 and eases back rather than trusting it.
+    // `genresPerHour` paces artist-genre enrichment, which costs one request
+    // per artist; 0 turns it off and leaves whatever is already cached.
+    // 60/hour, not 750. Genres are the most optional thing the station does and
+    // the only one that costs a request per item; at 750 a cold cache spent
+    // ~18k requests a day against an undocumented per-ACCOUNT budget shared with
+    // every other app the operator owns. A 123-artist pool still finishes in two
+    // hours, a big one fills over days, and neither competes with playback.
+    quota: {
+      requestsPer30s: 90,
+      genresPerHour: 60,
     },
     seamLeadMs: 1500,
-    healthPollSec: 60,
     mismatch: 'reclaim',
   },
 

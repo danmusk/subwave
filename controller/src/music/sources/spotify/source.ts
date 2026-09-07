@@ -22,7 +22,9 @@ import type { MusicSource, Song, Album, Artist, CoverArt, AnalyzableRef } from '
 import { SpotifyClient, SPOTIFY_PAGE_MAX, SPOTIFY_SEARCH_MAX, type SpotifyCredentials } from './client.js';
 import { SpotifyPoolCache, sample, type PoolConfig } from './pool.js';
 import { mapTrack, mapAlbum, mapArtist, mapPlaylist, unwrapItem, trackIdFromUri } from './map.js';
+import { listMyPlaylists, listSavedAlbums, listSavedTracks, getAlbumRaw, searchRaw } from './reads.js';
 import { readReceiverDeviceName } from './token-file.js';
+import { readHold, writeHold, clearHold } from './hold-file.js';
 import { SPOTIFY_DEFAULT_DEVICE_NAME } from '../../../settings/liquidsoap.js';
 
 export const SPOTIFY_SOURCE_ID = 'spotify';
@@ -45,6 +47,18 @@ export function spotifyClient(): SpotifyClient {
     client = new SpotifyClient({
       credentials: spotifyCredentials,
       log,
+      // The pacer's ceiling, read fresh per request so an operator's edit lands
+      // without a restart. It is a STARTING point — the client halves it on a
+      // 429 and eases back, because Spotify publishes no Development Mode
+      // number and the budget is shared across the whole developer account.
+      // NaN when unset — configuredCeiling() falls back to its own default
+      // rather than letting a missing setting become a zero ceiling.
+      requestsPer30s: () => Number(spotifySettings().quota?.requestsPer30s),
+      // A hold outlives the process. Injected rather than imported inside the
+      // client so that module keeps no filesystem edge.
+      loadHold: () => readHold(),
+      saveHold: (hold) => writeHold(hold),
+      clearHold: () => clearHold(),
       // A rotated refresh token must land in secrets.env or the next boot logs
       // in with a dead one. saveSecrets also updates process.env.
       onRefreshToken: async (token) => {
@@ -81,6 +95,10 @@ function poolConfig(): PoolConfig {
     includeSaved: pool.includeSaved !== false,
     includeSavedAlbums: pool.includeSavedAlbums === true,
     maxTracks: Number.isFinite(Number(pool.maxTracks)) && Number(pool.maxTracks) > 0 ? Number(pool.maxTracks) : 5000,
+    // Pacing, not curation — poolConfigSignature() deliberately ignores both,
+    // so changing one never throws the pool away and re-walks the catalogue.
+    fullWalkHours: Number.isFinite(Number(pool.fullWalkHours)) && Number(pool.fullWalkHours) > 0 ? Number(pool.fullWalkHours) : 24,
+    genresPerHour: Number.isFinite(Number(s.quota?.genresPerHour)) ? Number(s.quota.genresPerHour) : 750,
   };
 }
 
@@ -116,22 +134,14 @@ const normName = (s: unknown) => String(s ?? '')
   .toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
 
 // /search caps `limit` at 10 since February 2026, but the picker asks for 25–40
-// in one call. Page until the caller's count is satisfied rather than silently
-// answering a tenth of what was asked for. Bounded: a search that has to walk
-// more than this is a search that isn't finding anything.
-const SEARCH_MAX_PAGES = 5;
-
+// in one call, so ONE logical search is three HTTP requests. The paging and the
+// memo both live in reads.ts now: the picker's tools retry a search at a
+// different offset and then re-search under a resolved artist name, and the
+// listener-request matcher issues up to four searches for a single request, so
+// the same query recurs constantly both within a pick and across consecutive
+// ones. The callers here are unchanged — they still ask for a count and get one.
 async function searchPaged(q: string, type: 'track' | 'artist', want: number, offset = 0): Promise<any[]> {
-  const c = spotifyClient();
-  const out: any[] = [];
-  const target = Math.max(1, want);
-  for (let page = 0; page < SEARCH_MAX_PAGES && out.length < target; page++) {
-    const r: any = await c.search(q, [type], { limit: SPOTIFY_SEARCH_MAX, offset: offset + page * SPOTIFY_SEARCH_MAX });
-    const items: any[] = (type === 'track' ? r?.tracks?.items : r?.artists?.items) ?? [];
-    out.push(...items);
-    if (items.length < SPOTIFY_SEARCH_MAX) break; // short page — that was the last one
-  }
-  return out.slice(0, target);
+  return searchRaw(spotifyClient(), q, type, Math.max(1, want), offset);
 }
 
 function yearOk(s: Song, fromYear?: number, toYear?: number): boolean {
@@ -188,18 +198,17 @@ async function getSong(id: any): Promise<Song | null> {
   return song ? withPoolGenres([song])[0] : null;
 }
 
+// Memoised in reads.ts, because this was the single most-repeated uncached call
+// the station made: the picker's recently-added tool fans out over five albums
+// per invocation and the pool picker over as many as fourteen, per pick, and
+// nothing anywhere remembered one. The rows come back RAW and are mapped here
+// on every call — callers mutate the Songs they get (the queue stamps transient
+// fields on them, withPoolGenres writes genres in), so sharing mapped objects
+// would alias one pick's bookkeeping into another's.
 async function getAlbum(id: any): Promise<Song[]> {
-  const c = spotifyClient();
-  const a: any = await c.getAlbum(String(id));
-  if (!a) return [];
-  const items: any[] = [...(a.tracks?.items ?? [])];
-  // Albums over 50 tracks page.
-  if (a.tracks?.next) {
-    for await (const t of c.paginate<any>((o) => c.getAlbumTracks(a.id, { offset: o, limit: SPOTIFY_PAGE_MAX }), { pageSize: SPOTIFY_PAGE_MAX })) {
-      if (!items.some((x) => x.id === t.id)) items.push(t);
-    }
-  }
-  return withPoolGenres(keep(items.map((t) => mapTrack(t, { album: a }))));
+  const raw = await getAlbumRaw(spotifyClient(), String(id));
+  if (!raw) return [];
+  return withPoolGenres(keep(raw.items.map((t) => mapTrack(t, { album: raw.album }))));
 }
 
 async function getArtist(id: any): Promise<Artist | null> {
@@ -220,6 +229,14 @@ async function searchArtists(query: any, { artistCount = 5 } = {}): Promise<Arti
   if (!q) return [];
   const items = await searchPaged(q, 'artist', artistCount);
   return items.map(mapArtist).filter(Boolean) as Artist[];
+}
+
+// Start the background artist-genre drip. Called from the transport's start,
+// which is already the "Spotify is the active source" gate — the drip is
+// pointless on a station that is not playing from Spotify, and it must not run
+// on one that merely has credentials configured.
+export function startSpotifyGenreDrip(): void {
+  spotifyPool().startGenreDrip();
 }
 
 async function getGenres() {
@@ -288,12 +305,26 @@ async function* iterateAllSongs(): AsyncGenerator<Song> {
 //   • `truncated` — the walk stopped at maxTracks, so it is a prefix by design.
 // Subsonic implements none of this and prunes as it always has.
 async function catalogHealth(): Promise<{ complete: boolean; reason?: string }> {
-  const held = spotifyClient().rateLimitedForMs();
-  if (held > 0) {
-    return { complete: false, reason: `Spotify is rate-limiting the station (${Math.ceil(held / 1000)}s left), so the catalogue walk may be short` };
+  const hold = spotifyClient().rateLimitHold();
+  if (hold.msLeft > 0) {
+    return {
+      complete: false,
+      reason: hold.kind === 'quota'
+        ? `Spotify's developer-account quota is exhausted (${Math.ceil(hold.msLeft / 1000)}s left), so the catalogue walk may be short`
+        : `Spotify is rate-limiting the station (${Math.ceil(hold.msLeft / 1000)}s left), so the catalogue walk may be short`,
+    };
   }
   const p = spotifyPool().peek();
   if (!p) return { complete: false, reason: 'the Spotify pool has not been built yet' };
+  // A snapshot restored from disk was walked by some EARLIER process. It is
+  // perfectly good to play from — that is the whole point of persisting it —
+  // but the reconcile deletes the tags, moods and vectors of every track the
+  // walk did not yield, and "did not yield" against a file written days ago on
+  // a different set of playlists is not a statement about the live library.
+  // Fails closed until this process has confirmed the pool itself.
+  if (p.fromDisk) {
+    return { complete: false, reason: 'the Spotify pool was restored from its saved snapshot and has not been re-checked against Spotify since this controller started' };
+  }
   if (p.partial) {
     return { complete: false, reason: `the last Spotify pool build was incomplete — ${p.notes[0] ?? 'a source page failed'}` };
   }
@@ -373,9 +404,12 @@ async function getRecentSongsByArtist(artistName: any, { albums = 3, count = 20 
 // model's discovery call on a guaranteed-empty answer.
 
 async function getStarred(): Promise<Song[]> {
-  const c = spotifyClient();
+  // Two requests, and it is asked for by the auto-playlist refresh, the pool
+  // picker's thin-pool rescue, the starred-songs picker tool and every
+  // unmatched listener request — so it is memoised in reads.ts rather than here.
+  const items = await listSavedTracks(spotifyClient());
   const out: Song[] = [];
-  for await (const item of c.paginate<any>((o) => c.getSavedTracks({ offset: o, limit: SPOTIFY_PAGE_MAX }), { pageSize: SPOTIFY_PAGE_MAX, max: 100 })) {
+  for (const item of items) {
     const t = unwrapItem(item);
     const s = t ? mapTrack(t, { addedAt: item?.added_at }) : null;
     if (s) out.push(s);
@@ -383,21 +417,15 @@ async function getStarred(): Promise<Song[]> {
   return withPoolGenres(keep(out));
 }
 
-// Memoised: the admin's shows/blocklist tabs ask /dj/playlists on every render
-// and each answer used to be a fresh paginated walk — 429s within a minute on
-// the first real run. Five minutes is the pool's own cadence.
-let playlistsMemo: { at: number; value: any[] } | null = null;
-const PLAYLISTS_MEMO_MS = 5 * 60 * 1000;
+// The admin's shows/blocklist tabs ask /dj/playlists on every render and each
+// answer used to be a fresh paginated walk — 429s within a minute on the first
+// real run. The memo now lives in reads.ts, SHARED with the pool build, which
+// was walking the same listing separately; it also finally has an invalidation
+// hook, so "Rebuild pool now" no longer leaves the show editor five minutes
+// behind the account.
 async function getPlaylists() {
-  if (playlistsMemo && Date.now() - playlistsMemo.at < PLAYLISTS_MEMO_MS) return playlistsMemo.value;
-  const c = spotifyClient();
-  const out: any[] = [];
-  for await (const p of c.paginate<any>((o) => c.getMyPlaylists({ offset: o, limit: SPOTIFY_PAGE_MAX }), { pageSize: SPOTIFY_PAGE_MAX })) {
-    const m = mapPlaylist(p);
-    if (m) out.push(m);
-  }
-  playlistsMemo = { at: Date.now(), value: out };
-  return out;
+  const raw = await listMyPlaylists(spotifyClient());
+  return raw.map(mapPlaylist).filter(Boolean);
 }
 
 async function getPlaylist(id: any): Promise<Song[]> {
@@ -412,14 +440,41 @@ async function getPlaylist(id: any): Promise<Song[]> {
 }
 
 async function getRecentlyAddedAlbums({ size = 20 } = {}): Promise<Album[]> {
-  const r: any = await spotifyClient().getSavedAlbums({ limit: Math.min(SPOTIFY_PAGE_MAX, size) });
-  return ((r?.items ?? []) as any[])
+  // One page is fetched and shared; callers ask for 8, 12, 20 and 50, so the
+  // memo deliberately ignores `size` and each caller slices (reads.ts).
+  const items = await listSavedAlbums(spotifyClient());
+  return items
+    .slice(0, Math.min(SPOTIFY_PAGE_MAX, Math.max(1, size)))
     .map((it) => {
       const a = mapAlbum(it?.album);
       if (a) a.created = it?.added_at;
       return a;
     })
     .filter(Boolean) as Album[];
+}
+
+// The newest TRACKS, straight out of the pool.
+//
+// This is what `GET /dj/recent` actually wants, and answering it the generic
+// way — newest albums, then every album's tracks — cost ONE REQUEST PER ALBUM.
+// At the admin Library tab's `limit=50` that was ~51 metered requests for one
+// panel, the most expensive call in the codebase, with no cache anywhere on the
+// path. The pool already stamps each track's `added_at` as `created` when it
+// walks playlists and saved tracks/albums (map.ts), so the answer is a sort
+// over memory and costs nothing.
+//
+// An empty array means "I cannot answer" and the route falls back to the album
+// fan-out — which is the right behaviour on a cold pool, and the reason this
+// must not return a short list rather than none. `get()` rather than `peek()`:
+// a pool build is bounded, single-flight and cached for half an hour, so it is
+// strictly cheaper than the fan-out it replaces, and every other pick path
+// would have built it moments later anyway.
+async function getRecentSongs({ size = 20 } = {}): Promise<Song[]> {
+  const p = await spotifyPool().get();
+  const dated = [...p.tracks.values()].filter((s) => s.created);
+  if (!dated.length) return [];
+  dated.sort((a, b) => String(b.created).localeCompare(String(a.created)));
+  return keep(dated).slice(0, Math.max(1, size));
 }
 
 export const spotifySource: MusicSource = {
@@ -448,4 +503,5 @@ export const spotifySource: MusicSource = {
   getPlaylists,
   getPlaylist,
   getRecentlyAddedAlbums,
+  getRecentSongs,
 };
