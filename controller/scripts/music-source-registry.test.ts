@@ -111,7 +111,10 @@ test('the facade exports no name the client lacks a counterpart for (except its 
   // `catalogHealth` is one of them: Subsonic has no counterpart on purpose, and
   // the facade answering `{ complete: true }` on its behalf is what keeps its
   // orphan reconcile working (see music/prune-policy.ts).
-  const additions = new Set(['activeSourceId', 'activeCapabilities', 'getCoverArt', 'getAnalyzableRef', 'catalogHealth']);
+  // `getRecentSongs` is another: Subsonic has no newest-TRACKS endpoint, so the
+  // facade answers the neutral empty and `/dj/recent` composes the list from
+  // newest albums instead (see routes/dj.ts).
+  const additions = new Set(['activeSourceId', 'activeCapabilities', 'getCoverArt', 'getAnalyzableRef', 'catalogHealth', 'getRecentSongs']);
   for (const name of Object.keys(facade)) {
     if (additions.has(name)) continue;
     assert.ok(name in client, `facade.${name} has no counterpart in music/subsonic.ts`);
@@ -154,6 +157,7 @@ test('subsonic declares every discovery capability ON; the default for an unknow
   const caps = capabilitiesFor('subsonic');
   for (const [k, v] of Object.entries(caps)) {
     if (k === 'hasLiveTransport') assert.equal(v, false, 'subsonic plays request URIs, not a live input');
+    else if (k === 'hasRecentSongs') assert.equal(v, false, 'Navidrome has no newest-TRACKS endpoint — the facade returns the neutral empty and /dj/recent composes it from newest albums');
     else assert.equal(v, true, `subsonic.${k} must be on — an OFF flag would turn a working delegator into a neutral empty`);
   }
   assert.deepEqual(capabilitiesFor('nope'), DEFAULT_CAPS);
