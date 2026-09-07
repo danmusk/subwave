@@ -15,12 +15,14 @@ import { applyNavidromeToLiveConfig, saveSetupConfig } from '../../setup/config.
 import * as library from '../../music/library.js';
 import * as jingles from '../../broadcast/jingles.js';
 import * as settings from '../../settings.js';
+import { BOUNDARY_MIN_PLAY_SEC, BOUNDARY_TOLERANCE_SEC } from '../../broadcast/show-boundary.js';
 import * as tts from '../../audio/tts.js';
 import * as remoteTts from '../../audio/remoteTts.js';
 import * as chatterbox from '../../audio/chatterbox.js';
 import * as piper from '../../audio/piper.js';
 import * as llmProvider from '../../llm/provider.js';
 import { queue } from '../../broadcast/queue.js';
+import { handoverOffsetMinutes } from '../../broadcast/handover-policy.js';
 import { streamStatus } from '../../broadcast/liquidsoap-control.js';
 import { requireAdmin } from '../../middleware/auth.js';
 import { validateSettingsBody } from '../../middleware/validate.js';
@@ -100,16 +102,39 @@ router.get('/settings', requireAdmin, async (req, res) => {
       serverTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
       values: {
         jingleRatio: s.jingleRatio,
+        // Who counts the tracks between jingles (#1619) — the admin control that
+        // hands the rotate to the controller and writes the mixer's ratio 0.
+        jingleRotate: s.jingleRotate,
         crossfadeDuration: s.crossfadeDuration,
         ducking: s.ducking,
+        // Repaired on the way out, not served raw: a station-profile switch and
+        // a backup restore both reach the cache without passing load(), and the
+        // admin control is four fixed steps — an off-step value matches no
+        // option and reads as permanently dirty. Same rule as the air path, via
+        // the same function (#1576).
+        handover: { offsetMinutes: handoverOffsetMinutes() },
         maxTrackSeconds: s.maxTrackSeconds,
-        // Crossfade-relative floor for a non-zero cap — one rule, shared with the
-        // admin/show UI so client hints match server validation.
+        // Crossfade-relative floor for a non-zero cap OR a non-zero
+        // minimum-track-length floor — one rule, shared with the admin/show UI
+        // so client hints match server validation.
         minTrackSeconds: settings.minTrackSeconds(s),
         archive: s.archive,
+        // Edited from the Backup panel rather than a settings section — the
+        // schedule belongs beside Export/Restore, but it saves through the one
+        // POST /settings chokepoint like every other key.
+        backups: s.backups,
         stream: s.stream,
         loudness: s.loudness,
         silenceTrim: s.silenceTrim,
+        fadeAtShowEnd: s.fadeAtShowEnd,
+        // Shortest playable track a boundary cut can ever arm on: it needs an
+        // overshoot past BOUNDARY_TOLERANCE_SEC *and* BOUNDARY_MIN_PLAY_SEC of
+        // the track aired before the boundary, so anything shorter is left to
+        // run over by construction. Served rather than restated in the admin
+        // hint for the same reason minTrackSeconds is — a maxTrackSeconds cap
+        // at or below this switches the feature off silently, and the number
+        // that says so must be the one the drain actually uses.
+        boundaryFadeMinTrackSeconds: BOUNDARY_MIN_PLAY_SEC + BOUNDARY_TOLERANCE_SEC,
         station: s.station,
         stationDescription: s.stationDescription,
         timezone: s.timezone,
@@ -135,6 +160,11 @@ router.get('/settings', requireAdmin, async (req, res) => {
         search: s.search,
         embedding: s.embedding,
         likes: s.likes,
+        // Track-selection windows (album cooldown, minimum track length). The
+        // admin form reads `values.picker` to populate those inputs, so without
+        // this line every load shows them at 0 and the next save on that card
+        // silently writes the operator's own setting away.
+        picker: s.picker,
         // The active music source + the Spotify knobs — what MusicSection /
         // SpotifySection render and diff against.
         music: s.music,

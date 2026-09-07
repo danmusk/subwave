@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import * as subsonic from '../music/source.js';
 import * as library from '../music/library.js';
+import * as blocklist from '../music/blocklist.js';
 import * as settings from '../settings.js';
 import { getFullContext, geocodePlace } from '../context.js';
 import { queue } from '../broadcast/queue.js';
@@ -30,7 +31,14 @@ import { fetchWithTimeout } from '../util/fetch-timeout.js';
 import { listenerAuthDecision, stationAuthDecision } from '../util/listener-auth.js';
 import { publicGuestIds, publicPersonaShape, soulsArePublic } from '../util/public-persona.js';
 import { resolveThemeProvenance } from '../util/theme-provenance.js';
+import {
+  parseSimilarLimit,
+  publicSimilarTrack,
+  soundKnnWidth,
+  similarTracksOutcome,
+} from '../util/similar-tracks.js';
 import { checkAuthRateLimit, clientIp, listenerAuthFailureDelayMs } from '../middleware/ratelimit.js';
+import { requireStationAuth } from '../middleware/station-auth.js';
 import { STATE_ROOT } from '../config.js';
 import { activeStationId } from '../stations/resolve.js';
 
@@ -304,9 +312,20 @@ router.get('/now-playing', async (req, res) => {
         }
       : null;
     const s = session.getSession();
+    // The listener payload carries the context object nearly whole — it is the
+    // station's picture of the moment and the skins render most of it. What it
+    // must NOT carry is controller plumbing: `clock.spokenTimeOptions` is the
+    // hourly check's phrasing band (#1602), raw material for the picker rather
+    // than a fact about the moment, and a public read never widens to carry a
+    // behaviour internal. `spokenTime` stays — it is a reading, and skins have
+    // always seen it. Stripped here, at the one public boundary, rather than
+    // kept off the context type, so every in-process prompt caller still gets
+    // the band from the same getFullContext they already hold.
+    const publicClock: any = { ...(ctx.clock as any) };
+    delete publicClock.spokenTimeOptions;
     res.json({
       nowPlaying,
-      context: ctx,
+      context: { ...ctx, clock: publicClock },
       dj: {
         name: persona?.name || 'Frequency',
         tagline: persona?.tagline || '',
@@ -676,6 +695,115 @@ router.post(
     res.status(ok ? 200 : 401).json({ ok });
   },
 );
+
+// The one seed resolution both /similar-tracks paths share: a library row by
+// id, echoed back as `seed` — or null when there is no such track OR it is on
+// the never-play list. library.slimById carries albumId/artistId, so
+// blocklist.matchOf reaches its exact id tiers instead of falling back to
+// (album name, artist), which a compilation defeats. The blocklist is the
+// existing hitOf()/isBlocked() chokepoint, not a second rule filter.
+function seedRowFor(id: string): { id: string; title: string | null; artist: string | null } | null {
+  const row = library.slimById(id);
+  if (!row || blocklist.isBlocked(row)) return null;
+  return { id, title: row.title ?? null, artist: row.artist ?? null };
+}
+
+// ---------------------------------------------------------------------------
+// GET /similar-tracks?id=<trackId>|q=<terms>&limit=N — the CLAP "sounds like
+// this" lookup, outside the admin library panel (#1575). An operator building
+// a call-in agent against the HTTP API wants the same neighbours the Library
+// tab shows, without handing that agent the admin password.
+//
+// So the gate is the STATION password, not requireAdmin: open on a public
+// station, closed on a private one (requireStationAuth, which fails CLOSED —
+// see middleware/station-auth.ts). And the row shape is the public subset in
+// util/similar-tracks.ts, never the admin row: no tagger provenance, no
+// era-trust internals, no blocklist annotation.
+//
+// It always answers 200 with a `reason`. A lean analyzer, a library still
+// being analysed and a seed nobody has heard of are three different empty
+// results, and a 503 (what /library/search-sound answers, correctly, for an
+// operator watching a capability flag) tells an API consumer none of them
+// apart. util/similar-tracks.ts owns which is which.
+//
+// Blocklist: the neighbours are filtered once, inside
+// library.tracksLikeThisAudio's existing rejectBlocked chokepoint — never add
+// a second filter over THOSE. The seed echo is the separate case: it is
+// resolved by id / free text, and both library.get() and library.filter() are
+// blocklist-blind, so without the isBlocked() call in seedRowFor below a
+// never-play track's id, title and artist come back in `seed` — and on a
+// public station `q` makes that an unauthenticated way to look one up by name.
+// The blocklist is absolute, so a blocked seed reads as `seed-not-found`.
+// ---------------------------------------------------------------------------
+router.get('/similar-tracks', requireStationAuth, async (req, res) => {
+  const id = (typeof req.query?.id === 'string' ? req.query.id : '').trim();
+  const q = (typeof req.query?.q === 'string' ? req.query.q : '').trim();
+  if (!id && !q) return res.status(400).json({ error: 'id or q is required' });
+  const limit = parseSimilarLimit(req.query?.limit);
+
+  try {
+    await library.load();
+    const stats = library.stats();
+
+    // Resolve the seed HERE rather than leaning on tracksLikeThisAudio's own
+    // title fallback, because the caller has to be told WHICH track answered
+    // — "no results for the thing you meant" and "no results for something
+    // else entirely" are the two failures an agent has to be able to separate.
+    // Same resolution order the KNN uses internally: the id first, then the
+    // first text match that actually carries an audio vector.
+    let seedId = '';
+    let seedRow: { id: string; title: string | null; artist: string | null } | null = null;
+    let seedFound = false;
+
+    if (id) {
+      const row = seedRowFor(id);
+      if (row) {
+        seedFound = true;
+        seedRow = row;
+        if (library.hasAudioVector(id)) seedId = id;
+      }
+    }
+    if (!seedId && q) {
+      for (const cand of library.filter({ q, limit: 8 }).rows) {
+        const row = seedRowFor(cand.id);
+        if (!row) continue;
+        seedFound = true;
+        // Report the best text match even when none of them is analysed —
+        // that is what makes 'seed-not-analysed' actionable.
+        if (!seedRow) seedRow = row;
+        if (library.hasAudioVector(cand.id)) {
+          seedId = cand.id;
+          seedRow = row;
+          break;
+        }
+      }
+    }
+
+    const hits = seedId ? library.tracksLikeThisAudio(seedId, soundKnnWidth(limit)) : [];
+    const results = hits
+      // The station's own hourly archive mixdowns are not music (issue #273);
+      // a co-located Navidrome that scans state/archive puts them in the index.
+      .filter((t) => !subsonic.isStationArchive(t))
+      .filter((t) => t.id !== seedId)
+      .slice(0, limit)
+      .map(publicSimilarTrack);
+
+    const outcome = similarTracksOutcome({
+      audioIndexSize: stats.withAudioEmbedding ?? 0,
+      // mirrorTotal, not total: the analyzer writes CLAP vectors independently
+      // of the tagger, so `total` (tagged only) can be the SMALLER number and
+      // the coverage sentence turns into nonsense.
+      libraryTotal: stats.mirrorTotal ?? 0,
+      seedFound,
+      seedHasVector: Boolean(seedId),
+      neighbourCount: results.length,
+    });
+
+    res.json({ seed: seedRow, results, ...outcome });
+  } catch (err) {
+    publicError(res, '/similar-tracks', err);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // GET /themes — public theme registry. Returns the active theme id plus the

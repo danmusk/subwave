@@ -68,6 +68,7 @@ import {
   coerceGuestPersonaIds,
   isDefaultTakeover,
   mintId,
+  normalizeLlmHeaders,
   normalizeLlmKeys,
   normalizeLlmProviderBaseUrls,
   normalizeMoodMap,
@@ -76,6 +77,7 @@ import {
   normalizeTtsGainMap,
   normalizeTtsSpeedMap,
   takeoverShowId,
+  TRANSITION_EFFECTS,
   validateTtsCorrectionsStrict,
 } from './settings/vocab.js';
 import {
@@ -85,6 +87,7 @@ import {
   MP3_BITRATE_SET,
   OPUS_BITRATE_SET,
   coerceMaxTrackSeconds,
+  coerceMinTrackLengthSeconds,
   rawMaxTrackSec,
 } from './settings/defaults.js';
 import { validateCompatParams } from './settings/compat-params.js';
@@ -104,13 +107,18 @@ import {
   STREAM_GEOIP_DB_PATH_MAX,
   STREAM_MAX_LISTENERS_BOUNDS,
   maxTrackSecondsValueSchema,
+  type ScheduledBackupSettings,
+  type JingleRotateOwner,
 } from './schemas/settings.js';
+import { jingleRotateOwner, setJingleRotateOwner } from './broadcast/jingle-rotate.js';
 import { minTrackSeconds, peek, setCache } from './settings/store.js';
 import {
   SKILL_RENAMES,
   normalizeArchiveRetentionDays,
+  normalizeBackups,
   normalizeDjPrompts,
   normalizeDuckDepth,
+  normalizeHandoverOffsetMinutes,
   normalizePersonaArray,
   normalizeTtsFallback,
   normalizeSchedule,
@@ -180,6 +188,7 @@ export {
   SHOW_TOPIC_MAX,
   SOUL_MAX,
   TONE_DIALS,
+  TRANSITION_EFFECTS,
   TTS_CLOUD_PROVIDERS,
   TTS_CORRECTIONS_LIMIT,
   TTS_ENGINES,
@@ -232,8 +241,10 @@ export {
   announceLinks,
   castHouseRulesBlock,
   castSpeakerIdRule,
+  effectiveFadeAtShowEnd,
   effectiveFrequency,
   effectiveMaxTrackSec,
+  effectiveMinTrackSec,
   effectsActive,
   getActivePersona,
   getEffectivePersona,
@@ -249,6 +260,7 @@ export {
   spokenProperNounDirective,
 } from './settings/persona.js';
 export { writeLiquidsoapSettings } from './settings/liquidsoap.js';
+export { effectEnabled, enabledEffects } from './settings/transition-effects.js';
 export type {
   DjPromptEntry,
   EraWindow,
@@ -402,6 +414,10 @@ export async function load() {
 
   const loaded: any = {
     jingleRatio: stored.jingleRatio ?? DEFAULTS.jingleRatio,
+    // Repaired, never trusted: a hand-edited settings.json is load()'s input
+    // and an unrecognised owner here would decide whether TWO rotates run.
+    // Anything but the explicit opt-in reads as the mixer (#1619).
+    jingleRotate: jingleRotateOwner(stored),
     crossfadeDuration: stored.crossfadeDuration ?? DEFAULTS.crossfadeDuration,
     // Bounded here as well as at the save path: a hand-edited settings.json is
     // load()'s input, so it repairs rather than throws — and an out-of-range `p`
@@ -412,6 +428,13 @@ export async function load() {
       intro: normalizeDuckDepth(stored.ducking?.intro, DEFAULTS.ducking.intro),
     },
     maxTrackSeconds: coerceMaxTrackSeconds(rawMaxTrackSec(stored), false) ?? DEFAULTS.maxTrackSeconds,
+    // Station default for the show-boundary fade (#1574). Anything but an
+    // explicit boolean reads as the shipped default (off), which is what makes
+    // an install that predates the key sound byte-identical.
+    fadeAtShowEnd:
+      typeof stored.fadeAtShowEnd === 'boolean'
+        ? stored.fadeAtShowEnd
+        : DEFAULTS.fadeAtShowEnd,
     archive: {
       enabled:
         typeof stored.archive?.enabled === 'boolean'
@@ -422,6 +445,13 @@ export async function load() {
       // enabled archive without a stored value stays at 0, never pruned.
       retentionDays: normalizeArchiveRetentionDays(stored.archive),
     },
+    // Scheduled backups (#1570). An absent block reads as `{ cadence: 'off' }`,
+    // which is the pre-existing station exactly. This block does NOT spread
+    // DEFAULTS — a field missing from here saves, works for the rest of the
+    // process and then vanishes on the next cold load (controller/CLAUDE.md's
+    // THREE edits), which for a cadence means backups silently stopping.
+    // Pinned by a cold-load round trip in scripts/backup-schedule.test.ts.
+    backups: normalizeBackups(stored.backups),
     stream: {
       opusEnabled:
         typeof stored.stream?.opusEnabled === 'boolean'
@@ -557,6 +587,14 @@ export async function load() {
       typeof stored.djTalkOnlyBetweenTracks === 'boolean'
         ? stored.djTalkOnlyBetweenTracks
         : DEFAULTS.djTalkOnlyBetweenTracks,
+    // Repaired rather than refused, like ducking above: an offset the talk
+    // table's programme row cannot sample is a sign-off that never airs, and a
+    // hand-edited settings.json is this path's input.
+    handover: {
+      offsetMinutes: normalizeHandoverOffsetMinutes(
+        stored.handover?.offsetMinutes, DEFAULTS.handover.offsetMinutes,
+      ),
+    },
     station:
       typeof stored.station === 'string' && stored.station.trim()
         ? stored.station.trim().slice(0, 80)
@@ -777,6 +815,10 @@ export async function load() {
           typeof stored.tts?.cloud?.voiceUseSpeakerBoost === 'boolean'
             ? stored.tts.cloud.voiceUseSpeakerBoost
             : DEFAULTS.tts.cloud.voiceUseSpeakerBoost,
+        sendSpeed:
+          typeof stored.tts?.cloud?.sendSpeed === 'boolean'
+            ? stored.tts.cloud.sendSpeed
+            : DEFAULTS.tts.cloud.sendSpeed,
         // Fish Audio controls — lenient load for hand-edited/older settings.
         // Only the Fish provider sends these fields on the wire.
         temperature:
@@ -838,6 +880,13 @@ export async function load() {
       providerBaseUrls: llmBaseUrls,
       baseUrl: llmBaseUrls[llmProvider]
         ?? (typeof stored.llm?.baseUrl === 'string' ? stored.llm.baseUrl.trim() : DEFAULTS.llm.baseUrl),
+      // Extra openai-compatible request headers (#1618). Malformed entries are
+      // dropped rather than throwing — this block does NOT spread DEFAULTS, so
+      // a field missing HERE saves fine and then vanishes on the next cold
+      // load; see repeatPenalty below for what that failure looks like. A
+      // settings.json written before the field existed loads as {}, which sends
+      // no extra headers at all.
+      headers: normalizeLlmHeaders(stored.llm?.headers),
       reasoning:
         typeof stored.llm?.reasoning === 'boolean' ? stored.llm.reasoning : DEFAULTS.llm.reasoning,
       // Only 'auto' downgrades the forced tool_choice; anything else (incl. a
@@ -914,6 +963,7 @@ export async function load() {
           providerBaseUrls: fbBaseUrls,
           baseUrl: fbBaseUrls[fbProvider]
             ?? (typeof fb.baseUrl === 'string' ? fb.baseUrl.trim() : DEFAULTS.llm.fallback.baseUrl),
+          headers: normalizeLlmHeaders(fb.headers),
           reasoning:
             typeof fb.reasoning === 'boolean' ? fb.reasoning : DEFAULTS.llm.fallback.reasoning,
           toolChoice: fb.toolChoice === 'auto' ? 'auto' : DEFAULTS.llm.fallback.toolChoice,
@@ -1031,6 +1081,15 @@ export async function load() {
     transitions: {
       pairDrain: typeof stored.transitions?.pairDrain === 'boolean' ? stored.transitions.pairDrain : DEFAULTS.transitions.pairDrain,
       stemBlends: typeof stored.transitions?.stemBlends === 'boolean' ? stored.transitions.stemBlends : DEFAULTS.transitions.stemBlends,
+      // Per-effect kill switches (#1565) — same absent-means-default repair as
+      // every sibling, and the default is `true`, so a stored block missing a
+      // field (or missing entirely) normalises to the whole kit on.
+      effects: Object.fromEntries(TRANSITION_EFFECTS.map(k => [
+        k,
+        typeof stored.transitions?.effects?.[k] === 'boolean'
+          ? stored.transitions.effects[k]
+          : DEFAULTS.transitions.effects[k],
+      ])) as typeof DEFAULTS.transitions.effects,
     },
     sfx: {
       enabled: typeof stored.sfx?.enabled === 'boolean' ? stored.sfx.enabled : DEFAULTS.sfx.enabled,
@@ -1120,6 +1179,14 @@ export async function load() {
             Math.max(PICKER_ALBUM_HOURS_BOUNDS.min, Number(stored.picker.albumHours)),
           )
         : DEFAULTS.picker.albumHours,
+      // Minimum-track-length floor (#1573). Same lenient clamp, and the same
+      // reason it has to be listed HERE and not just in DEFAULTS: this block
+      // composes explicitly. The crossfade floor is NOT re-applied on load —
+      // load is lenient by contract, and a crossfade lowered after the fact
+      // must not delete a floor the operator set deliberately.
+      minTrackLengthSeconds:
+        coerceMinTrackLengthSeconds(stored.picker?.minTrackLengthSeconds, false)
+        ?? DEFAULTS.picker.minTrackLengthSeconds,
     },
     // Active music source. An unknown or absent value falls back to subsonic so
     // an upgrade is byte-identical; the strict refusal is the patch path's.
@@ -1199,6 +1266,10 @@ export async function load() {
     console.warn(`[settings] ignoring invalid timezone "${stored.timezone.trim()}" — using Auto (container TZ)`);
   }
   setStationTimezone(loaded.timezone);
+  // Same shape, same reason (#1619): the queue subscribes to a real ownership
+  // change so it can restart the rotate's boundary count, and it cannot be
+  // called from here directly without closing a settings ↔ queue cycle.
+  setJingleRotateOwner(loaded.jingleRotate);
   return loaded;
 }
 
@@ -1217,6 +1288,19 @@ export async function update(patch) {
     const v = parseSettingsPatchKey<number>('jingleRatio', patch.jingleRatio);
     if (v !== cur.jingleRatio) {
       next.jingleRatio = v;
+      restart = true;
+    }
+  }
+  // Who counts the tracks (#1619). Same restart flag as the ratio itself and
+  // for the same reason: this key's whole effect on the mixer is the value
+  // written into liquidsoap_jingle_ratio.txt, which is read once at startup.
+  // Until that restart the mixer is still rotating on its old ratio, so an
+  // operator who flips this and walks away hears both — which is what the
+  // control's "needs restart" wording is for.
+  if ('jingleRotate' in patch) {
+    const v = parseSettingsPatchKey<JingleRotateOwner>('jingleRotate', patch.jingleRotate);
+    if (v !== cur.jingleRotate) {
+      next.jingleRotate = v;
       restart = true;
     }
   }
@@ -1283,6 +1367,17 @@ export async function update(patch) {
       // restart involved.
       next.archive.retentionDays = a.retentionDays;
     }
+  }
+  if ('backups' in patch) {
+    const b = parseSettingsPatchKey<Partial<ScheduledBackupSettings>>(
+      'backups',
+      patch.backups,
+    );
+    // Read live by the scheduler's hourly tick — nothing is handed to
+    // Liquidsoap, so no restart, and a cadence change takes effect on the next
+    // tick rather than needing one.
+    if (b.cadence !== undefined) next.backups.cadence = b.cadence;
+    if (b.keep !== undefined) next.backups.keep = b.keep;
   }
   if ('stream' in patch) {
     const st = parseSettingsPatchKey<Record<string, number | boolean | undefined>>(
@@ -1501,6 +1596,18 @@ export async function update(patch) {
     next.djTalkOnlyBetweenTracks =
       parseSettingsPatchKey<boolean>('djTalkOnlyBetweenTracks', patch.djTalkOnlyBetweenTracks);
   }
+  if ('handover' in patch) {
+    // No mixer restart: the offset is read live by broadcast/handover-policy.ts
+    // at each programme tick, not handed to liquidsoap as a startup file.
+    const hv = parseSettingsPatchKey<{ offsetMinutes?: number }>('handover', patch.handover);
+    if (hv.offsetMinutes !== undefined) next.handover.offsetMinutes = hv.offsetMinutes;
+  }
+  // Show-boundary fade (#1574). Read live by the drain (it stamps liq_cue_out
+  // on the next pick that would cross a show change), so no restart and no
+  // Liquidsoap handoff file.
+  if ('fadeAtShowEnd' in patch) {
+    next.fadeAtShowEnd = parseSettingsPatchKey<boolean>('fadeAtShowEnd', patch.fadeAtShowEnd);
+  }
   if ('personas' in patch) {
     next.personas = validatePersonasStrict(patch.personas);
   }
@@ -1696,6 +1803,12 @@ export async function update(patch) {
       if (c.voiceUseSpeakerBoost !== undefined) {
         next.tts.cloud.voiceUseSpeakerBoost = !!c.voiceUseSpeakerBoost;
       }
+      // openai-compatible: send `speed` upstream vs. stretch locally (see
+      // speedDirective / issue #942). Plain boolean coercion — only consulted on
+      // the compat path, inert elsewhere.
+      if (c.sendSpeed !== undefined) {
+        next.tts.cloud.sendSpeed = !!c.sendSpeed;
+      }
       // Fish Audio synthesis controls. Clamp numeric knobs like the existing
       // ElevenLabs sliders; reject an unknown enum so a typo cannot silently
       // turn into a provider-side 422 and a different fallback voice.
@@ -1855,6 +1968,28 @@ export async function update(patch) {
   if ('picker' in patch) {
     const pk = parseSettingsPatchKey<Record<string, unknown>>('picker', patch.picker);
     if (pk.albumHours !== undefined) next.picker.albumHours = pk.albumHours as number;
+    if (pk.minTrackLengthSeconds !== undefined) {
+      // Whole seconds — the schema's bounds check is deliberately number-like
+      // (it also serves albumHours, where a fraction is a real answer), so the
+      // rounding lands here rather than widening that shared helper.
+      const v = Math.round(pk.minTrackLengthSeconds as number);
+      // A positive FLOOR must clear the crossfade-derived minimum, the same
+      // figure maxTrackSeconds is bounded by above and for the same reason: a
+      // track shorter than 2x the crossfade never gets solo airtime, so the
+      // smallest floor worth expressing is the one the mixer already imposes.
+      // 0 (= off) always stays allowed, which is what keeps an untouched
+      // station byte-identical. Uses next's crossfade, already applied above if
+      // this same patch changed it.
+      const floor = minTrackSeconds(next);
+      if (v !== 0 && v < floor) {
+        throw new Error(
+          `picker.minTrackLengthSeconds must be 0 (no floor) or at least ${floor}s`,
+        );
+      }
+      // Read live by both pick paths and the auto-playlist refresh; no
+      // Liquidsoap file is written, so no mixer restart.
+      next.picker.minTrackLengthSeconds = v;
+    }
   }
   if ('music' in patch) {
     const mu = parseSettingsPatchKey<Record<string, unknown>>('music', patch.music);
@@ -2096,6 +2231,16 @@ export async function update(patch) {
     for (const k of ['pairDrain', 'stemBlends'] as const) {
       if (tr[k] !== undefined) (next.transitions as Record<string, unknown>)[k] = tr[k];
     }
+    // Nested block, so it needs its own per-field loop like scrobble.* does: the
+    // flat copy above would replace the whole `effects` object, and a patch that
+    // sends only `{ dissolve: false }` would silently reset the other five to
+    // whatever the applier happened to write.
+    const fx = tr.effects as Record<string, unknown> | undefined;
+    if (fx !== undefined) {
+      for (const k of TRANSITION_EFFECTS) {
+        if (fx[k] !== undefined) (next.transitions.effects as Record<string, unknown>)[k] = fx[k];
+      }
+    }
   }
   // On the shared schema (#1348). The block schemas keep the branches' own
   // leniency — a non-object block is an empty patch, an absent field is left
@@ -2326,6 +2471,10 @@ export async function update(patch) {
   // Applied-on-save, same pattern as the liquidsoap_*.txt files below —
   // minus the restart: the next zonedParts() call picks it up.
   setStationTimezone(next.timezone);
+  // Applied-on-save too, and unlike the zone this one DOES also need the mixer
+  // restart the flag above raises — the counter reset is only the controller's
+  // half (#1619).
+  setJingleRotateOwner(next.jingleRotate);
   // shows + schedule are persisted to their own file (schedule.json); strip
   // them from the settings.json payload so legacy installs migrate forward
   // on the first write. The in-memory `cache` keeps the full shape so

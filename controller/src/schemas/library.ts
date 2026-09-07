@@ -2,7 +2,11 @@
 // /library that carry typed input rather than a bare id: `POST
 // /library/manual-tag` (tag this track, or its whole album, by hand — no LLM
 // involved) and `POST /library/original-year` (the operator's own answer to
-// "what year was this actually recorded", behind the same row editor).
+// "what year was this actually recorded", behind the same row editor), and
+// `POST /library/scenes/merge` (consolidate near-duplicate genre tags), plus
+// the one RESPONSE shape that crosses the same boundary — the referenced-by
+// warning a scene merge carries (#1593), which the browser renders before the
+// operator confirms.
 //
 // HARD RULE: this file may import ONLY from 'zod'. It is copied verbatim into
 // the web bundle, so a project import or a node builtin here breaks the mirror.
@@ -134,4 +138,100 @@ export function originalYearSchema() {
     // at a time, so this is the common case here rather than the exception.
     applyToAlbum: z.unknown().optional().transform((v) => v === true),
   });
+}
+
+// ── POST /library/scenes/merge ───────────────────────────────────────────────
+// Scene-vocabulary consolidation (issue #1577). "Scene" is the operator-facing
+// word for a genre tag; the body names the values to retire and the one that
+// survives. Both halves are typed here because a wrong `to` is not recoverable
+// from the UI: the rows are rewritten in place, so the retired spellings are
+// gone until the next Navidrome walk.
+
+/** How many values one merge may retire at once. Ticking a whole noisy tail is
+ *  the point, so this is generous; it exists to bound the SQL parameter list. */
+export const SCENE_MERGE_SOURCES_MAX = 100;
+
+/** Longest scene value accepted as a merge target. Navidrome genre tags are
+ *  short; a longer string is a paste accident, not a genre. */
+export const SCENE_VALUE_MAX = 120;
+
+export function sceneMergeSchema() {
+  return z.object({
+    // Every entry is matched against the EXACT stored value, which is what the
+    // listing hands the operator — so blanks and non-strings are refused
+    // rather than trimmed into something that matches a different row.
+    from: z
+      .array(z.unknown(), { error: 'from must be an array of scene values' })
+      .transform((items, c) => {
+        if (items.some((v) => typeof v !== 'string' || !(v as string).trim())) {
+          c.addIssue({ code: 'custom', message: 'from must be an array of scene values' });
+          return z.NEVER;
+        }
+        const values = [...new Set(items as string[])];
+        if (values.length < 1) {
+          c.addIssue({ code: 'custom', message: 'pick at least one scene to merge' });
+          return z.NEVER;
+        }
+        if (values.length > SCENE_MERGE_SOURCES_MAX) {
+          c.addIssue({
+            code: 'custom',
+            message: `at most ${SCENE_MERGE_SOURCES_MAX} scenes per merge`,
+          });
+          return z.NEVER;
+        }
+        return values;
+      }),
+    // Trimmed, because this one is TYPED (the target may be a new spelling that
+    // is in no list yet) and a trailing space would file a second scene beside
+    // the one the operator meant.
+    to: z.unknown().transform((raw, c) => {
+      const value = typeof raw === 'string' ? raw.trim() : '';
+      if (!value) {
+        c.addIssue({ code: 'custom', message: 'to (the surviving scene) is required' });
+        return z.NEVER;
+      }
+      if (value.length > SCENE_VALUE_MAX) {
+        c.addIssue({ code: 'custom', message: `to must be at most ${SCENE_VALUE_MAX} characters` });
+        return z.NEVER;
+      }
+      return value;
+    }),
+  });
+}
+
+// ── The referenced-by warning on a scene merge (#1593) ───────────────────────
+// A merge retires a source value. Case and punctuation variants keep matching
+// through show-filter's normGenre ("rock" → "Rock", "Hip-Hop" → "Hip Hop"), so
+// those merges orphan nothing; a SEMANTIC rename ("trip-hop" → "downtempo")
+// leaves every show, blocklist rule and playlist filter still naming the
+// retired value selecting nothing on that value, with no error and no visible
+// cause.
+//
+// The scan behind this shape lives in music/scene-references.ts — it needs
+// show-filter's matcher, which this file may not import. Only the SHAPE is
+// here, because it crosses to the browser: the Scene vocabulary section shows
+// the warning before the operator confirms, and again on the merge response.
+//
+// Naming the affected shows is the whole value of the warning. A generic "this
+// may affect filters" is the non-advice the operator already assumed.
+
+/** Where a retired scene can still be named. A bare union: nothing validates
+ *  against these at a boundary, so there is no runtime list to keep. */
+export type SceneReferenceKind = 'show' | 'rule' | 'playlist';
+
+/** One filter that names a value this merge retires and would stop catching it. */
+export interface SceneReference {
+  kind: SceneReferenceKind;
+  /** Show id, blocklist rule id, or Navidrome playlist id. */
+  id: string;
+  /** What the operator calls it: show name, rule label, playlist name. */
+  name: string;
+  /** Its values that NAME a scene this merge retires — the value IS that
+   *  scene, not something broader that also caught it — and that do not catch
+   *  the survivor. */
+  orphaned: string[];
+  /** The REST of this filter's own list, and nothing more. Empty means the
+   *  orphaned values were all it had; it is NOT a claim that the filter now
+   *  matches no tracks, which would need the whole tag set walked. */
+  remaining: string[];
 }

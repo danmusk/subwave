@@ -48,8 +48,12 @@ export function hydrateShow(s: Partial<Show>): Show {
     vocals: m.vocals === 'instrumental' || m.vocals === 'vocal' ? m.vocals : '',
     filtersStrict: m.filtersStrict ?? false,
     maxTrackSeconds: m.maxTrackSeconds ?? null,
+    minTrackLengthSeconds: m.minTrackLengthSeconds ?? null,
+    // Tri-state: only an explicit boolean is an opinion; anything else inherits.
+    fadeAtShowEnd: typeof m.fadeAtShowEnd === 'boolean' ? m.fadeAtShowEnd : null,
     playlistIds: Array.isArray(m.playlistIds) ? m.playlistIds : [],
     playlistStrict: m.playlistStrict ?? false,
+    playlistExhaust: m.playlistExhaust ?? false,
     excludedPlaylistIds: Array.isArray(m.excludedPlaylistIds) ? m.excludedPlaylistIds : [],
     programme: m.programme ?? false,
     segmentSkill: m.segmentSkill ?? '',
@@ -118,9 +122,16 @@ export function showPayload(s: Show) {
     // Strict only means something with at least one music filter set.
     filtersStrict: hasAnyMusicFilter(s) && s.filtersStrict,
     maxTrackSeconds: s.maxTrackSeconds,
+    minTrackLengthSeconds: s.minTrackLengthSeconds,
+    // null rides through as null: it is "inherit", not "off", and coercing it
+    // here would opt every saved show out of a station default.
+    fadeAtShowEnd: typeof s.fadeAtShowEnd === 'boolean' ? s.fadeAtShowEnd : null,
     playlistIds: s.playlistIds || [],
     // Strict only means something with at least one playlist pinned.
     playlistStrict: (s.playlistIds?.length ?? 0) > 0 && s.playlistStrict,
+    // And full rotation only means something behind strict: a soft anchor may
+    // leave the playlist, so "every track once" has no set to be true of.
+    playlistExhaust: (s.playlistIds?.length ?? 0) > 0 && s.playlistStrict && s.playlistExhaust,
     excludedPlaylistIds: s.excludedPlaylistIds || [],
     programme: s.programme ?? false,
     // A skill pin only means something in programme mode.
@@ -149,11 +160,20 @@ export function showFacets(s: Show): ShowFacet[] {
   if (s.vocals) facets.push({ key: 'vocals', label: s.vocals === 'instrumental' ? 'instrumental' : 'vocals' });
   if (s.filtersStrict && hasAnyMusicFilter(s)) facets.push({ key: 'strict', label: 'strict', accent: true });
   const nPl = s.playlistIds?.length ?? 0;
-  if (nPl) facets.push({ key: 'playlists', label: `${nPl} playlist${nPl > 1 ? 's' : ''}${s.playlistStrict ? ' · strict' : ''}` });
+  if (nPl) facets.push({ key: 'playlists', label: `${nPl} playlist${nPl > 1 ? 's' : ''}${s.playlistStrict ? ' · strict' : ''}${s.playlistStrict && s.playlistExhaust ? ' · full rotation' : ''}` });
   const nEx = s.excludedPlaylistIds?.length ?? 0;
   if (nEx) facets.push({ key: 'excluded', label: `${nEx} excluded` });
   if (s.maxTrackSeconds != null) {
     facets.push({ key: 'length', label: s.maxTrackSeconds === 0 ? 'any length' : `≤${s.maxTrackSeconds}s` });
+  }
+  // The floor gets its own facet rather than being folded into the one above:
+  // the two are independent overrides and a show may set either alone, so one
+  // combined "60–600s" chip would have to invent a bound the operator did not.
+  if (s.minTrackLengthSeconds) {
+    facets.push({ key: 'min-length', label: `≥${s.minTrackLengthSeconds}s` });
+  }
+  if (typeof s.fadeAtShowEnd === 'boolean') {
+    facets.push({ key: 'boundary-fade', label: s.fadeAtShowEnd ? 'fades at end' : 'runs over' });
   }
   return facets;
 }

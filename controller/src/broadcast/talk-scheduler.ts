@@ -43,6 +43,7 @@
 import {
   BANTER_SLOTS, BANTER_WINDOW_MINUTES, BANTER_MIN_GAP_MS,
 } from './banter-policy.js';
+import { HANDOVER_OFFSET_STEP_MINUTES } from '../schemas/settings.js';
 import { pendingVoiceValidForMs } from './queue/kinds.js';
 import type { PendingTalk } from './queue/kinds.js';
 
@@ -50,7 +51,14 @@ import type { PendingTalk } from './queue/kinds.js';
 // THE SLOT TABLE
 // ---------------------------------------------------------------------------
 
-export type TalkKind = 'hourly' | 'programme' | 'banter' | 'station-id' | 'segment';
+export type TalkKind = 'hourly' | 'programme' | 'banter' | 'station-id' | 'segment' | 'jingle';
+
+// `jingle` is the one row that is not SPEECH. It is here because the table is
+// where every claim on the listener's ear is arbitrated, and a stinger takes
+// the seam exactly the way an ident does — which is the whole of #1619: while
+// Liquidsoap drew the rotate itself, the planner could only find out
+// afterwards, through the `jingle-playing.json` hold, and a link written for
+// the next boundary landed right behind it.
 
 // Which clock a row's placement is a fact ABOUT. Two clocks coexist on purpose
 // and a unified table must not collapse them: slot minutes run on PROCESS time
@@ -118,8 +126,16 @@ export type TalkSlot = {
   // Only evaluate this row on process minutes divisible by `stride`. Exists so
   // the programme row keeps being sampled exactly where its old `*/5` cron
   // sampled it: with every real IANA offset a multiple of 15 minutes, a 5-minute
-  // stride lands one tick inside each beat window (:35-:39, :55+) whatever the
-  // zone, and a per-minute row would add retries the old cron never had.
+  // stride lands one tick inside each beat window whatever the zone, and a
+  // per-minute row would add retries the old cron never had.
+  //
+  // For the programme row that is a CONTRACT, not a convenience, and #1576 made
+  // it one the operator can now break: the sign-off's window moved off the
+  // hardcoded :55 and onto `handover.offsetMinutes`. A window narrower than the
+  // stride, or opening off a multiple of it, is one this row never samples — and
+  // the failure is silent, a show that simply stops signing off. So the stride
+  // and the bound on that setting are the SAME constant, declared once in
+  // schemas/settings.ts and imported at both ends.
   stride: number;
   // Whether the row remembers that a slot has already spoken. Banter needs it
   // (a per-minute window would otherwise stream exchanges); programme does NOT,
@@ -143,14 +159,23 @@ export type TalkSlot = {
 // the back of a segment that just finished — which is the whole of #310,
 // stated as a number instead of as an absent cron minute.
 export const TALK_SLOTS: readonly TalkSlot[] = [
-  // Programme beats — the feature mid-hour and the outro in the final minutes
-  // of the show's last hour, both placed on the station clock by
-  // programme.dueBeat(). Gating lives in programme.ts; this row only says when
-  // to ask. It leads the table because it is the one row that CANNOT retry:
-  // `dueBeat` is a window on the station clock that this row samples once, so a
-  // beat that yields is a beat the episode never gets. It takes no gap for the
-  // same reason — a planned episode's beats are the show, not an interruption
-  // of it.
+  // Programme beats — the feature mid-hour and the outro (the show's sign-off)
+  // in the final hour, both placed on the station clock by programme.dueBeat().
+  // Gating lives in programme.ts; this row only says when to ask. It leads the
+  // table because it is the one row that CANNOT retry: `dueBeat` is a window on
+  // the station clock that this row samples once, so a beat that yields is a
+  // beat the episode never gets. It takes no gap for the same reason — a planned
+  // episode's beats are the show, not an interruption of it.
+  //
+  // The outro's window is the one placement here an operator can move
+  // (`handover.offsetMinutes`, #1576: 5 keeps it at :55-:59, 20 opens it at
+  // :40). Moving it is a WINDOW MOVE and never a resize — it stays one `stride`
+  // wide and aligned to a multiple of `stride`, which is the only shape this
+  // row's single sample is guaranteed to land inside. That is why the offset is
+  // bounded to multiples of the stride at the save path, and why the stride
+  // below is the imported constant rather than a literal 5: the table and the
+  // setting have to be the same number, and a row this sparse gives no second
+  // chance to notice they stopped being one.
   {
     kind: 'programme',
     opens: 'external',
@@ -160,7 +185,7 @@ export const TALK_SLOTS: readonly TalkSlot[] = [
     role: 'slot',
     priority: 1,
     clock: 'station',
-    stride: 5,
+    stride: HANDOVER_OFFSET_STEP_MINUTES,
     oneFirePerSlot: false,
   },
   // Top of the hour: the DJ checks in. The window runs to :09 — past that it is
@@ -247,6 +272,60 @@ export const TALK_SLOTS: readonly TalkSlot[] = [
     clock: 'process',
     stride: 5,
     oneFirePerSlot: true,
+  },
+  // The automatic jingle rotate (#1619) — the row that is not speech.
+  //
+  // ROLE. It is the table's SECOND fill row, and the choice is the same
+  // argument the segment director's is, not a weaker version of it. A fill row
+  // is one with "no scheduled chance to lose", and that is exactly what a
+  // rotate is: its due-ness is a COUNT of track boundaries
+  // (queue.rotateJingleTracksSince()), which keeps counting while the row
+  // waits, so a minute given away costs nothing but a minute. Making it a slot
+  // row would be wrong twice — it would suppress the director on every minute
+  // the jingle is merely waiting, and every hold would log `missed` about a
+  // chance that was never lost, since an `opens: 'any'` row's window is one
+  // minute wide and `canRetry` is therefore false on all of them.
+  //
+  // What the issue asked for — "the segment director stands down for it the way
+  // it does for an ident" — is what one talker per minute already does between
+  // two fill rows: the higher-priority plan takes the minute and the other one
+  // waits. It does not need to be a slot to get that.
+  //
+  // PRIORITY. Last, by the table's own principle: among rows that can retry,
+  // fewer remaining chances outranks more. The director is offered twelve
+  // minutes an hour; this row is offered sixty. So on a contested minute the
+  // director speaks and the jingle takes one of its other fifty-nine.
+  //
+  // GAP. Three minutes, the short segments' figure, and it is the half of the
+  // #310 collision this row can actually answer: a stinger must not land on the
+  // back of a break that has just finished. The other half — talk landing on
+  // the back of the STINGER — is not this row's to enforce and stays where it
+  // already lives, in the `jingle-playing.json` hold (#997, #1258, #1468) and
+  // radio.liq's own `voice_until` gate on the priority queue, which is why that
+  // guard survives this change untouched. Note the gap is one-directional for a
+  // second reason too: a jingle is not talk, so it never appears in
+  // queue.getLastTalkBreakAt().
+  //
+  // AIR. 'immediate' describes the HANDOFF, which is all the controller does
+  // here — the write to jingle-now.txt happens now and Liquidsoap's
+  // jingle_now_queue, a track-sensitive fallback gated on voice and beds,
+  // places the clip at the next safe boundary. Claiming 'next-track' would say
+  // the controller is deferring something it is not.
+  {
+    kind: 'jingle',
+    opens: 'any',
+    windowMinutes: 1,
+    minGapMs: 3 * 60_000,
+    air: 'immediate',
+    role: 'fill',
+    priority: 6,
+    clock: 'process',
+    stride: 1,
+    // The counter is the guard: it is zeroed when the jingle is handed over, so
+    // the row cannot fire twice for one rotate. An in-memory slot claim would
+    // only duplicate that, and keyed by minute (an `opens: 'any'` row's slot IS
+    // its minute) it would expire a tick later anyway.
+    oneFirePerSlot: false,
   },
 ];
 
@@ -482,12 +561,31 @@ function pendingOutlivesWindow(row: TalkSlot, slot: string, pending: PendingTalk
 // honest report, and the boundary the clip is waiting for is usually a track
 // away. Gating the SECOND segment here rather than queueing it in the queue is
 // also gate-before-generation: a postponed row writes no script at all.
+//
+// One row is covered by that ON rule for a reason that does not apply to it:
+// the jingle rotate (#1619) never writes `_pendingVoice` — it hands a clip that
+// is already on disk to `jingle-now.txt` — so firing it could not delete a
+// rendered segment. For that row the hold is COURTESY, not resource protection:
+// don't stack a stinger in front of a segment that is about to air. Keeping it
+// costs nothing (the count keeps counting, the next minute is another chance)
+// and dropping the row out of the rule would be the collision the table was
+// asked to arbitrate, so the rule stays uniform and this note stays here.
 function pendingHolds(
   row: TalkSlot, slot: string, minute: number, pending: PendingTalk, p: TalkTickInput,
 ): boolean {
   if (p.betweenTracksOnly) return pendingVoiceValidForMs(pending.queuedAt, p.now.getTime()) > 0;
-  return row.minGapMs > 0
-    && canRetry(row, slot, minute)
+  if (row.minGapMs === 0) return false;
+  // A row with no scheduled minutes ('any') cannot lose a chance by waiting —
+  // the next tick it is sampled on is another one. The #1539 bound exists
+  // ONLY to stop a hold turning a postpone into a cancel on a row with a
+  // finite window, and there is nothing here to cancel, so the hold is
+  // unbounded and the row simply waits for the clip to reach air. The bounded
+  // form would be strictly wrong for such a row: every minute is its own
+  // one-minute window, so `canRetry` is false on all of them and the row would
+  // never be held at all — which for the jingle rotate (#1619) is exactly the
+  // collision the table was asked to arbitrate.
+  if (row.opens === 'any') return pendingVoiceValidForMs(pending.queuedAt, p.now.getTime()) > 0;
+  return canRetry(row, slot, minute)
     && pendingOutlivesWindow(row, slot, pending, p.now.getTime());
 }
 

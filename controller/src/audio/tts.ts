@@ -9,7 +9,7 @@ import * as kokoro from './kokoro.js';
 import { applyEdgeFades } from './wav-edges.js';
 import * as chatterbox from './chatterbox.js';
 import * as pocketTts from './pocketTts.js';
-import { heavyEnabledEngines } from './ttsHeavyClient.js';
+import { heavyColdEngines, heavyEnabledEngines } from './ttsHeavyClient.js';
 import * as remoteTts from './remoteTts.js';
 import { normalizeForSpeech } from './speech-text.js';
 import { scrubCjkForSpeech } from './spoken-script-policy.js';
@@ -19,6 +19,7 @@ import {
 } from './tts-fallback.js';
 import { localizedPreviewText } from './preview-text.js';
 import * as cloud from '../llm/speech.js';
+import { resolvePersonaVoiceSlot } from './persona-engine.js';
 import { stripThinking } from '../llm/sdk.js';
 import * as settings from '../settings.js';
 import { recordTts } from '../stats.js';
@@ -48,9 +49,18 @@ function personaFor(persona?: any): any {
 
 // The persona's TTS config for a persona-voiced kind, else null. `persona`
 // overrides the effective persona (persona handoff); absent → effective persona.
+//
+// This is the ONE seam where the 'inherit' engine sentinel is resolved into a
+// real engine (audio/persona-engine.ts). Everything downstream — requestedEngine,
+// resolveEngine, ttsTarget, personaCloudProvider and every per-engine branch in
+// speakWith — compares `personaTts.engine` against a concrete engine id, so
+// resolving here keeps the sentinel out of a dozen comparisons that would each
+// have to learn it (and one of which would eventually forget). A slot naming a
+// real engine passes through untouched.
 function djPersonaTts(kind: string, persona?: any): any {
   if (GLOBAL_VOICE_KINDS.has(kind)) return null;
-  return personaFor(persona)?.tts || null;
+  const slot = personaFor(persona)?.tts || null;
+  return resolvePersonaVoiceSlot(slot, settings.get().tts);
 }
 
 // The engine the persona (or the global default) actually asked for, BEFORE
@@ -618,6 +628,12 @@ export function availableEngines() {
     // badge separate "engine off" (sidecar up, engine disabled) from "sidecar
     // off" (whole sidecar down). See engineMeta.engineStatus.
     heavyEnabled: heavyEnabledEngines(),
+    // Which of those the sidecar has idle-unloaded (#1579): still available —
+    // the next line just pays a model load first — so this changes nothing
+    // about routing and is here only so the admin badge can say "cold" rather
+    // than leaving an operator to read `docker stats` and guess. Same
+    // null-means-unknown rule as heavyEnabled.
+    heavyCold: heavyColdEngines(),
     // Whether PocketTTS can clone voices (gated weights present). null = not
     // yet known. The admin UI uses this to warn that a cloned .wav voice will
     // silently revert to a built-in when cloning is unavailable (issue #238).
@@ -648,8 +664,19 @@ function isPocketClone(voice?: string | null): boolean {
 // operator can see *who speaks* without waiting for a segment to air.
 export function describeRouting() {
   const persona = settings.getEffectivePersona();
-  const personaTts = persona?.tts || null;
   const tts = settings.get().tts || {};
+  // Resolved, like djPersonaTts() — this function reproduces the same
+  // per-engine comparisons the dispatcher makes, so it needs the same input.
+  // Against a raw slot every one of them reads false for a persona following
+  // the station: `requested` reported the literal sentinel, the voice fell
+  // through to the engine's GLOBAL default instead of the persona's own, and
+  // `fellBack` compared 'inherit' against the engine that actually spoke and
+  // was therefore true on a station where nothing fell back at all. That last
+  // one is the expensive direction — /debug's TTS panel and the nightly
+  // doctor's "active routing" check both exist to spot a SILENT fallback, and
+  // a warning that fires for the shipped default roster is the noise that
+  // teaches an operator to ignore the real one.
+  const personaTts = resolvePersonaVoiceSlot(persona?.tts || null, tts);
   const requested = personaTts?.engine || tts.defaultEngine || 'piper';
   const slot = resolveEngine('dj-speak', personaTts);   // any persona-voiced kind
   const engine = slot.engine;

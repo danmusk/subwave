@@ -43,6 +43,7 @@ import {
   TTS_CHATTERBOX_VOICE_RE,
   TTS_CLOUD_PROVIDERS as TTS_CLOUD_PROVIDER_VALUES,
   TTS_ENGINES as TTS_ENGINE_VALUES,
+  PERSONA_TTS_INHERIT,
   TTS_GAIN_CLAMP_DB as TTS_GAIN_CLAMP_DB_VALUE,
   TTS_KOKORO_VOICE_RE,
   TTS_POCKET_VOICE_RE,
@@ -54,6 +55,10 @@ import {
   clampTtsSpeed as clampTtsSpeedFn,
 } from '../schemas/persona.js';
 import {
+  LLM_HEADER_NAME_RE,
+  LLM_HEADER_VALUE_MAX,
+  LLM_HEADER_VALUE_RE,
+  LLM_HEADERS_MAX,
   SETTINGS_AAC_BITRATES,
   SETTINGS_LOUDNESS_SOURCES,
   SETTINGS_MP3_BITRATES,
@@ -101,6 +106,9 @@ export const SCRIPT_LENGTHS: readonly string[] = PERSONA_SCRIPT_LENGTHS;
 
 // 'natural' (default) or 'announce' — see PERSONA_LINK_STYLES / announceLinks().
 export const LINK_STYLES: readonly string[] = PERSONA_LINK_STYLES;
+
+// Shared with the browser through the generated schema mirror.
+export { TRANSITION_EFFECTS, type TransitionEffect } from '../schemas/settings.js';
 
 // Per-persona tone dials. Each is 0-10 with 5 (DIAL_NEUTRAL) the default. A
 // model can't distinguish humour=6 from 7, so rather than inject a raw "7/10"
@@ -158,6 +166,12 @@ export function personaToneDirectives(persona: unknown): string {
 // every engine on isAvailable(), so settings can name one whose runtime is
 // absent and it simply falls back to Piper.
 export const TTS_ENGINES: readonly string[] = TTS_ENGINE_VALUES;
+// The persona-only 'inherit' sentinel, re-exported like every other schema
+// constant so no call site has to reach into src/schemas/ directly. The
+// PERSONA_TTS_ENGINES list is deliberately NOT re-exported: nothing outside the
+// schema needs the vocabulary (ttsVoiceSlotSchema's `allowInherit` flag is the
+// only way in), and a re-export with no reader is a name that drifts unnoticed.
+export { PERSONA_TTS_INHERIT };
 
 // DJ-voice level trim, in dB. A per-engine gain levels the loudness gap between
 // TTS engines (only PocketTTS self-normalises today, so it sits quieter than
@@ -475,6 +489,56 @@ export function applyLlmLegPatch(target: Record<string, unknown>, patch: unknown
       target.providerBaseUrls = urls;
     }
   }
+  // Extra request headers for the openai-compatible transport (#1618). A
+  // gateway can require one to route a call at all — OpenCode Zen Go's
+  // `x-opencode-session` is the case this was filed for — and without a
+  // passthrough every call 400s while the station keeps playing, blind.
+  //
+  // Whole-map REPLACE, like tts.corrections and festivals: the admin editor is
+  // a row list and always sends the full edited set, so a merge would make a
+  // deleted row un-deletable. `'set'` is the getRedacted() sentinel and
+  // resolves against the PRE-patch value, which is what lets the redacted map
+  // round-trip through a save without blanking every header.
+  //
+  // Deliberately NOT keyed by provider the way baseUrl is: headers belong to
+  // one server, and there is only ever one openai-compatible slot per leg, so
+  // per-provider keying would buy nothing and leave `headers.anthropic` as a
+  // shape that can never be sent. They follow the leg's inline API key instead
+  // — switching that leg's base URL carries them, exactly as the key does.
+  if (l.headers !== undefined) {
+    if (!l.headers || typeof l.headers !== 'object' || Array.isArray(l.headers)) {
+      throw new Error(`${label}.headers must be an object map of header name -> value`);
+    }
+    const incoming = l.headers as Record<string, unknown>;
+    const existing = (target.headers as Record<string, string> | undefined) ?? {};
+    const next: Record<string, string> = {};
+    for (const rawName of Object.keys(incoming)) {
+      const name = rawName.trim();
+      if (!LLM_HEADER_NAME_RE.test(name)) {
+        throw new Error(`${label}.headers has an invalid header name "${rawName}"`);
+      }
+      const raw = incoming[rawName];
+      if (raw === 'set') {
+        // Redacted on the way out, so the operator's real value is the stored
+        // one — a row they did not retype must survive their save.
+        if (existing[name]) next[name] = existing[name];
+        continue;
+      }
+      const v = String(raw ?? '').trim();
+      if (!v) continue; // an emptied value drops the header, like providerBaseUrls
+      if (v.length > LLM_HEADER_VALUE_MAX) {
+        throw new Error(`${label}.headers.${name} must be 0-${LLM_HEADER_VALUE_MAX} chars`);
+      }
+      if (!LLM_HEADER_VALUE_RE.test(v)) {
+        throw new Error(`${label}.headers.${name} must be printable ASCII on a single line`);
+      }
+      next[name] = v;
+    }
+    if (Object.keys(next).length > LLM_HEADERS_MAX) {
+      throw new Error(`${label}.headers must have at most ${LLM_HEADERS_MAX} entries`);
+    }
+    target.headers = next;
+  }
   if (l.reasoning !== undefined) {
     target.reasoning = !!l.reasoning;
   }
@@ -519,6 +583,26 @@ export function applyInlineKey(llmHost: { keys?: Record<string, string> }, provi
   if (!llmHost.keys || typeof llmHost.keys !== 'object') llmHost.keys = {};
   if (v) llmHost.keys[provider] = v;
   else delete llmHost.keys[provider];
+}
+
+// Lenient load-path reading of a leg's stored `headers` map (#1618). Repairs
+// or drops; never throws, because settings.load() failing means the controller
+// does not boot at all. Same rules as the strict save path above — both import
+// the grammar and the caps from schemas/settings.ts rather than restating them,
+// so a header the admin form accepted cannot be silently dropped on the next
+// cold load. Order is preserved so the editor renders rows as they were saved.
+export function normalizeLlmHeaders(raw: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const rawName of Object.keys(raw as Record<string, unknown>)) {
+    if (Object.keys(out).length >= LLM_HEADERS_MAX) break;
+    const name = rawName.trim();
+    if (!LLM_HEADER_NAME_RE.test(name)) continue;
+    const v = String((raw as Record<string, unknown>)[rawName] ?? '').trim();
+    if (!v || v.length > LLM_HEADER_VALUE_MAX || !LLM_HEADER_VALUE_RE.test(v)) continue;
+    out[name] = v;
+  }
+  return out;
 }
 
 // Build the per-provider inline-key map from a stored settings.llm blob.
@@ -990,8 +1074,14 @@ export interface NormalizedShow {
   vocals: string;
   filtersStrict: boolean;
   maxTrackSeconds: number | null;
+  /** Minimum track length in seconds (#1573). null = inherit the station
+   *  default, 0 = no floor. See settings/persona.effectiveMinTrackSec. */
+  minTrackLengthSeconds: number | null;
   playlistIds: string[];
   playlistStrict: boolean;
+  /** Full rotation (#1612): with playlistStrict on, every track in the anchor
+   *  airs once before any of them repeats. Inert without it. */
+  playlistExhaust: boolean;
   excludedPlaylistIds: string[];
   /** Operator organisation tags. Filters the admin list; steers nothing on
    *  air, which is why resolveShow() does not carry them through. */
@@ -1113,7 +1203,7 @@ export const SEED_PERSONAS = [
     soul: DJ_SOULS[0],
     language: '',
     avatar: '',
-    tts: { engine: 'piper', cloudProvider: 'openai', voice: 'bm_george', gainDb: 0, speed: 1 },
+    tts: { engine: PERSONA_TTS_INHERIT, cloudProvider: 'openai', voice: 'bm_george', gainDb: 0, speed: 1 },
   },
   {
     id: 'p_default1',
@@ -1124,7 +1214,7 @@ export const SEED_PERSONAS = [
     soul: DJ_SOULS[1],
     language: '',
     avatar: '',
-    tts: { engine: 'piper', cloudProvider: 'openai', voice: 'bf_alice', gainDb: 0, speed: 1 },
+    tts: { engine: PERSONA_TTS_INHERIT, cloudProvider: 'openai', voice: 'bf_alice', gainDb: 0, speed: 1 },
   },
   {
     id: 'p_default2',
@@ -1135,7 +1225,7 @@ export const SEED_PERSONAS = [
     soul: DJ_SOULS[3],
     language: '',
     avatar: '',
-    tts: { engine: 'piper', cloudProvider: 'openai', voice: 'bm_daniel', gainDb: 0, speed: 1 },
+    tts: { engine: PERSONA_TTS_INHERIT, cloudProvider: 'openai', voice: 'bm_daniel', gainDb: 0, speed: 1 },
   },
 ];
 

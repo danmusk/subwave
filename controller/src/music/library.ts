@@ -11,10 +11,12 @@
 
 import * as db from './library-db.js';
 import * as blocklist from './blocklist.js';
+import * as sceneVocab from './scene-vocab.js';
 import { resolveEmbeddingDim } from './embeddings.js';
 import { openingKeyFrom, endingKeyFrom } from './mix.js';
 import { DEEP_CUT_DAYS, EMPTY_AIRED_INDEX, type AiredIndex } from './airing.js';
 import { trackKey, type CandidateLike } from './recency.js';
+import { isInstrumental } from './lyric-vocal.js';
 
 let loaded = false;
 
@@ -229,6 +231,18 @@ export function countTagged(): number {
 // Lean whole-library projection for the explicitly requested Show-editor candidate diagnostic.
 export function candidateFilterTracks() {
   return loaded ? db.candidateFilterTracks() : [];
+}
+
+// One library row in the SAME slim shape every pool source hands back — the
+// shape blocklist.matchOf reads, so it carries albumId/artistId and can reach
+// the exact id tiers rather than falling back to (album name, artist). Exists
+// because a caller that resolves a track BY ID still has to run it through the
+// blocklist chokepoint, and get()'s projection carries no ids (and parses the
+// heavy acoustic blobs on the way). null when the track has no library row.
+export function slimById(songId: string): any {
+  if (!loaded || !songId) return null;
+  const t = db.getTrack(songId);
+  return t ? slimTrack(t) : null;
 }
 
 // The album-cooldown exemption facts (#1485 FR 3) — is_compilation +
@@ -641,6 +655,43 @@ export function stats() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Scene vocabulary (#1577)
+// ---------------------------------------------------------------------------
+// The genre tag set as the operator sees it, and the consolidation that merges
+// near-duplicates. Two halves that must happen together and are owned by two
+// modules: the durable RULE (scene-vocab.ts, so the next Navidrome walk lands
+// on the same name) and the in-place REWRITE of the rows already stored
+// (library-db, one transaction). This is where they are paired, so a route
+// cannot do one and forget the other.
+
+// Not a bare re-export: routes reach the library through this module, and the
+// `loaded` guard is the same one every other read here carries — an unopened
+// DB answers "no vocabulary yet", never throws at the route boundary.
+export function scenes(): db.SceneCount[] {
+  if (!loaded) return [];
+  return db.sceneVocabulary();
+}
+
+export interface SceneConsolidation extends db.SceneMergeResult {
+  target: string;
+  /** Alias keys now recorded — what a later walk will rewrite. */
+  recorded: string[];
+}
+
+export async function consolidateScenes(
+  sources: readonly string[],
+  target: string,
+): Promise<SceneConsolidation> {
+  // The rule is recorded FIRST. If the rewrite then fails half way, the
+  // transaction rolls the rows back and the next walk still consolidates them
+  // — the reverse order can leave rewritten rows with no rule, which the next
+  // walk silently undoes.
+  const { target: resolved, recorded } = await sceneVocab.recordMerge(sources, target);
+  const merged = db.mergeScenes(sources, resolved);
+  return { ...merged, target: resolved, recorded };
+}
+
 // Share of text vectors that embed nothing but the artist/title/album label —
 // no Last.fm tags, no lyric excerpt, no measured acoustics — as 0..1, or null
 // when the index is empty/unloaded. On such an index cosine "similarity" ranks
@@ -742,7 +793,7 @@ export function filter(opts: FilterOpts = {}): { total: number; rows: FilteredRo
       musicalKey: r.musicalKey,
       loudnessLufs: r.loudnessLufs,
       paceMean: paceMeanOf(r.pace),
-      instrumental: r.vocalRanges == null ? null : r.vocalRanges.length === 0,
+      instrumental: isInstrumental(r.vocalRanges),
     })),
   };
 }

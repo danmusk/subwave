@@ -1,7 +1,8 @@
 // Admin-gated music-library management surface — backs /admin/library.
 // Browse + filter the tagged index (SQLite library-db), page through
 // untagged tracks, retag a single track inline (through the same bulk
-// pipeline — enrich + embed + LLM tag), and report coverage stats.
+// pipeline — enrich + embed + LLM tag), consolidate the scene (genre tag)
+// vocabulary, and report coverage stats.
 import express from 'express';
 import { requireAdmin } from '../middleware/auth.js';
 import * as library from '../music/library.js';
@@ -11,11 +12,15 @@ import * as db from '../music/library-db.js';
 import * as analyzer from '../music/analyzer.js';
 import * as coverage from '../music/library-coverage.js';
 import * as subsonic from '../music/source.js';
+import * as sceneVocab from '../music/scene-vocab.js';
+import { sceneReferences } from '../music/scene-references.js';
 import * as lastfm from '../music/lastfm.js';
 import * as musicbrainz from '../music/musicbrainz.js';
 import * as settings from '../settings.js';
 import * as embeddings from '../music/embeddings.js';
 import { resolveEraYear } from '../music/show-filter.js';
+import { isInstrumental } from '../music/lyric-vocal.js';
+import { soundKnnWidth } from '../util/similar-tracks.js';
 import { buildGenreSuggest } from '../music/genre-suggest.js';
 import { tagBatch, TAGGER_CONTRACT_VERSION } from '../music/tagger-core.js';
 import { promptVocabHash } from '../music/embeddings.js';
@@ -26,11 +31,12 @@ import { refreshAutoPlaylist } from '../broadcast/scheduler.js';
 import * as mapProjection from '../music/map-projection.js';
 import { validateBody, validateBodyAsync } from '../middleware/validate.js';
 import { blockEntrySchema, blockRuleSchema } from '../schemas/blocklist.js';
-import { manualTagSchema, originalYearSchema } from '../schemas/library.js';
+import { manualTagSchema, originalYearSchema, sceneMergeSchema } from '../schemas/library.js';
 import type { z } from 'zod';
 
 type ManualTagBody = z.output<ReturnType<typeof manualTagSchema>>;
 type OriginalYearBody = z.output<ReturnType<typeof originalYearSchema>>;
+type SceneMergeBody = z.output<ReturnType<typeof sceneMergeSchema>>;
 
 export const router = express.Router();
 
@@ -172,7 +178,7 @@ router.get('/library/liked', requireAdmin, async (req, res) => {
         bpm: rec?.bpm ?? null,
         musicalKey: rec?.musicalKey ?? null,
         loudnessLufs: rec?.loudnessLufs ?? null,
-        instrumental: rec?.vocalRanges == null ? null : rec.vocalRanges.length === 0,
+        instrumental: isInstrumental(rec?.vocalRanges),
         likeCount: entry.count,
         likedByOperator: entry.operator,
         lastLikedAt: entry.lastLikedAt,
@@ -233,7 +239,8 @@ router.get('/library/search-sound', requireAdmin, async (req, res) => {
       });
     }
     // Wide KNN, capped after the archive filter so junk rows don't eat slots.
-    const hits = library.tracksByAudioVector(vecs[0], Math.max(limit * 2, 60));
+    // Same width rule as GET /similar-tracks — shared, not restated.
+    const hits = library.tracksByAudioVector(vecs[0], soundKnnWidth(limit));
     const results = hits
       .filter((t) => !subsonic.isStationArchive(t))
       .slice(0, limit)
@@ -255,7 +262,7 @@ router.get('/library/search-sound', requireAdmin, async (req, res) => {
         bpm: t.bpm ?? null,
         musicalKey: t.musicalKey ?? null,
         loudnessLufs: t.loudnessLufs ?? null,
-        instrumental: t.vocalRanges == null ? null : t.vocalRanges.length === 0,
+        instrumental: isInstrumental(t.vocalRanges),
         similarity: typeof t._similarity === 'number' ? t._similarity : null,
       }));
     res.json({ results: blocklist.annotate(results) });
@@ -300,6 +307,151 @@ router.get('/library/genres/related', requireAdmin, async (_req, res) => {
   try {
     await library.load();
     res.json(buildGenreSuggest());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Scene vocabulary (#1577) — the genre tag set as one curatable list.
+//
+//   GET    /library/scenes                  every distinct value + track count,
+//                                           plus the consolidation rules in force
+//   POST   /library/scenes/references       { from: string[], to } — what would
+//                                           stop matching. A READ; see below.
+//   POST   /library/scenes/merge            { from: string[], to } — retire values
+//   DELETE /library/scenes/aliases/:from    stop applying one rule
+//
+// Counts come from the mirror rather than from Navidrome's own genre index:
+// this list exists to be edited, and every value on it must be one a merge can
+// actually reach. Sorting is the client's — the whole vocabulary is a few
+// hundred rows at worst, and paging a list you are ticking boxes down is worse
+// than sending it.
+//
+// Building that list is a full json_each walk of `tracks` (the shape stats()
+// TTL-caches), so it is a scan whatever the row count is — which is why it is
+// fetched on EXPAND and on a merge, never polled.
+// ---------------------------------------------------------------------------
+
+/** How many orphaned filters the booth log names before it says "and N more".
+ *  The response and the admin panel carry all of them; this bounds one line. */
+const SCENE_REFERENCES_LOGGED = 5;
+
+/** The listing both reads answer with: the vocabulary and the rules over it. */
+function sceneListing() {
+  return { scenes: library.scenes(), aliases: sceneVocab.list() };
+}
+
+router.get('/library/scenes', requireAdmin, async (_req, res) => {
+  try {
+    await library.load();
+    res.json(sceneListing());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// The referenced-by warning (#1593), asked BEFORE the merge. A read, but a
+// POST: the body carries up to SCENE_MERGE_SOURCES_MAX values of up to
+// SCENE_VALUE_MAX characters each — ticking a whole noisy tail is the point of
+// the section — and that does not fit in a request line every proxy in front of
+// the controller will carry.
+//
+// Same body as the merge, and the same call, so the preview and the merge
+// response cannot say different things about the same click.
+router.post(
+  '/library/scenes/references',
+  requireAdmin,
+  validateBody(sceneMergeSchema(), { messages: 'verbatim' }),
+  async (req, res) => {
+    const { from, to } = req.body as SceneMergeBody;
+    try {
+      res.json({ references: await sceneReferences(from, to) });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+router.post(
+  '/library/scenes/merge',
+  requireAdmin,
+  validateBody(sceneMergeSchema(), { messages: 'verbatim' }),
+  async (req, res) => {
+    const { from, to } = req.body as SceneMergeBody;
+    try {
+      await library.load();
+      // Computed BEFORE the rewrite: the target resolves through the rule set
+      // this merge is about to change, so asking afterwards would answer for a
+      // different merge than the one the preview warned about.
+      const references = await sceneReferences(from, to);
+      const result = await library.consolidateScenes(from, to);
+      // Three outcomes, and the log must not flatten them. Rows rewritten is
+      // the ordinary one. No rows but a rule recorded means the listing the
+      // operator ticked is stale (a walk ran, or another admin merged first)
+      // and the fold still applies from the next scan. Neither means the merge
+      // asked for nothing this rule set does not already do — a 200 with zero
+      // counts, not an error, but it must not claim a rule was recorded.
+      queue.log(
+        'info',
+        result.tracksChanged > 0
+          ? `scenes: merged ${result.sources.map(s => `"${s}"`).join(', ')} → "${result.target}" (${result.tracksChanged} track${result.tracksChanged === 1 ? '' : 's'})`
+          : result.recorded.length > 0
+            ? `scenes: nothing to rewrite for "${result.target}" — rule recorded for the next library scan`
+            : `scenes: nothing to do — "${result.target}" already survives every value picked`,
+      );
+      // Named, not counted. The operator confirmed past this warning in the UI;
+      // the point of the booth log is that it is still readable next week, when
+      // the only symptom is a show that airs nothing. Capped so one careless
+      // merge cannot push a whole page of names into the log — the response and
+      // the panel carry the full list.
+      if (references.length) {
+        const named = references
+          .slice(0, SCENE_REFERENCES_LOGGED)
+          .map(r => `${r.kind} "${r.name}" (${r.orphaned.map(v => `"${v}"`).join(', ')})`);
+        const rest = references.length - named.length;
+        queue.log(
+          'warn',
+          `scenes: merging into "${result.target}" retires values still filtered by ${named.join(', ')}${rest > 0 ? ` and ${rest} more` : ''} — repoint them by hand`,
+        );
+      }
+      res.json({
+        ok: true,
+        target: result.target,
+        sources: result.sources,
+        recorded: result.recorded,
+        tracksChanged: result.tracksChanged,
+        vectorsDirtied: result.vectorsDirtied,
+        // Shows / rules / playlists that named a retired value and now match
+        // nothing. A warning, never a block: the merge is what the operator
+        // asked for, and genre matching is one-directional, so the filter
+        // cannot be rewritten without changing what the show means.
+        references,
+        // The refreshed listing rides back on the same response: after a merge
+        // every count on the client is wrong, and a merge is usually one of
+        // several in a sitting.
+        ...sceneListing(),
+      });
+    } catch (err) {
+      queue.log('error', `/library/scenes/merge failed: ${err.message}`);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// Forgetting a rule stops it applying to FUTURE walks; the rows it already
+// rewrote keep the merged value. There is nothing to restore them to — several
+// spellings became one, and which row had which is exactly the information the
+// merge discarded. The UI says this on the button.
+router.delete('/library/scenes/aliases/:from', requireAdmin, async (req, res) => {
+  try {
+    const removed = await sceneVocab.forget(req.params.from);
+    if (!removed) return res.status(404).json({ error: 'no such scene rule' });
+    queue.log('info', `scenes: dropped the rule for "${req.params.from}"`);
+    // Aliases only, deliberately: forgetting a rule rewrites no row, so every
+    // count the client holds is still correct and re-running the scan for it
+    // would be a full table walk for an unchanged answer.
+    res.json({ ok: true, aliases: sceneVocab.list() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -604,13 +756,35 @@ router.get('/library/untagged', requireAdmin, async (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /library/coverage —
 //   { tagged, analysed, total, percent, analysedPercent, scannedAt, scanning }
-// `total` / `percent` / `analysedPercent` are null until the first background
-// scan completes.
+// A cheap read: DB counts plus the LAST-KNOWN Navidrome total, which is null
+// until somebody has asked for a count. It never walks Navidrome by itself —
+// that walk is thousands of getAlbum calls and the admin Library page polls
+// this on mount (#1570). There is deliberately no `?refresh=1` escape hatch:
+// counting is a command, and it lives on the POST below. A GET that can start
+// a walk is exactly the shape something eventually polls by accident, which is
+// the bug this route exists to have fixed.
 // ---------------------------------------------------------------------------
-router.get('/library/coverage', requireAdmin, async (req, res) => {
+router.get('/library/coverage', requireAdmin, async (_req, res) => {
   try {
-    if (req.query?.refresh === '1') coverage.refresh();
     res.json(await coverage.get());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /library/coverage/refresh — count the Navidrome library, on request.
+// The operator's "Count library" button. A command, not a read: it walks every
+// album to total the songs, so it is deliberately a POST rather than a GET the
+// panel could poll by accident. Returns at once with the snapshot the scan is
+// starting from (`scanning: true`), which the caller polls until it flips.
+// ---------------------------------------------------------------------------
+router.post('/library/coverage/refresh', requireAdmin, async (_req, res) => {
+  try {
+    // Fire-and-forget: doScan() swallows its own failure, and a scan of a big
+    // library outlives any sensible request timeout.
+    coverage.refresh();
+    res.json({ ok: true, coverage: await coverage.get() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -710,9 +884,12 @@ router.post('/library/reset', requireAdmin, async (_req, res) => {
   if (tagger.running) return res.status(409).json({ error: 'a tagger/analyzer run is already active', tagger });
   try {
     await library.reset();
-    // The tagged/analysed counts are read live from the DB, so they're already 0
-    // now; kick a coverage refresh so the panel's snapshot reflects it promptly.
-    coverage.refresh();
+    // Deliberately NO coverage.refresh() here. The tagged/analysed counts are
+    // read live from the DB by coverage.get(), so they are already 0 — and the
+    // only thing refresh() recomputes is the Navidrome `total`, which a reset
+    // cannot have changed (it wipes library.db, not the music server). Kicking
+    // it here fired thousands of getAlbum calls for a number that was already
+    // correct, on the one action an operator least expects to hit Navidrome.
     queue.log('warn', 'library reset: wiped all tagging data (tags, embeddings, acoustics, enrichment)');
     res.json({ ok: true });
   } catch (err) {

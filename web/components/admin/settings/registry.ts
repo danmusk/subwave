@@ -10,7 +10,7 @@
 
 import {
   Radio, Palette, Cpu, Mic, Library, Search,
-  Activity, Archive, Save, AlertTriangle, Heart, Music2,
+  Activity, Archive, Save, AlertTriangle, Heart, Music2, BrainCircuit,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
@@ -63,14 +63,27 @@ export const SECTIONS = [
     formKeys: [],
   },
   {
+    // One-field setup for the hosted DJ Brain: writes both `llm` and
+    // `tts.cloud` in a single save, but owns neither slice — the LLM provider
+    // and TTS voice sections keep the dirty tracking for those keys, and this
+    // one holds local state only, so it lists no formKeys.
+    id: 'brain', group: 'the dj', label: 'DJ Brain',
+    hint: 'one field · brain + voice', icon: BrainCircuit,
+    formKeys: [],
+  },
+  {
     id: 'llm', group: 'the dj', label: 'LLM provider',
     hint: 'model routing', icon: Cpu,
-    formKeys: ['llm'],
+    // `picker` rides this section because its two controls (album cooldown,
+    // minimum track length) are edited on this card and saved by the same
+    // PATCH — without it here the section's dirty dot and save bar are blind
+    // to a change the operator just made.
+    formKeys: ['llm', 'picker'],
   },
   {
     id: 'tts', group: 'the dj', label: 'TTS voice',
     hint: 'default engine', icon: Mic,
-    formKeys: ['tts', 'kokoroLang', 'djTalkOnlyBetweenTracks'],
+    formKeys: ['tts', 'kokoroLang', 'djTalkOnlyBetweenTracks', 'handoverOffsetMinutes'],
   },
   {
     id: 'library', group: 'the dj', label: 'Library tagger',
@@ -155,7 +168,7 @@ export const ADVANCED_CARDS: Partial<Record<SectionId, readonly string[]>> = {
   library: ['seed-phase', 'propagation', 'enrichment'],
   likes: ['ai-dj-influence'],
   danger: [
-    'crossfade', 'duck-depth', 'stem-transitions', 'max-track-length', 'dead-air-trim',
+    'crossfade', 'duck-depth', 'stem-transitions', 'dj-transition-effects', 'max-track-length', 'dead-air-trim',
     'loudness-levelling', 'opus-stream', 'flac-stream', 'ogg-metadata',
     'aac-stream', 'stream-mp3-bitrate', 'listener-buffer', 'max-listeners',
     'listener-country',
@@ -231,6 +244,7 @@ export const SETTINGS_INDEX: readonly IndexEntry[] = [
   // ── tts voice ──────────────────────────────────────────────────────────────
   { label: 'DJ speech', section: 'tts', card: 'Station voice', keywords: 'on air music only mute silent' },
   { label: 'Talk placement', section: 'tts', card: 'Station voice', keywords: 'between tracks boundary interrupt over song duck mid-song' },
+  { label: 'Show handover', section: 'tts', card: 'Station voice', keywords: 'sign-off outro handover changeover boundary closing track programme' },
   { label: 'Engine', section: 'tts', card: 'Voice engine', keywords: 'piper kokoro chatterbox pocket-tts cloud remote' },
   { label: 'Voice', section: 'tts', card: 'Voice engine', keywords: 'speaker accent alba amy' },
   { label: 'Voice level (dB)', section: 'tts', card: 'Voice engine', keywords: 'gain trim loudness decibel' },
@@ -297,6 +311,12 @@ export const SETTINGS_INDEX: readonly IndexEntry[] = [
   { label: 'Stem cache', section: 'danger', card: 'Stem transitions', keywords: 'demucs drums bass vocals disk' },
   { label: 'Stem cache budget', section: 'danger', card: 'Stem transitions', keywords: 'gb evict oldest' },
   { label: 'Stem-blend seams', section: 'danger', card: 'Stem transitions', keywords: 'drums carry under intro blend' },
+  { label: 'Sweep', section: 'danger', card: 'DJ transition effects', keywords: 'transition effect filter gear change clash dj mode' },
+  { label: 'Washout', section: 'danger', card: 'DJ transition effects', keywords: 'transition effect echo tail dub exit length cap dj mode' },
+  { label: 'Blend', section: 'danger', card: 'DJ transition effects', keywords: 'transition effect spectral handover locked pair dj mode' },
+  { label: 'Dissolve', section: 'danger', card: 'DJ transition effects', keywords: 'transition effect reverb wash ambient cpu latency catchup stutter dj mode' },
+  { label: 'Chop', section: 'danger', card: 'DJ transition effects', keywords: 'transition effect crossfader cut beat stabs dj mode' },
+  { label: 'Exit loop', section: 'danger', card: 'DJ transition effects', keywords: 'transition effect final bar repeat groove tempo dj mode' },
   { label: 'Maximum track length', section: 'danger', card: 'Max track length', keywords: 'cap cut long tracks seconds' },
   { label: 'Trim silent edges', section: 'danger', card: 'Dead-air trim', keywords: 'silence cue in cue out dead air' },
   { label: 'Shortest gap worth cutting', section: 'danger', card: 'Dead-air trim', keywords: 'min gap ms silence' },

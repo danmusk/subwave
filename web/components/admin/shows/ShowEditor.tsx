@@ -31,6 +31,7 @@ import { fieldAria } from '@/lib/form';
 import { SwitchField, TextField, TextareaField, ToggleGroupField } from '@/lib/form-fields';
 import {
   ANY_SENTINEL,
+  INHERIT_SENTINEL,
   DECADES,
   ENERGY_OPTIONS,
   FILTER_VALUES_MAX,
@@ -43,7 +44,10 @@ import {
   TAG_RE,
   TOPIC_MAX,
   VOCAL_OPTIONS,
+  YEAR_MAX,
+  YEAR_MIN,
   eraLabelOf,
+  resolveEraDraft,
   sameEra,
 } from './types';
 import type { EraWindow, Persona, PlaylistIndexStatus, Show, ShowsFormValues, SkillOption, ThemeOption } from './types';
@@ -59,6 +63,8 @@ const FIELD_LABELS: Record<string, string> = {
   personaId: 'host',
   guestPersonaIds: 'guests',
   maxTrackSeconds: 'track length cap',
+  minTrackLengthSeconds: 'minimum track length',
+  fadeAtShowEnd: 'fade at show end',
   segmentSkill: 'feature skill',
   playlistIds: 'playlists',
   excludedPlaylistIds: 'excluded playlists',
@@ -109,6 +115,10 @@ interface ShowEditorProps {
   apiBase: string;
   adminFetch: (path: string, init?: RequestInit) => Promise<Response>;
   minTrackSeconds?: number;
+  // The station-wide minimum track length a blank field inherits, so the hint
+  // can say what "inherit" actually means today instead of leaving the operator
+  // to open the Settings page to find out.
+  stationMinTrackLengthSeconds?: number;
   busy: boolean;
   isNew: boolean;       // show the AI-draft field only while creating
   valid: boolean;
@@ -123,7 +133,7 @@ interface ShowEditorProps {
 export function ShowEditor({
   show, index, control, trigger, errors, editorRef, personas, moods, themes, skills, activeThemeId, genres, tagSuggestions, playlists,
   playlistsStatus, apiBase,
-  adminFetch, minTrackSeconds, busy, isNew, valid, onApplyDraft,
+  adminFetch, minTrackSeconds, stationMinTrackLengthSeconds, busy, isNew, valid, onApplyDraft,
   onSave, onClose, onRemove,
 }: ShowEditorProps) {
   const uid = useId();
@@ -169,6 +179,8 @@ export function ShowEditor({
   const vocalsCtl = useController({ control, name: path('vocals') });
   const genresCtl = useController({ control, name: path('genres') });
   const maxTrackSecondsCtl = useController({ control, name: path('maxTrackSeconds') });
+  const minTrackLengthSecondsCtl = useController({ control, name: path('minTrackLengthSeconds') });
+  const fadeAtShowEndCtl = useController({ control, name: path('fadeAtShowEnd') });
   const tagsCtl = useController({ control, name: path('tags') });
 
   const candidateKey = JSON.stringify(showPayload(show));
@@ -204,6 +216,33 @@ export function ShowEditor({
   // retyping "trance" once per trance sub-genre. Committing the typed
   // text (Enter/Add) still clears: there the draft *is* the thing consumed.
   const addGenreFromSuggestion = (g: string) => addGenre(g, { keepDraft: true });
+
+  // The custom era range's own text buffers (#1599) — same deal as genreDraft:
+  // remounted per show, not form data. The error is only raised on Add, so
+  // half-typed "20" doesn't scold anyone mid-keystroke.
+  const [eraFrom, setEraFrom] = useState('');
+  const [eraTo, setEraTo] = useState('');
+  const [eraDraftError, setEraDraftError] = useState('');
+  // EVERY write to `eras` goes through here, because every write can falsify
+  // the draft error. That message is a verdict on one Add press against the
+  // array as it stood: untoggle the decade chip a range collided with and
+  // "That range is already selected." is still standing — inside a live
+  // region, over a range that would now add cleanly. Clearing it inside each
+  // handler instead only holds until someone adds a third.
+  const setEras = (next: EraWindow[]) => {
+    erasCtl.field.onChange(next);
+    setEraDraftError('');
+  };
+  const addEraRange = () => {
+    const current: EraWindow[] = erasCtl.field.value ?? [];
+    if (current.length >= FILTER_VALUES_MAX) return;
+    const r = resolveEraDraft(eraFrom, eraTo, current);
+    if ('error' in r) { setEraDraftError(r.error); return; }
+    // A range spelling out a decade lands in the same array the chips write to,
+    // so it lights that chip rather than appearing twice.
+    setEras([...current, r.window]);
+    setEraFrom(''); setEraTo('');
+  };
   // Genres no track carries. The controller resolves free text onto the nearest
   // library tag, silently broadening the show ("Pop Punk" → "Pop") or dropping the
   // filter — invisible on air unless said here. Mirrors show-filter.normGenre so UI
@@ -224,6 +263,15 @@ export function ShowEditor({
 
   const guestIds: string[] = guestsCtl.field.value ?? [];
   const eras: EraWindow[] = erasCtl.field.value ?? [];
+  // Windows matching no decade preset. They get their own removable chips, and
+  // they are the slice of the schema's cap the decade row cannot see — that row
+  // caps on what IT has selected, and 8 chips against a FILTER_VALUES_MAX of 15
+  // never reach it on their own. Handing it the REMAINING budget is required BY
+  // this feature rather than tidying alongside it: before the add-a-range
+  // control, filling `eras` took 15 API-set windows, and now the operator can
+  // fill it right here — at which point an uncapped chip row offers a 16th, the
+  // schema refuses the save, and nothing on screen says why.
+  const customEras = eras.filter(e => !DECADES.some(d => sameEra(e, d)));
 
   // Guests group — a chip/card multi-select has no single labelable element,
   // so it names itself via aria-labelledby/groupProps, same convention as
@@ -236,6 +284,8 @@ export function ShowEditor({
   const vocalsAria = fieldAria(`${uid}-${path('vocals')}`, vocalsCtl.fieldState.error, { hasDescription: true });
   const genresAria = fieldAria(`${uid}-${path('genres')}`, genresCtl.fieldState.error, { hasDescription: true });
   const maxTrackSecondsAria = fieldAria(`${uid}-${path('maxTrackSeconds')}`, maxTrackSecondsCtl.fieldState.error, { hasDescription: true });
+  const minTrackLengthSecondsAria = fieldAria(`${uid}-${path('minTrackLengthSeconds')}`, minTrackLengthSecondsCtl.fieldState.error, { hasDescription: true });
+  const fadeAtShowEndAria = fieldAria(`${uid}-${path('fadeAtShowEnd')}`, fadeAtShowEndCtl.fieldState.error, { hasDescription: true });
   const tagsAria = fieldAria(`${uid}-${path('tags')}`, tagsCtl.fieldState.error, { hasDescription: true });
 
   return (
@@ -473,25 +523,27 @@ export function ShowEditor({
               <ChipRow
                 options={DECADES.map(d => ({ key: d.key, label: d.label }))}
                 selected={DECADES.filter(d => eras.some(e => sameEra(e, d))).map(d => d.key)}
+                cap={FILTER_VALUES_MAX - customEras.length}
                 onToggle={key => {
                   const d = DECADES.find(x => x.key === key)!;
                   const existing = eras.find(e => sameEra(e, d));
-                  erasCtl.field.onChange(
+                  setEras(
                     existing
                       ? eras.filter(e => e !== existing)
                       : [...eras, { fromYear: d.from, toYear: d.to }],
                   );
                 }}
               />
-              {/* Custom windows (set via the API — no preset matches) stay
-                  visible and removable so they can't silently constrain picks. */}
-              {eras.some(e => !DECADES.some(d => sameEra(e, d))) && (
+              {/* Custom windows — the ones below matching no decade preset —
+                  stay visible and removable so they can't silently constrain
+                  picks. Set here or via the API; the display is the same. */}
+              {customEras.length > 0 && (
                 <div className="flex flex-wrap gap-1">
-                  {eras.filter(e => !DECADES.some(d => sameEra(e, d))).map((e, i) => (
+                  {customEras.map((e, i) => (
                     <button
                       key={`${e.fromYear ?? ''}-${e.toYear ?? ''}-${i}`}
                       type="button"
-                      onClick={() => erasCtl.field.onChange(eras.filter(x => x !== e))}
+                      onClick={() => setEras(eras.filter(x => x !== e))}
                       className="min-h-9 border border-ink bg-ink px-2 py-0.5 text-[12px] text-bg sm:min-h-0"
                       title="Remove this custom era window"
                     >
@@ -500,10 +552,54 @@ export function ShowEditor({
                   ))}
                 </div>
               )}
+              {/* Add a range the decade chips can't spell — a single year
+                  ("2026 only"), a span across two decades, or an open end
+                  ("2026 and later"). Both inputs are plain one-offs inside the
+                  group: they carry their own aria-label because the group title
+                  names the whole field, not either box. */}
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <Input
+                  id={`${uid}-show-era-from`}
+                  type="number" inputMode="numeric"
+                  min={YEAR_MIN} max={YEAR_MAX}
+                  aria-label="custom era start year"
+                  className="w-[7.5rem] flex-none"
+                  value={eraFrom}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => { setEraFrom(e.target.value); setEraDraftError(''); }}
+                  onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addEraRange(); } }}
+                  placeholder="from"
+                  disabled={eras.length >= FILTER_VALUES_MAX}
+                />
+                <span aria-hidden="true" className="text-[12px] text-muted">–</span>
+                <Input
+                  id={`${uid}-show-era-to`}
+                  type="number" inputMode="numeric"
+                  min={YEAR_MIN} max={YEAR_MAX}
+                  aria-label="custom era end year"
+                  className="w-[7.5rem] flex-none"
+                  value={eraTo}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => { setEraTo(e.target.value); setEraDraftError(''); }}
+                  onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addEraRange(); } }}
+                  placeholder="to"
+                  disabled={eras.length >= FILTER_VALUES_MAX}
+                />
+                <Btn
+                  className="min-h-9 flex-none sm:min-h-0"
+                  onClick={addEraRange}
+                  disabled={(!eraFrom.trim() && !eraTo.trim()) || eras.length >= FILTER_VALUES_MAX}
+                >
+                  Add range
+                </Btn>
+              </div>
+              {eraDraftError && (
+                <span role="alert" className="field-hint text-vermilion">{eraDraftError}</span>
+              )}
             </div>
             <FieldDescription {...erasAria.descriptionProps}>
               Pick any decades, even non-adjacent ones ({'"'}90s + 2010s{'"'}).
-              None selected = any era.
+              Or add your own range — a single year (2026 to 2026), or one
+              side left blank for an open end. Up to {FILTER_VALUES_MAX}{' '}
+              windows; none selected = any era.
             </FieldDescription>
             <FieldError {...erasAria.errorProps} errors={erasCtl.fieldState.error ? [erasCtl.fieldState.error] : undefined} />
           </Field>
@@ -650,6 +746,20 @@ export function ShowEditor({
             />
           )}
 
+          {/* Offered only behind the strict toggle: without it the show can
+              leave the playlist, so its universe is the library again and
+              "every track once" has no set to be true of. The controller
+              treats the combination as inert rather than invalid — see the
+              playlistExhaust comment in schemas/show.ts. */}
+          {show.playlistIds.length > 0 && show.playlistStrict && (
+            <SwitchField
+              control={control}
+              name={path('playlistExhaust')}
+              label="Play the whole playlist before repeating"
+              description="On: every track in the pinned playlist(s) airs once before any of them comes round again, however long the playlist is. Off: repeats are governed by the station-wide no-repeat window. Add tracks in Navidrome and the rotation widens on the next pick. A playlist too short to rotate falls back to the station window rather than risking a gap."
+            />
+          )}
+
           <Field>
             <PlaylistIdsField
               control={control}
@@ -750,6 +860,72 @@ export function ShowEditor({
               least {minTrackSeconds ?? 30}s to cap it here.
             </FieldDescription>
             <FieldError {...maxTrackSecondsAria.errorProps} errors={maxTrackSecondsCtl.fieldState.error ? [maxTrackSecondsCtl.fieldState.error] : undefined} />
+          </div>
+
+          {/* The cap's twin, and the same Raw Controller reason. Separate field
+              rather than a range input: each side is independently inheritable
+              (blank), and a range control cannot express "floor set, cap
+              inherited". */}
+          <div className="field">
+            <Label {...minTrackLengthSecondsAria.labelProps}>minimum track length (seconds)</Label>
+            <Input
+              {...minTrackLengthSecondsAria.controlProps}
+              type="number"
+              min={0}
+              max={3600}
+              placeholder="inherit"
+              value={minTrackLengthSecondsCtl.field.value ?? ''}
+              onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                const raw = e.target.value.trim();
+                minTrackLengthSecondsCtl.field.onChange(raw === '' ? null : Math.max(0, parseInt(raw, 10) || 0));
+              }}
+              onBlur={minTrackLengthSecondsCtl.field.onBlur}
+              ref={minTrackLengthSecondsCtl.field.ref}
+            />
+            <FieldDescription {...minTrackLengthSecondsAria.descriptionProps}>
+              The shortest a track can be to get picked for this show &mdash; the
+              way to keep 40-second skits, interludes and album intros off air.
+              Unlike the cap above this drops the track from the pool rather than
+              trimming it, so nothing short is ever chosen. Blank uses the
+              station setting{stationMinTrackLengthSeconds
+                ? ` (${stationMinTrackLengthSeconds}s)`
+                : ' (currently off)'}, 0 means no floor, or set at
+              least {minTrackSeconds ?? 30}s to set one here. Listener requests
+              are always exempt.
+            </FieldDescription>
+            <FieldError {...minTrackLengthSecondsAria.errorProps} errors={minTrackLengthSecondsCtl.fieldState.error ? [minTrackLengthSecondsCtl.fieldState.error] : undefined} />
+          </div>
+          {/* Tri-state, so a Switch would be wrong: "inherit" is a real answer
+              and the commonest one, and a two-state control would turn every
+              untouched show into an explicit no. */}
+          <div className="field">
+            <Label {...fadeAtShowEndAria.labelProps}>fade out at the show change</Label>
+            <Select
+              value={fadeAtShowEndCtl.field.value == null ? INHERIT_SENTINEL : String(fadeAtShowEndCtl.field.value)}
+              onValueChange={val => fadeAtShowEndCtl.field.onChange(val === INHERIT_SENTINEL ? null : val === 'true')}
+            >
+              <SelectTrigger {...fadeAtShowEndAria.controlProps} onBlur={fadeAtShowEndCtl.field.onBlur} ref={fadeAtShowEndCtl.field.ref} aria-label="Fade out at the show change">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value={INHERIT_SENTINEL}>Station default</SelectItem>
+                  <SelectItem value="true">Fade at the boundary</SelectItem>
+                  <SelectItem value="false">Let it run over</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <FieldDescription {...fadeAtShowEndAria.descriptionProps}>
+              When this show ends, a track still playing is faded out at the
+              boundary instead of running into the next show. Worth turning on
+              for long-form music (ambient, classical, prog) where one record
+              can outlast the slot; a short overrun is left alone either way.
+              A cut needs both enough music played before the boundary and more
+              than a minute of overrun. A low maximum track length can prevent
+              boundary fading, but tracks starting near the end of the show can
+              still run into the next one.
+            </FieldDescription>
+            <FieldError {...fadeAtShowEndAria.errorProps} errors={fadeAtShowEndCtl.fieldState.error ? [fadeAtShowEndCtl.fieldState.error] : undefined} />
           </div>
         </Card>
       </div>

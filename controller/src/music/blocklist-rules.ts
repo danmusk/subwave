@@ -16,6 +16,12 @@ import {
   trackMoods,
   type FilterTrack,
 } from './show-filter.js';
+// The artist rule reads a credit the way the id list's name fallback does — the
+// whole string AND every act ON it, not just the lead (#1603). Both sides of
+// that comparison have to be folded by the same normaliser, which is why the
+// values compile to their own set below rather than sharing `valueSet`'s
+// normText.
+import { artistNameKey, artistParticipantKeys } from './recency.js';
 // The rule's SHAPE — field vocabulary, caps, the season window and the
 // add/update validator — lives in the shared schema so the admin card runs the
 // same rules. Imported and re-exported here so no call site moved. This module
@@ -109,6 +115,7 @@ export function ruleActive(rule: BlockRule, ctx: RuleContext): boolean {
 export interface CompiledRule {
   rule: BlockRule;
   genreTargets: string[];  // field=genre — normGenre'd, for genreMatches
+  artistKeys: Set<string>; // field=artist — artistNameKey'd, matched per credited act
   valueSet: Set<string>;   // every other field — normText'd exact match
 }
 
@@ -116,6 +123,7 @@ export function compileRules(rules: BlockRule[]): CompiledRule[] {
   return rules.map((rule) => ({
     rule,
     genreTargets: rule.field === 'genre' ? rule.values.map(normGenre).filter(Boolean) : [],
+    artistKeys: rule.field === 'artist' ? new Set(rule.values.map(artistNameKey).filter(Boolean)) : new Set<string>(),
     valueSet: new Set(rule.values.map(normText).filter(Boolean)),
   }));
 }
@@ -137,8 +145,14 @@ export type RuleTrack = FilterTrack & { artist?: string | null; album?: string |
 //            (trackAllTags: genres ∪ moods ∪ audioMoods ∪ Last.fm tags).
 //            Exact, not substring — Last.fm tags are noisy free text.
 //   mood   — normalised exact over trackMoods (editorial + audio union).
-//   artist/album/title — normalised exact on the row's own fields (the id
-//            blocklist's name-fallback semantics, minus the id).
+//   artist — the whole credit, then every act CREDITED on the row, each
+//            matched exact-normalised (recency.artistParticipantKeys —
+//            `feat.`/`ft.`/`featuring` split, nothing else), so blocking X also
+//            blocks "Y feat. X" without stranding a value that is itself a
+//            composite credit. Same semantics as the id blocklist's name
+//            fallback, minus the id; the two must not drift.
+//   album/title — normalised exact on the row's own fields (the id blocklist's
+//            name-fallback semantics, minus the id).
 //   playlist — track id ∈ the pre-resolved member set for any listed playlist
 //            id; an unresolved playlist contributes nothing (stale ids inert).
 export function ruleMatches(
@@ -156,7 +170,13 @@ export function ruleMatches(
     case 'mood':
       return trackMoods(track).some((m) => cr.valueSet.has(normText(m)));
     case 'artist':
-      return !!track.artist && cr.valueSet.has(normText(track.artist));
+      return !!track.artist && (
+        // The WHOLE credit first — the pre-#1603 comparison, kept because a
+        // rule value can itself be a pasted composite ("Host feat. Guest"),
+        // which no participant key can ever equal. See artistNameHit.
+        cr.artistKeys.has(artistNameKey(track.artist))
+        || artistParticipantKeys(track.artist).some((k) => cr.artistKeys.has(k))
+      );
     case 'album':
       return !!track.album && cr.valueSet.has(normText(track.album));
     case 'title': {

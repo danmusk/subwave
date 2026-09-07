@@ -15,7 +15,10 @@ import {
   SHOW_TAG_RE,
   SHOW_TOPIC_MAX,
   SHOW_VOCALS,
+  SHOW_YEAR_MAX,
+  SHOW_YEAR_MIN,
   TAGS_PER_SHOW_LIMIT,
+  validEraYear,
 } from '@/lib/schemas.generated';
 
 export const NAME_MAX = SHOW_NAME_MAX;
@@ -29,6 +32,12 @@ export const EXCLUDED_PLAYLISTS_MAX = EXCLUDED_PLAYLISTS_PER_SHOW;
 export const TAGS_MAX = TAGS_PER_SHOW_LIMIT;
 export const TAG_MAX = SHOW_TAG_MAX;
 export const TAG_RE = SHOW_TAG_RE;
+// The era-window year bounds the schema's own showYear enforces. Re-exported
+// for the <input min/max> and the error copy only — the TEST itself is the
+// schema's own `validEraYear`, imported rather than re-derived from these two,
+// so the Add button can never accept a year the save then refuses.
+export const YEAR_MIN = SHOW_YEAR_MIN;
+export const YEAR_MAX = SHOW_YEAR_MAX;
 
 /** How much the panel knows about the live Navidrome playlist index.
  *
@@ -75,11 +84,24 @@ export interface Show {
    *  0 = unlimited (opt this show out of the cap so it can air long mixes);
    *  >0 = this show's own cap. */
   maxTrackSeconds: number | null;
+  /** Per-show minimum track length (seconds) — the floor that keeps 40-second
+   *  skits, interludes and album intros out of the pick pool (#1573). null =
+   *  inherit the station default; 0 = no floor; >0 = this show's own floor.
+   *  Unlike the cap this is a SELECTION filter: a short track cannot be
+   *  lengthened on air the way a long one is cut. */
+  minTrackLengthSeconds: number | null;
+  /** Fade this show's last track out at the show change instead of letting it
+   *  spill into the next show (#1574). TRI-STATE: null = inherit the station
+   *  default, true/false = this show's own answer. */
+  fadeAtShowEnd: boolean | null;
   /** The union of these playlists becomes the show's candidate pool. Empty = no anchor. */
   playlistIds: string[];
   /** With ≥1 playlist pinned, the playlist is the show's ENTIRE universe;
    *  off-playlist tracks only play as a never-starve fallback. */
   playlistStrict: boolean;
+  /** Every track in the anchor plays once before any of them repeats (#1612).
+   *  Inert without playlistStrict — a soft anchor's universe is the library. */
+  playlistExhaust: boolean;
   /** Excluded from the candidate pool regardless of the other filters. */
   excludedPlaylistIds: string[];
   /** The show airs as a produced episode: intro, a planned feature segment
@@ -112,6 +134,7 @@ export interface CommunityShow {
   programme: boolean;
   segmentSkill: string;
   maxTrackSeconds: number | null;
+  minTrackLengthSeconds: number | null;
   submittedBy?: string;   // GitHub login of the contributor who submitted it
   dateAdded?: string;     // ISO date (YYYY-MM-DD) it first entered the catalog
   dateModified?: string;  // ISO date (YYYY-MM-DD) of the last catalog change
@@ -137,6 +160,10 @@ export const ENERGY_OPTIONS: readonly string[] = SHOW_ENERGY;
 const VOCAL_LABELS: Record<string, string> = { instrumental: 'instrumental', vocal: 'vocals' };
 export const VOCAL_OPTIONS = SHOW_VOCALS.map((key) => ({ key, label: VOCAL_LABELS[key] ?? key }));
 export const ANY_SENTINEL = '__any__';
+// Radix Select refuses an empty string value, and `null` is not a value at
+// all — the tri-state "inherit" needs its own token, exactly as ANY_SENTINEL
+// stands in for ''.
+export const INHERIT_SENTINEL = '__inherit__';
 export const FILTER_VALUES_MAX = SHOW_FILTER_VALUES_MAX;
 
 export function sameEra(a: EraWindow, b: { from: number | null; to: number | null } | EraWindow): boolean {
@@ -144,7 +171,47 @@ export function sameEra(a: EraWindow, b: { from: number | null; to: number | nul
   const bt = 'to' in b ? b.to : b.toYear;
   return a.fromYear === bf && a.toYear === bt;
 }
-/** Preset label ("90s") or the raw window ("1975–1984") for a custom one set via API. */
+/** Resolve the add-a-range inputs into a window to push onto `eras` (#1599).
+ *
+ * Returns a reason rather than throwing: the two inputs sit inside the eras
+ * group, so a bad draft is reported next to the Add button and nothing reaches
+ * the form array. Either bound may be blank — an open-ended "2026+" is a legal
+ * window — but a window with NO bound is the absent state the schema drops,
+ * not a filter. Duplicates are refused rather than appended so that a range
+ * spelling out a decade lights that chip instead of stacking beside it.
+ *
+ * The year test is the schema's own `validEraYear` off the mirror, never a
+ * local re-derivation of it around YEAR_MIN/YEAR_MAX: half the rule restated
+ * is half the rule free to drift. */
+export function resolveEraDraft(
+  from: string,
+  to: string,
+  existing: EraWindow[],
+): { window: EraWindow } | { error: string } {
+  const parse = (raw: string): number | null | undefined => {
+    // The trim is the editor's, not the schema's: a draft box legitimately
+    // holds whitespace mid-keystroke, while `eraYearOf` on the wire reads a
+    // blank-but-not-empty string as malformed rather than as an open end.
+    const v = raw.trim();
+    if (!v) return null;
+    const n = Number(v);
+    return validEraYear(n) ? n : undefined;
+  };
+  const fromYear = parse(from);
+  const toYear = parse(to);
+  if (fromYear === undefined || toYear === undefined) {
+    return { error: `Years must be whole numbers between ${YEAR_MIN} and ${YEAR_MAX}.` };
+  }
+  if (fromYear == null && toYear == null) return { error: 'Enter a start year, an end year, or both.' };
+  if (fromYear != null && toYear != null && fromYear > toYear) {
+    return { error: 'The start year must not be after the end year.' };
+  }
+  const w = { fromYear, toYear };
+  if (existing.some(e => sameEra(e, w))) return { error: 'That range is already selected.' };
+  return { window: w };
+}
+
+/** Preset label ("90s") or the raw window ("1975–1984") for a custom one. */
 export function eraLabelOf(e: EraWindow): string {
   const hit = DECADES.find(d => sameEra(e, d));
   if (hit) return hit.label;
@@ -204,8 +271,12 @@ export interface SettingsResponse {
     shows?: Array<Partial<Show>>;
     schedule?: Schedule;
     personas?: Persona[];
-    /** Crossfade-relative floor for a non-zero per-show cap (server-computed). */
+    /** Crossfade-relative floor for a non-zero per-show cap OR minimum track
+     *  length (server-computed). */
     minTrackSeconds?: number;
+    /** Station-wide picking windows; `minTrackLengthSeconds` is the default a
+     *  show inherits when its own field is null. */
+    picker?: { albumHours?: number; minTrackLengthSeconds?: number };
   };
   tts?: { moods?: string[] };
 }

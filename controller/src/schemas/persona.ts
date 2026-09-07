@@ -127,6 +127,42 @@ export const TTS_ENGINES = [
   'remote',
 ] as const;
 
+/**
+ * "Use whatever the station is set to" — a PERSONA-only engine value.
+ *
+ * Deliberately NOT a member of TTS_ENGINES. That list is also the vocabulary
+ * for `tts.defaultEngine` (which would then be able to inherit from itself),
+ * for the `tts.gainDb` / `tts.speed` per-engine maps (which need a real engine
+ * per key), and for the station rescue slot `tts.fallback` (where "inherit"
+ * names the rung BELOW it in the chain and so means nothing). It is admitted
+ * only where a slot genuinely sits under a station default — see
+ * ttsVoiceSlotSchema's `allowInherit`.
+ */
+export const PERSONA_TTS_INHERIT = 'inherit';
+
+/** The engine vocabulary a PERSONA slot accepts: inherit, then the real ones. */
+export const PERSONA_TTS_ENGINES = [PERSONA_TTS_INHERIT, ...TTS_ENGINES] as const;
+
+/**
+ * The engines that share ONE voice id-space, and so the only ones a voice on an
+ * INHERIT slot may carry to.
+ *
+ * Piper and Kokoro alone: the strict schema deliberately accepts a Kokoro-shaped
+ * id under piper (the seed roster carries one per persona so switching to Kokoro
+ * yields distinct voices with no editing, #454), and `piper.resolvePiperVoice()`
+ * falls back gracefully for one it cannot find. Every other engine reads the
+ * field as something else entirely — chatterbox and pocket-tts as a reference
+ * `.wav` filename or a built-in id, `cloud` and `remote` as provider-specific
+ * names — so a voice chosen WITHOUT knowing the engine cannot be trusted to
+ * them. They take their voice from the station block, or from their own
+ * default when the station names none.
+ *
+ * Getting this wrong is not cosmetic: "bm_george" under chatterbox resolves to
+ * a reference WAV that does not exist and fails the synth on every line, and
+ * under a cloud provider it is a 400 or a silent substitution.
+ */
+export const TTS_INHERITABLE_VOICE_ENGINES = ['piper', 'kokoro'] as const;
+
 export const TTS_CLOUD_PROVIDERS = [
   'openai',
   'elevenlabs',
@@ -199,7 +235,9 @@ export interface TtsVoiceSlot {
  * never opted into. A transform reports exactly the first failure the
  * hand-rolled validator reported, in the same order.
  */
-export function ttsVoiceSlotSchema(where: string) {
+export function ttsVoiceSlotSchema(where: string, opts?: { allowInherit?: boolean }) {
+  const allowInherit = opts?.allowInherit === true;
+  const engines: readonly string[] = allowInherit ? PERSONA_TTS_ENGINES : TTS_ENGINES;
   // `.optional()` so an ABSENT block reaches the transform and is refused by the
   // engine rule below ("tts.engine must be one of: …") rather than by zod's
   // generic 'expected nonoptional' — the hand-rolled validator's `raw || {}`
@@ -210,10 +248,10 @@ export function ttsVoiceSlotSchema(where: string) {
     const t = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
 
     const engine = t.engine as string;
-    if (!(TTS_ENGINES as readonly string[]).includes(engine)) {
+    if (!engines.includes(engine)) {
       ctx.addIssue({
         code: 'custom',
-        message: `${where}.engine must be one of: ${TTS_ENGINES.join(', ')}`,
+        message: `${where}.engine must be one of: ${engines.join(', ')}`,
       });
       return z.NEVER;
     }
@@ -265,8 +303,12 @@ export function ttsVoiceSlotSchema(where: string) {
       } else if (voice.length < 1 || voice.length > TTS_VOICE_MAX) {
         return fail(`${where}.voice must be 1-${TTS_VOICE_MAX} chars`);
       }
-    } else if (engine === 'remote') {
-      // Server-specific — the sidecar interprets them. Empty is valid.
+    } else if (engine === 'remote' || engine === PERSONA_TTS_INHERIT) {
+      // remote: server-specific ids the sidecar interprets. inherit: no engine
+      // is known at validation time, so no per-engine rule CAN apply —
+      // resolvePersonaVoiceSlot() decides at speak time whether the id survives
+      // the resolved engine. Both leave only the shared length cap, and empty
+      // is valid for both.
       if (voice.length > TTS_VOICE_MAX) {
         return fail(`${where}.voice must be 0-${TTS_VOICE_MAX} chars`);
       }
@@ -303,9 +345,14 @@ export function ttsVoiceSlotSchema(where: string) {
  * output is therefore always schema-valid, which is what lets the load path run
  * the real schema after repairing rather than maintaining a second set of rules.
  */
-export function repairTtsVoiceSlot(raw: unknown): TtsVoiceSlot {
+export function repairTtsVoiceSlot(raw: unknown, opts?: { allowInherit?: boolean }): TtsVoiceSlot {
   const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const engine = (TTS_ENGINES as readonly string[]).includes(r.engine as string)
+  const engines: readonly string[] = opts?.allowInherit === true ? PERSONA_TTS_ENGINES : TTS_ENGINES;
+  // 'piper' and not PERSONA_TTS_INHERIT: an unreadable engine on a persona
+  // written before this value existed must land on the behaviour it had, and
+  // that behaviour was the piper floor — never a value that re-points the
+  // persona at whatever the station is set to today.
+  const engine = engines.includes(r.engine as string)
     ? (r.engine as string)
     : 'piper';
   const cloudProvider = (TTS_CLOUD_PROVIDERS as readonly string[]).includes(
@@ -339,12 +386,20 @@ export function repairTtsVoiceSlot(raw: unknown): TtsVoiceSlot {
     voice = '';
   }
   if (!voice && engine === 'cloud' && cloudProvider !== 'openai-compatible') voice = 'alloy';
+  // The kokoro floor. PERSONA_TTS_INHERIT is excluded alongside the engines that
+  // read empty as "your own default": an inherit slot has no engine yet, so
+  // there is no id-space to pick a floor FROM, and stamping a Kokoro id here
+  // would hand "bf_isabella" to whatever the station is set to — the same
+  // wrong-id-space failure resolvePersonaVoiceSlot() exists to prevent, and it
+  // would silently overwrite the empty voice every community install is created
+  // with (routes/personas.ts).
   if (
     !voice &&
     engine !== 'cloud' &&
     engine !== 'chatterbox' &&
     engine !== 'piper' &&
-    engine !== 'remote'
+    engine !== 'remote' &&
+    engine !== PERSONA_TTS_INHERIT
   ) {
     voice = 'bf_isabella';
   }
@@ -535,7 +590,7 @@ export const personaSchema = z
         .optional()
         .transform((v) => v ?? ''),
     ),
-    tts: ttsVoiceSlotSchema('tts'),
+    tts: ttsVoiceSlotSchema('tts', { allowInherit: true }),
     // skills — absent → null ("all skills", the legacy default). Present → an
     // explicit slug array.
     skills: z.preprocess(
@@ -650,7 +705,7 @@ export function repairPersonaForLoad(
       typeof raw.avatar === 'string' && PERSONA_AVATAR_FILENAME_RE.test(raw.avatar.trim())
         ? raw.avatar.trim()
         : undefined,
-    tts: repairTtsVoiceSlot(raw.tts),
+    tts: repairTtsVoiceSlot(raw.tts, { allowInherit: true }),
     // Non-array → undefined → the schema's null default ("all skills"), which is
     // what normalizeSkills returned. Renames are applied HERE and not in the
     // schema: a rename is a migration of stored data, not a rule a submitted
@@ -753,5 +808,123 @@ export function repairDjPromptForLoad(
     ...raw,
     id: typeof raw.id === 'string' && PERSONA_ID_RE.test(raw.id) ? raw.id : undefined,
     name,
+  };
+}
+
+/**
+ * Personas that will NOT speak through the station voice described by
+ * `{engine, provider}` — the list the admin DJ Brain section warns about before
+ * it wires the cloud voice, and the list its one-click fix patches to 'inherit'.
+ *
+ * A persona already on `inherit` is never listed: it follows the station by
+ * definition, which is exactly what the fix would set it to.
+ *
+ * `provider` matters because "pins cloud" is not the same as "pins THIS cloud".
+ * The four cloud providers share one dispatcher but are independent targets: a
+ * persona pinned to cloud/openai speaks through OpenAI, not through the
+ * openai-compatible DJ Brain the operator just wired, and reporting it as
+ * already-following was how the warning could say "nothing outstanding" about a
+ * roster that still could not reach the voice being paid for. Omit `provider`
+ * to compare on engine alone.
+ */
+export function personasPinningOtherEngine(
+  personas:
+    | Array<{
+        id?: unknown;
+        name?: unknown;
+        tts?: { engine?: unknown; cloudProvider?: unknown } | null;
+      }>
+    | null
+    | undefined,
+  engine: string,
+  provider?: string,
+): Array<{ id: string; name: string; engine: string }> {
+  if (!Array.isArray(personas)) return [];
+  return personas
+    .filter((p) => {
+      const e = p?.tts?.engine;
+      if (typeof e !== 'string' || e === PERSONA_TTS_INHERIT) return false;
+      if (e !== engine) return true;
+      // Same engine — only a cloud slot can still miss, and only when the
+      // caller named the provider it means.
+      if (e !== 'cloud' || !provider) return false;
+      return p?.tts?.cloudProvider !== provider;
+    })
+    .map((p) => {
+      const e = String(p.tts?.engine ?? '');
+      const cp = p.tts?.cloudProvider;
+      return {
+        id: String(p.id ?? ''),
+        name: String(p.name ?? p.id ?? ''),
+        // A cloud pin is only meaningful with its provider — "cloud" alone
+        // reads as "already on the cloud voice", which is the confusion.
+        engine: e === 'cloud' && typeof cp === 'string' && cp ? `${e} / ${cp}` : e,
+      };
+    });
+}
+
+/** The slice of `settings.tts` the resolution depends on. */
+export interface StationVoiceDefaults {
+  /** settings.tts.defaultEngine — the engine an inherit slot resolves to. */
+  defaultEngine?: unknown;
+  /** settings.tts.cloud — provider + voice used when that engine is 'cloud'. */
+  cloud?: { provider?: unknown; voice?: unknown } | null;
+}
+
+const CARRIES_VOICE: readonly string[] = TTS_INHERITABLE_VOICE_ENGINES;
+
+/**
+ * Resolve a persona voice slot against the station defaults.
+ *
+ * Returns the slot unchanged unless its engine is the inherit sentinel. Null in
+ * (the global-voice kinds, which deliberately carry no persona) is null out, so
+ * callers can hand this whatever djPersonaTts() gave them.
+ */
+export function resolvePersonaVoiceSlot(
+  slot: Partial<TtsVoiceSlot> | null | undefined,
+  station: StationVoiceDefaults | null | undefined,
+): TtsVoiceSlot | null | undefined {
+  if (!slot) return slot as null | undefined;
+  if (slot.engine !== PERSONA_TTS_INHERIT) return slot as TtsVoiceSlot;
+
+  // The station default is the whole point of the sentinel; 'piper' is the same
+  // floor settings.load() coerces an unreadable defaultEngine to, so a broken
+  // settings file resolves to the universal engine rather than to nothing.
+  const engine =
+    typeof station?.defaultEngine === 'string' && station.defaultEngine
+      ? station.defaultEngine
+      : 'piper';
+
+  // gainDb and speed are per-persona dials, not per-engine ones — they survive
+  // the resolution untouched whatever speaks.
+  const gainDb = typeof slot.gainDb === 'number' ? slot.gainDb : 0;
+  const speed = typeof slot.speed === 'number' ? slot.speed : 1;
+
+  if (engine === 'cloud') {
+    const cloud = station?.cloud || {};
+    return {
+      engine,
+      // The station's provider AND the station's voice: an inherit slot has
+      // never named a cloud provider, and its voice belongs to another
+      // id-space. Both come from the block the operator configured together.
+      cloudProvider: typeof cloud.provider === 'string' && cloud.provider ? cloud.provider : 'openai',
+      voice: typeof cloud.voice === 'string' ? cloud.voice : '',
+      gainDb,
+      speed,
+    };
+  }
+
+  return {
+    engine,
+    // Carried through so a later reroute onto `cloud` (the rescue chain's
+    // configured rung) still has a provider to check keys against; it is read
+    // only while the engine IS cloud, which this branch is not.
+    cloudProvider:
+      typeof slot.cloudProvider === 'string' && slot.cloudProvider ? slot.cloudProvider : 'openai',
+    // Only piper/kokoro share the seed roster's id-space, so only they keep the
+    // persona voice. Everywhere else '' is the engine's own default.
+    voice: CARRIES_VOICE.includes(engine) && typeof slot.voice === 'string' ? slot.voice : '',
+    gainDb,
+    speed,
   };
 }

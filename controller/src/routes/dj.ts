@@ -14,6 +14,7 @@ import * as dj from '../llm/dj.js';
 import * as subsonic from '../music/source.js';
 import { liveTransport } from '../broadcast/queue/transport.js';
 import * as library from '../music/library.js';
+import { isInstrumental } from '../music/lyric-vocal.js';
 import * as settings from '../settings.js';
 import { runStationId, runHourlyCheck, runLink, runBanter, runProgrammeIntro, runProgrammeFeature, runProgrammeOutro, refreshAutoPlaylist, syncSkillCrons } from '../broadcast/scheduler.js';
 import { skillCatalog, runCapability, effectiveContextFields } from '../skills/_agent.js';
@@ -932,7 +933,7 @@ function toAdminRow(s: AdminSong) {
     loudnessLufs: tag?.loudnessLufs ?? null,
     paceMean: tag?.paceMean ?? null,
     // Same derivation as /library/browse: [] = analysed, no vocals detected.
-    instrumental: tag?.vocalRanges == null ? null : tag.vocalRanges.length === 0,
+    instrumental: isInstrumental(tag?.vocalRanges),
     // Which never-play entry keeps this row off the air, or null. /dj/search
     // returns blocked rows on purpose (the operator has to be able to find one
     // to review it) — this is what tells them apart on screen.

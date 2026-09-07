@@ -1,3 +1,5 @@
+import { trackLengthSeconds } from './track-floor.js';
+
 export const DEFAULT_TRACK_RECENCY_HOURS = 12;
 export const DEFAULT_ARTIST_RECENCY_HOURS = 2;
 const DIVERSE_LIBRARY_ARTISTS = 48;
@@ -98,9 +100,14 @@ interface CandidateFilterState {
 // unknown. Zero/negative/non-finite all read as unknown — we only ever act on a
 // positive, trustworthy duration (the hour-long album mixes #447 targets report
 // one reliably).
+//
+// Delegates to music/track-floor.ts rather than restating the rule: the track
+// length CAP reads this and the FLOOR reads that, and two copies answering
+// "how long is this track?" differently is exactly the drift #1573 warns about.
+// track-floor.ts is itself pure and import-free, so this module stays free of
+// every library / settings / mixer concern.
 export function durationSeconds(song: CandidateLike): number | null {
-  const d = song?.duration ?? song?.durationSec;
-  return Number.isFinite(d) && (d as number) > 0 ? Number(d) : null;
+  return trackLengthSeconds(song);
 }
 
 export function artistKey(song: CandidateLike): string {
@@ -139,6 +146,36 @@ const ARTIST_ROOT_ALIASES = new Map<string, string>([
   ['bill evans trio', 'bill evans'],
 ]);
 
+// The fold under every free-text NAME comparison — an artist credit, an album
+// title, anything an operator typed against something a ripper tagged: case,
+// curly-vs-straight apostrophes ("Guns N’ Roses" and "Guns N' Roses" are one
+// act, tagged either way depending on which ripper wrote the file) and runs of
+// whitespace. Nothing here changes which thing a string names, which is what
+// makes it safe in front of an ABSOLUTE list.
+//
+// Exported because the blocklist keys BOTH sides of every name match with it —
+// a stored entry name and an incoming row — across its artist tier (#1603) and
+// its album tier (#1611). A normaliser copied into the consumer is how a stored
+// value stops matching the value that stored it, so there is one of these.
+//
+// Deliberately NOT the rest of artistRootKey's folding (article strip, root
+// aliases, join split): that widens a MATCHING key, which is right for a
+// preference the repeat guard reads as "pick someone else" and wrong for a hard
+// drop with no never-starve behind it.
+//
+// `schemas/blocklist.ts` normText RESTATES this fold rather than importing it —
+// a mirrored schema module may import only zod — so the two are pinned in step
+// by scripts/blocklist-name-fold.test.ts. Change one, change both.
+export function nameKey(raw: unknown): string {
+  return String(raw ?? '').toLowerCase().replace(APOSTROPHES, "'").replace(/\s+/g, ' ').trim();
+}
+
+// The artist-facing name for the same fold, kept because every artist call site
+// and every comment about them says `artistNameKey`. One function, two names:
+// an album title is not an artist, and a site keying one through a helper named
+// for the other is what invites a well-meaning local copy back in.
+export const artistNameKey = nameKey;
+
 // The LEAD artist of a credit — `artistKey` collapsed onto its primary act, so
 // a collaboration shares a key with the artist who leads it (#1251):
 //
@@ -170,7 +207,7 @@ const ARTIST_ROOT_ALIASES = new Map<string, string>([
 // queue.recentlyPlayed builds from raw tag text. This is a MATCHING key.
 export function artistRootKey(song: CandidateLike | string): string {
   const raw = typeof song === 'string' ? song : (song?.artist || '');
-  const base = raw.toLowerCase().replace(APOSTROPHES, "'").replace(/\s+/g, ' ').trim();
+  const base = artistNameKey(raw);
   if (!base) return '';
 
   let root = base;
@@ -192,6 +229,74 @@ export function artistRootKey(song: CandidateLike | string): string {
   root = ARTIST_ROOT_ALIASES.get(root) ?? root;
 
   return root || base;
+}
+
+// Every act CREDITED on a track, in credit order — the opposite question to
+// artistRootKey, which asks who LEADS the credit:
+//
+//   "Kanye West (feat. Jay-Z)"  → ["kanye west", "jay-z"]
+//   "Drake ft. Rihanna"         → ["drake", "rihanna"]
+//   "Simon & Garfunkel"         → ["simon & garfunkel"]
+//   "Earth, Wind & Fire"        → ["earth, wind & fire"]
+//
+// Written for the blocklist (#1603): blocking an artist has to reach the tracks
+// they only GUEST on, and the id tiers can't — a Subsonic song carries one
+// `artistId`, the track's lead, and `tracks.artist_id` stores that same single
+// id. There is no participant list anywhere in the library to consult, so the
+// display credit is the only source there is.
+//
+// FEATURE_SPLIT is the whole of what gets split, and that is a deliberate stop
+// rather than a first cut. `&`, `+`, `,` and `x` all sit INSIDE act names far
+// more often than they join two credits — Simon & Garfunkel, Hall & Oates,
+// Florence + the Machine, Earth, Wind & Fire, Tyler, the Creator, Chase & Status
+// — and the caller is the blocklist, which is ABSOLUTE: no never-starve
+// anywhere, listener requests included. A wrong key there silently removes music
+// the operator never blocked, with no starvation fallback to make the loss
+// visible. `feat.`/`ft.`/`featuring` carry no such ambiguity (see FEATURE_SPLIT:
+// always a credit on someone else's track, never part of a name), so they are
+// the only marker that can be split without guessing.
+//
+// The cost is honest under-matching: "Y feat. A & B" keys as ["y", "a & b"], so
+// a block on A alone does not fire. Splitting that tail needs exactly the
+// name-vs-credit judgement the join is refused for, and the tail is where the
+// ambiguous punctuation actually lives.
+//
+// A marker at index 0 is not a marker: `\bft\b\.?\s+` matches the front of
+// "Ft. Lauderdale …", and dropping that head would leave a key naming nobody.
+// Same guard artistRootKey applies, for the same reason. The lead segment is
+// also the one segment the bracket cleanup must not touch: "Sunn O)))" is an
+// act, not a credit with an orphaned closer.
+//
+// Deliberately NOT artistRootKey's normalisation beyond the shared name fold —
+// no article strip, no root aliases, no join split. Those widen a MATCHING key,
+// which is right for a preference (the repeat guard reads an over-match as "pick
+// someone else") and wrong for a hard drop.
+// The split eats the OPENING bracket of a "(feat. …)" credit, so its closing
+// half is left orphaned on the tail. Drops ONE such closer, and only when the
+// segment has more closers than openers — a greedy run, applied to every
+// segment, ate real names instead: "Sunn O))) feat. Someone" keyed its lead
+// "sunn o" and silently missed a block the operator did make, and a balanced
+// suffix ("Y (Live)") lost the bracket it came with. Nested brackets are not
+// balanced properly here; nothing downstream needs them to be.
+function dropOrphanCloser(part: string): string {
+  const closes = (part.match(/[)\]]/g) || []).length;
+  if (!closes || closes <= (part.match(/[([]/g) || []).length) return part;
+  return part.replace(/[)\]](\s*)$/, '$1');
+}
+
+export function artistParticipantKeys(song: CandidateLike | string): string[] {
+  const raw = typeof song === 'string' ? song : (song?.artist || '');
+  const base = artistNameKey(raw);
+  if (!base) return [];
+  if (base.search(FEATURE_SPLIT) <= 0) return [base];
+
+  const out: string[] = [];
+  const parts = base.split(FEATURE_SPLIT);
+  for (let i = 0; i < parts.length; i++) {
+    const key = (i > 0 ? dropOrphanCloser(parts[i]!) : parts[i]!).trim();
+    if (key && !out.includes(key)) out.push(key);
+  }
+  return out.length ? out : [base];
 }
 
 export function trackKey(song: CandidateLike): string {
@@ -254,8 +359,7 @@ export function albumCooldownExempt(song: CandidateLike): boolean {
 // nobody asked for.
 export function albumKey(song: CandidateLike): string {
   if (!song || albumCooldownExempt(song)) return '';
-  const album = String(song.album || '')
-    .toLowerCase().replace(APOSTROPHES, "'").replace(/\s+/g, ' ').trim();
+  const album = nameKey(song.album);
   if (!album) return '';
   const artist = artistRootKey({ artist: song.albumArtist || song.artist });
   if (!artist) return '';
@@ -323,6 +427,35 @@ export function effectiveNoRepeatWindow(
   return eff < NO_REPEAT_MIN_EFFECTIVE ? 0 : eff;
 }
 
+// Headroom the EXHAUSTIVE window leaves under the rotation it governs, and both
+// slots it reserves are load-bearing:
+//   * queue.recentlyPlayedByCount(n) blocks the ON-AIR track on top of the n
+//     ended plays it counts — `current` is appended to the recent-plays sidecar
+//     when it ENDS, so a window of n withholds n+1 identities, not n;
+//   * one identity has to survive it. The count-based guard is checked OUTSIDE
+//     the starvation cascade, so a window that withholds the whole rotation is
+//     an empty pool, and an empty pool is the LLM pick skipped.
+// A rotation of S identities therefore takes S-2: S-1 withheld, exactly one
+// left — the one that has waited longest — and the repeat lands on pick S+1.
+const EXHAUSTIVE_WINDOW_HEADROOM = 2;
+
+// The window that makes a rotation exhaust ITSELF: every identity in the
+// universe airs once before any of them airs again (#1612).
+//
+// Deliberately free of effectiveNoRepeatWindow's library-fraction ceiling and
+// minimum-effective floor. Both of those exist to stop a number the operator
+// TYPED from swallowing a catalogue it was never measured against; this number
+// is derived from the universe it governs, so clamping it to 37.5% of that same
+// universe would only ever mean "don't do the thing you were asked to do".
+//
+// A universe too small to leave the headroom returns 0 — the guard switches off
+// and the relaxable recency cascade carries the rotation, exactly as today.
+// That IS the never-starve: a rotation is not worth dead air.
+export function exhaustiveNoRepeatWindow(universeSize: number | null | undefined): number {
+  const total = Math.floor(Number(universeSize) || 0);
+  return Math.max(0, total - EXHAUSTIVE_WINDOW_HEADROOM);
+}
+
 export function filterPickerCandidates<T extends CandidateLike>(
   list: T[],
   {
@@ -341,10 +474,17 @@ export function filterPickerCandidates<T extends CandidateLike>(
     blockedArtists = new Set<string>(),
   }: CandidateFilterState = {},
 ): T[] {
-  // Track length is NOT a selection criterion: max-track-length (issue #447) is
-  // enforced as an on-air cue_out cut, so an over-length track stays eligible
-  // and simply crossfades out at the cap. Filtering it here would only starve
-  // the pool — e.g. a 60s cap leaving nothing but short skits/interludes.
+  // The track-length CAP is NOT a selection criterion: max-track-length (issue
+  // #447) is enforced as an on-air cue_out cut, so an over-length track stays
+  // eligible and simply crossfades out at the cap. Filtering it here would only
+  // starve the pool — e.g. a 60s cap leaving nothing but short skits/interludes.
+  //
+  // The FLOOR is the opposite case and is enforced (#1573), but NOT here: a
+  // short track cannot be lengthened, so it has to leave the pool — and the
+  // posture differs per pick path (hard in the agent's tools, never-starve in
+  // the pool picker and the coast), which is a decision this filter has no way
+  // to make. It lives in music/track-floor.ts and is applied by each call site
+  // just before this one. Don't fold it in here.
   const pool = list || [];
 
   // Relaxation cascade: each mode drops a guard so a starved pool still yields

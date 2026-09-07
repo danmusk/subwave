@@ -13,8 +13,8 @@
 //
 // WHY A FACTORY. Unlike webhooks and stations, a show cannot be validated
 // against itself: `personaId` must name a real persona, `moods` a live mood,
-// `themeId` an installed theme, and `maxTrackSeconds` clears a crossfade-derived
-// floor. Those four travel as ONE ShowSchemaContext value rather than separate
+// `themeId` an installed theme, and the two track-length fields clear a
+// crossfade-derived floor. Those four travel as ONE ShowSchemaContext value rather than separate
 // arguments — the same "one scope value, never unpacked" rule PickerScope
 // follows. Both sides can build it; the admin panel already fetches personas,
 // moods, themes and the station settings.
@@ -56,6 +56,15 @@ export const SHOW_YEAR_MAX = 2100;
 // from here, because the strict show validator has always bounds-checked a
 // show's override against the station figure and two copies would drift.
 export const SHOW_MAX_TRACK_SECONDS = 36000;
+// Ceiling on the per-show minimum-track-length FLOOR (#1573). Deliberately far
+// below SHOW_MAX_TRACK_SECONDS: a cap of ten hours is a harmless "no cap", but a
+// FLOOR of ten hours is a show that can never pick anything, and the pick paths
+// would spend every pool build discovering that. An hour is already past every
+// real answer (the field exists to skip 40-second skits and interludes).
+// Twinned with schemas/settings.ts's PICKER_MIN_TRACK_LENGTH_BOUNDS.max, which
+// bounds the STATION-wide default — a mirrored module may import only zod, so
+// the two are separate declarations of one number and must move together.
+export const SHOW_MIN_TRACK_LENGTH_MAX = 3600;
 
 export const SHOW_ENERGY = ['low', 'medium', 'high'] as const;
 export const SHOW_VOCALS = ['instrumental', 'vocal'] as const;
@@ -76,7 +85,8 @@ export type EraWindow = { fromYear: number | null; toYear: number | null };
  *     strip an operator's own moods. A stale mood just matches nothing on air.
  *   - `themeIds: null` — load has no theme registry to consult. A stale id is
  *     harmless: GET /themes falls back to the station default at serve time.
- *   - `minTrackSeconds: null` — the crossfade-derived floor. Load clamps to the
+ *   - `minTrackSeconds: null` — the crossfade-derived floor, the lower bound on
+ *     BOTH `maxTrackSeconds` and `minTrackLengthSeconds`. Load clamps to the
  *     hard bounds instead of enforcing it.
  *
  * `personaIds` is NOT nullable: a show whose host does not exist has no owner
@@ -150,8 +160,15 @@ function showStringList(opts: {
 // the load path's repairEraWindow (below) so the two can never disagree about
 // what a valid year is. null / '' means "open end". A numeric string is
 // accepted because that is what an <input type="number"> posts.
+//
+// `validEraYear` is EXPORTED so it rides the mirror into the admin show
+// editor's add-a-range control (#1599), which has to refuse a year the save
+// would then reject. It owns only the integer-and-range test; the editor keeps
+// its own trim, because eraYearOf deliberately does not trim (' ' reaching the
+// wire is a malformed post, not an open end) and a draft box legitimately holds
+// whitespace mid-keystroke.
 const eraYearOf = (v: unknown): number | null => (v == null || v === '' ? null : Number(v));
-const validEraYear = (n: number | null): boolean =>
+export const validEraYear = (n: number | null): boolean =>
   n == null || (Number.isInteger(n) && n >= SHOW_YEAR_MIN && n <= SHOW_YEAR_MAX);
 
 const showYear = z
@@ -406,6 +423,42 @@ function showObjectSchema(ctx: ShowSchemaContext) {
           (n) => n == null || n === 0 || ctx.minTrackSeconds == null || n >= ctx.minTrackSeconds,
           `must be 0 (inherit/unlimited) or at least the station's minimum track length`,
         ),
+      // Minimum track length (#1573) — the FLOOR, the twin of the cap above.
+      // null = inherit the station default (picker.minTrackLengthSeconds),
+      // 0 = no floor, >0 = this show's own floor in seconds.
+      //
+      // Unlike the cap, this one is a SELECTION filter: a 40-second interlude
+      // cannot be lengthened on air the way an over-long mix can be cut, so it
+      // has to be kept out of the pool rather than trimmed at the seam.
+      //
+      // It carries the SAME crossfade-derived lower bound as the cap, and for
+      // the same reason: a track shorter than 2x the crossfade has no solo
+      // airtime at all, so the smallest floor worth expressing is the one the
+      // mixer already imposes. 0 (inherit/off) always stays allowed, so a
+      // station that never touches the field is byte-identical to today.
+      minTrackLengthSeconds: z
+        .union([z.null(), z.literal(''), z.number(), z.string()])
+        .optional()
+        .transform((v) => (v == null || v === '' ? null : Number(v)))
+        .refine(
+          (n) =>
+            n == null ||
+            (Number.isInteger(n) && n >= 0 && n <= SHOW_MIN_TRACK_LENGTH_MAX),
+          `must be an integer between 0 and ${SHOW_MIN_TRACK_LENGTH_MAX}`,
+        )
+        .refine(
+          (n) => n == null || n === 0 || ctx.minTrackSeconds == null || n >= ctx.minTrackSeconds,
+          `must be 0 (inherit/no floor) or at least the station's minimum track length`,
+        ),
+      // Show-boundary fade (#1574). TRI-STATE, exactly like maxTrackSeconds
+      // above: null = inherit the station default, true/false = this show's own
+      // answer. A plain showBool() would read an untouched show as an explicit
+      // `false` and silently opt every existing show OUT of a station default
+      // the operator had just turned on.
+      fadeAtShowEnd: z
+        .union([z.null(), z.literal(''), z.boolean()])
+        .optional()
+        .transform((v) => (v == null || v === '' ? null : v)),
       // Shape-checked only: ids resolve against the live Navidrome at pick
       // time, so a stale one contributes nothing rather than failing a save.
       playlistIds: showStringList({
@@ -413,6 +466,25 @@ function showObjectSchema(ctx: ShowSchemaContext) {
         overflowError: `must have at most ${PLAYLISTS_PER_SHOW} entries`,
       }),
       playlistStrict: showBool(),
+      // Full rotation (#1612): while this show is on, every track in its anchor
+      // playlist airs once before any of them repeats. The no-repeat window
+      // stops being the station-wide count and becomes the resolved playlist's
+      // own size — recomputed per pick, so a playlist that grows in Navidrome
+      // widens the rotation rather than silently stopping being right.
+      //
+      // DECIDED: it is a NO-OP without `playlistStrict`, not a validation
+      // error. A soft anchor may leave the playlist, so its universe is the
+      // library again and "every track once" has no set to be true of; refusing
+      // the combination would instead mean a show that cannot be saved while
+      // the operator is halfway through configuring it. The editor only offers
+      // the switch behind the strict one, so the dependency is visible there
+      // and merely inert here — which is also what a hand-edited settings.json
+      // needs, since it reaches this schema without ever seeing the editor.
+      //
+      // The window is counted AFTER the show's strict locks and its excluded
+      // playlists, in music/show-recency.ts — sizing it against the raw
+      // playlist would withhold tracks the show was never going to play.
+      playlistExhaust: showBool(),
       excludedPlaylistIds: showStringList({
         max: EXCLUDED_PLAYLISTS_PER_SHOW,
         overflowError: `must have at most ${EXCLUDED_PLAYLISTS_PER_SHOW} entries`,
@@ -548,7 +620,8 @@ export function repairShowTags(raw: unknown): string[] | undefined {
  *
  * maxTrackSeconds is deliberately NOT repaired here: its clamp bounds are owned
  * by settings/defaults.ts (coerceMaxTrackSeconds), which already reads its
- * ceiling from this module's SHOW_MAX_TRACK_SECONDS.
+ * ceiling from this module's SHOW_MAX_TRACK_SECONDS. minTrackLengthSeconds
+ * follows it for the same reason (coerceMinTrackLengthSeconds).
  */
 export function repairShowForLoad(
   raw: Record<string, unknown>,
