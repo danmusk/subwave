@@ -226,7 +226,10 @@ export function validateTtsCorrectionsStrict(raw: any): Array<{ from: string; to
 
 // Resolved by llm/provider.js. `openai-compatible` targets any self-hosted
 // server via `llm.baseUrl`; `locca` is the same transport with a default base
-// URL and onboarding discovery.
+// URL and onboarding discovery. `azure` is OpenAI's models on the operator's
+// OWN resource: the endpoint is per-install and rides
+// `llm.providerBaseUrls.azure` (no hosted default), the key is AZURE_API_KEY,
+// and `model` is the DEPLOYMENT name.
 export const LLM_PROVIDERS = [
   'ollama',
   'openai-compatible',
@@ -235,6 +238,7 @@ export const LLM_PROVIDERS = [
   'requesty',
   'anthropic',
   'openai',
+  'azure',
   'google',
   'deepseek',
   'gateway',
@@ -428,6 +432,14 @@ export function applyLlmLegPatch(target: Record<string, unknown>, patch: unknown
   }
   if (l.reasoning !== undefined) {
     target.reasoning = !!l.reasoning;
+  }
+  // Does the model behind this leg accept the reasoning-model request dialect?
+  // Azure's only, because only there is `model` an operator-chosen alias rather
+  // than a model id. Coerced, never validated against the provider: a leg saved
+  // as azure and later switched keeps the answer for when it switches back, the
+  // same way providerBaseUrls keeps a URL per provider.
+  if (l.reasoningModel !== undefined) {
+    target.reasoningModel = !!l.reasoningModel;
   }
   if (l.numCtx !== undefined) {
     target.numCtx = clampNumCtx(Number(l.numCtx), target.numCtx as number);
