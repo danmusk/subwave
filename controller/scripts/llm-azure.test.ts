@@ -30,12 +30,13 @@ process.env.STATE_DIR = stateRoot;
 
 const { setCache } = await import('../src/settings/store.js');
 const settings = await import('../src/settings.js');
-const { LLM_PROVIDERS } = await import('../src/settings/vocab.js');
+const { LLM_PROVIDERS, EMBEDDING_PROVIDERS } = await import('../src/settings/vocab.js');
 const { SECRET_ENV_KEYS } = await import('../src/setup/secrets.js');
 const { azureEndpoint, languageModel, azureChatFetch } = await import('../src/llm/internal/provider/registry.js');
+const { buildEmbeddingModel, resolveEmbeddingCfg } = await import('../src/llm/internal/provider/embedding.js');
 const { capabilitiesFor } = await import('../src/llm/internal/provider/capabilities.js');
 const { createAzure } = await import('@ai-sdk/azure');
-const { generateText } = await import('ai');
+const { generateText, embedMany } = await import('ai');
 
 const SETTINGS_PATH = path.join(stateRoot, 'settings.json');
 const RESOURCE = 'https://oai-example.openai.azure.com';
@@ -391,11 +392,192 @@ test('changing the endpoint rebuilds the model rather than reusing the cached cl
 });
 
 // ---------------------------------------------------------------------------
+// Embeddings — the SAME resource, the same key, the same two surfaces
+// ---------------------------------------------------------------------------
+//
+// The tagger's whole enrich -> embed -> seed -> propagate pipeline is dead on an
+// Azure-only station unless this path works, and the failure mode is quiet: a
+// blank `settings.embedding.provider` means "follow the DJ", so the operator
+// never chose azure here and only sees the tagger stop. Every assertion below is
+// at the WIRE for the same reason the chat ones are — the SDK assembles the URL
+// on top of ours, and the URL that leaves the process is the only thing that
+// matters. No credentials, no network.
+
+function captureEmbedFetch(seen: { url?: string; headers?: Record<string, string>; body?: Record<string, unknown> }) {
+  return (async (url: unknown, init: { headers?: HeadersInit; body?: unknown }) => {
+    seen.url = typeof url === 'string' ? url : String(url);
+    seen.headers = Object.fromEntries(new Headers(init?.headers ?? {}).entries());
+    try { seen.body = JSON.parse(String(init?.body)); } catch { seen.body = undefined; }
+    return Response.json({
+      object: 'list',
+      model: 'text-embedding-3-small',
+      data: [{ object: 'embedding', index: 0, embedding: [0.1, 0.2, 0.3] }],
+      usage: { prompt_tokens: 1, total_tokens: 1 },
+    });
+  }) as unknown as typeof fetch;
+}
+
+async function embedWith(baseUrl: string, deployment = 'text-embedding-3-small', apiKey = 'test-key') {
+  // The embedding builder does not take a `fetch` option (nothing on this path
+  // needs one — azureChatFetch corrects chat-completion parameters an embeddings
+  // request never carries), so the capture goes on the global.
+  const seen: { url?: string; headers?: Record<string, string>; body?: Record<string, unknown> } = {};
+  const original = globalThis.fetch;
+  globalThis.fetch = captureEmbedFetch(seen);
+  try {
+    const model = buildEmbeddingModel(
+      resolveEmbeddingCfg({ provider: 'azure', model: deployment, baseUrl, apiKey }),
+    );
+    await embedMany({ model, values: ['subwave embedding probe'] });
+  } finally {
+    globalThis.fetch = original;
+  }
+  return seen;
+}
+
+async function embedProbeWithSavedSettings(overrides: Record<string, string> = {}) {
+  const seen: { url?: string; headers?: Record<string, string>; body?: Record<string, unknown> } = {};
+  const original = globalThis.fetch;
+  globalThis.fetch = captureEmbedFetch(seen);
+  try {
+    const model = buildEmbeddingModel(resolveEmbeddingCfg(overrides));
+    await embedMany({ model, values: ['subwave embedding probe'] });
+  } finally {
+    globalThis.fetch = original;
+  }
+  return seen;
+}
+
+test('embeddings on the modern surface call /openai/v1/embeddings with no api-version', async () => {
+  const seen = await embedWith(RESOURCE);
+  assert.equal(seen.url, `${RESOURCE}/openai/v1/embeddings`);
+  // Azure authenticates with `api-key`, never a bearer Authorization header.
+  assert.equal(seen.headers?.['api-key'], 'test-key');
+  // The body's `model` is the DEPLOYMENT name, which is the whole Azure quirk.
+  assert.equal(seen.body?.model, 'text-embedding-3-small');
+});
+
+test('embeddings on the legacy surface call the deployment path with the pinned api-version', async () => {
+  const seen = await embedWith(`${RESOURCE}/?api-version=2024-08-01-preview`, 'my-embeddings');
+  assert.equal(
+    seen.url,
+    `${RESOURCE}/openai/deployments/my-embeddings/embeddings?api-version=2024-08-01-preview`,
+  );
+  assert.equal(seen.body?.model, 'my-embeddings');
+});
+
+test('a blank deployment name is refused, not guessed', () => {
+  // registry.resolveModelId() makes the same call for chat. Nothing can guess a
+  // name the operator invented, and text-embedding-3-small would be a guess
+  // dressed as a default — so say what to type instead.
+  assert.throws(
+    () => buildEmbeddingModel(resolveEmbeddingCfg({ provider: 'azure', model: '', baseUrl: RESOURCE, apiKey: 'k' })),
+    /no model is set.*DEPLOYMENT name/s,
+  );
+});
+
+test('a missing endpoint is named at the point of use, not discovered as a 404', () => {
+  assert.throws(
+    () => buildEmbeddingModel(resolveEmbeddingCfg({ provider: 'azure', model: 'text-embedding-3-small', baseUrl: '', apiKey: 'k' })),
+    /No Azure endpoint is set/,
+  );
+});
+
+test('the embedding probe classifies both refusals actionably', async () => {
+  // The probe is what the admin's "Test embeddings" button and the tagger's
+  // preflight both read, so the two config errors have to arrive as their own
+  // codes — 'unknown' would print a raw stack where the fix belongs.
+  const { probeEmbeddingConfig } = await import('../src/music/embeddings.js');
+  const noModel = await probeEmbeddingConfig({ provider: 'azure', model: '', baseUrl: RESOURCE, apiKey: 'k' });
+  assert.equal(noModel.code, 'no_model');
+  assert.match(noModel.message, /DEPLOYMENT name/);
+  const noUrl = await probeEmbeddingConfig({ provider: 'azure', model: 'text-embedding-3-small', baseUrl: '', apiKey: 'k' });
+  assert.equal(noUrl.code, 'bad_url');
+  assert.match(noUrl.message, /Azure resource endpoint/);
+});
+
+test('the deployment list is trimmed by the MODEL behind each deployment', async () => {
+  // Azure's deployments API is one mixed list, and the deployment NAME is
+  // whatever the operator typed — so a name-only heuristic (what
+  // MIXED_MODEL_LIST_PROVIDERS does) both hides real embedding deployments and
+  // offers chat ones. The `model` field is the authoritative answer; the name is
+  // only the fallback for a resource that omits it.
+  const { azureDeploymentIds } = await import('../src/routes/settings/llm.js');
+  const list = [
+    { id: 'radio-dj', model: 'gpt-4o-mini' },
+    { id: 'vectors', model: 'text-embedding-3-small' },
+    { id: 'embeddings-chat', model: 'gpt-4o' },
+    { id: 'nomic-embed-text' },              // no `model` — fall back to the name
+    { id: 'legacy-ada', model: 'text-embedding-ada-002' },
+  ];
+  assert.deepEqual(
+    azureDeploymentIds(list, 'embedding'),
+    ['legacy-ada', 'nomic-embed-text', 'vectors'],
+  );
+  // The chat picker is deliberately untouched: every deployment stays listed.
+  assert.deepEqual(
+    azureDeploymentIds(list, ''),
+    ['embeddings-chat', 'legacy-ada', 'nomic-embed-text', 'radio-dj', 'vectors'],
+  );
+  // A resource that answers with something unexpected costs the operator the
+  // free-text input, never a throw.
+  assert.deepEqual(azureDeploymentIds(undefined, 'embedding'), []);
+  assert.deepEqual(azureDeploymentIds([{ model: 'text-embedding-3-small' }], 'embedding'), []);
+});
+
+test('azure embeddings never inherit a NON-azure chat endpoint', async () => {
+  // settings.embedding.baseUrl inherits the chat leg's flat field so a blank one
+  // keeps working (#319) — but that field is whatever the DJ's provider set. On
+  // a llama.cpp DJ, azureEndpoint() would turn http://host:8080/v1 into a
+  // plausible-looking Azure endpoint pointed at the wrong box. Refuse instead.
+  await coldLoad({
+    provider: 'openai-compatible',
+    model: 'qwen3',
+    providerBaseUrls: { 'openai-compatible': 'http://host.docker.internal:8080/v1' },
+  });
+  const { probeEmbeddingConfig } = await import('../src/music/embeddings.js');
+  const r = await probeEmbeddingConfig({ provider: 'azure', model: 'text-embedding-3-small' });
+  assert.equal(r.code, 'bad_url');
+
+  // ...but when the DJ IS on azure the inheritance is exactly right, and is the
+  // common case: a blank embedding provider means "follow the DJ".
+  await coldLoad({
+    provider: 'azure',
+    model: 'gpt-4o-mini',
+    providerBaseUrls: { azure: RESOURCE },
+    keys: { azure: 'k-azure' },
+  });
+  // No baseUrl override at all — the endpoint has to come through the chat leg,
+  // which is the shape of a station that only ever filled in Settings → LLM.
+  // (The deployment name is still required; that is the point of the test above.)
+  const seen = await embedProbeWithSavedSettings({ model: 'text-embedding-3-small' });
+  assert.equal(seen.url, `${RESOURCE}/openai/v1/embeddings`);
+  assert.equal(seen.headers?.['api-key'], 'k-azure');
+});
+
+test('an inline azure key reaches the embedding request when the DJ is elsewhere', async () => {
+  // The inherited chain ends at the CHAT leg's key, so a station whose DJ is on
+  // Ollama but which has an inline Azure key on file would otherwise send none.
+  await coldLoad({
+    provider: 'ollama',
+    model: 'qwen3',
+    keys: { azure: 'k-azure-inline' },
+  });
+  const seen = await embedWith(RESOURCE, 'text-embedding-3-small', '');
+  assert.equal(seen.headers?.['api-key'], 'k-azure-inline');
+});
+
+// ---------------------------------------------------------------------------
 // Registration + the settings round trip
 // ---------------------------------------------------------------------------
 
-test('azure is a known LLM provider, and its key is a known secret', () => {
+test('azure is both an LLM and an embedding provider, and its key is a known secret', () => {
   assert.ok(LLM_PROVIDERS.includes('azure'));
+  // Azure embeddings are a SEPARATE deployment with its own name, but they are
+  // the same resource, the same key and the same two API surfaces — so the
+  // picker offers it, and buildEmbeddingModel refuses a blank deployment name
+  // rather than falling through to a misleading error (the #493 shape).
+  assert.ok(EMBEDDING_PROVIDERS.includes('azure'));
   assert.ok((SECRET_ENV_KEYS as readonly string[]).includes('AZURE_API_KEY'));
 });
 

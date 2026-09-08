@@ -245,12 +245,16 @@ export const LLM_PROVIDERS = [
 ];
 
 // Subset of LLM_PROVIDERS that can produce text embeddings (#493, #522).
+// `azure` is in: the same OpenAI embedding models deploy on the operator's own
+// resource, over the two surfaces `azureEndpoint()` already resolves between —
+// but its `model` is a DEPLOYMENT name, so a blank one is refused, not guessed.
 export const EMBEDDING_PROVIDERS = [
   'ollama',
   'openai-compatible',
   'locca',
   'openrouter',
   'openai',
+  'azure',
   'google',
   'requesty',
 ];
