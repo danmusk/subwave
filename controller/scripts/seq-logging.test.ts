@@ -232,6 +232,20 @@ test('logEventOf carries the trace as a W3C id and cannot be shadowed', () => {
   assert.equal(draft.properties.Source, 'llm');
 });
 
+test('Detail prefers an explicit message, then falls back to leading scalars', () => {
+  assert.equal(logEventOf('x.y', { message: 'said it' }, null, NOW).properties.Detail, 'said it');
+  assert.equal(logEventOf('x.y', { error: 'timed out' }, null, NOW).properties.Detail, 'timed out');
+  // The common case: no message field at all, so the event list would otherwise
+  // read as a bare type name with every fact hidden in the property list.
+  assert.equal(
+    logEventOf('pick.made', { title: 'Hurricane', artist: 'Bob Dylan', ms: 412, meta: { a: 1 } }, null, NOW)
+      .properties.Detail,
+    'title=Hurricane artist=Bob Dylan ms=412',
+    'objects are skipped, and only the first three scalars are taken',
+  );
+  assert.equal(logEventOf('tick', {}, null, NOW).properties.Detail, '', 'nothing to say stays empty');
+});
+
 test('logEventOf without a trace omits the id rather than nulling it', () => {
   const draft = logEventOf('navidrome', { ms: 3 }, null, NOW);
   assert.equal('traceId' in draft, false);

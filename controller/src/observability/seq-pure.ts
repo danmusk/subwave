@@ -217,6 +217,26 @@ export function levelForEvent(type: string, data: unknown): SeqLevel {
   return 'Information';
 }
 
+// Most logEvent payloads carry no message/error field, so `{EventType} {Detail}`
+// would render as a bare `pick.made` and every useful fact would live only in
+// the property list. A few leading scalars make the event list readable at a
+// glance. This is a property VALUE, never a template, so it is still Seq-inert.
+const DETAIL_FIELDS = 3;
+const DETAIL_VALUE_CAP = 40;
+
+function summariseScalars(bag: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(bag)) {
+    if (parts.length >= DETAIL_FIELDS) break;
+    const t = typeof v;
+    if (t !== 'string' && t !== 'number' && t !== 'boolean') continue;
+    const s = String(v);
+    if (!s) continue;
+    parts.push(`${k}=${s.length > DETAIL_VALUE_CAP ? `${s.slice(0, DETAIL_VALUE_CAP)}…` : s}`);
+  }
+  return parts.join(' ');
+}
+
 function formatPrimitive(v: unknown): string {
   if (typeof v === 'string') return v;
   if (v === undefined) return 'undefined';
@@ -280,7 +300,7 @@ export function logEventOf(
       : { Data: spread }),
     // Envelope last, so a `data.EventType` cannot shadow it.
     EventType: type,
-    Detail: capText(formatPrimitive(detailRaw), MESSAGE_CAP),
+    Detail: capText(formatPrimitive(detailRaw) || summariseScalars(bag), MESSAGE_CAP),
     // Keeps the Source filter axis uniform with the console tap's `[prefix]`.
     Source: type.includes('.') ? type.slice(0, type.indexOf('.')) : type,
   };
