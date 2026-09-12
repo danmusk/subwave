@@ -94,6 +94,7 @@ import { validateCompatParams } from './settings/compat-params.js';
 import { parseSettingsPatchKey } from './settings/patch-registry.js';
 import {
   MUSIC_SOURCES,
+  PAUSE_TALK_MIN_SECONDS_BOUNDS,
   PICKER_ALBUM_HOURS_BOUNDS,
   SPOTIFY_BITRATES,
   SPOTIFY_MISMATCH_MODES,
@@ -587,6 +588,27 @@ export async function load() {
       typeof stored.djTalkOnlyBetweenTracks === 'boolean'
         ? stored.djTalkOnlyBetweenTracks
         : DEFAULTS.djTalkOnlyBetweenTracks,
+    // parseInt + clamp, matching pauseTalkMinSecondsSchema's posture on the save
+    // path: a read that repaired differently from the writer would refuse a
+    // value it had just stored.
+    pauseTalkMinSeconds: Number.isFinite(parseInt(stored.pauseTalkMinSeconds, 10))
+      ? Math.min(
+          PAUSE_TALK_MIN_SECONDS_BOUNDS.max,
+          Math.max(PAUSE_TALK_MIN_SECONDS_BOUNDS.min, parseInt(stored.pauseTalkMinSeconds, 10)),
+        )
+      : DEFAULTS.pauseTalkMinSeconds,
+    djBehaviour: {
+      showWelcome: typeof stored.djBehaviour?.showWelcome === 'boolean'
+        ? stored.djBehaviour.showWelcome
+        : DEFAULTS.djBehaviour.showWelcome,
+      sameHostAcknowledgement: typeof stored.djBehaviour?.sameHostAcknowledgement === 'boolean'
+        ? stored.djBehaviour.sameHostAcknowledgement
+        : DEFAULTS.djBehaviour.sameHostAcknowledgement,
+      extendedSleeveNotes: typeof stored.djBehaviour?.extendedSleeveNotes === 'boolean'
+        ? stored.djBehaviour.extendedSleeveNotes : DEFAULTS.djBehaviour.extendedSleeveNotes,
+      releaseYearMentions: ['regular', 'occasional', 'rare'].includes(stored.djBehaviour?.releaseYearMentions)
+        ? stored.djBehaviour.releaseYearMentions : DEFAULTS.djBehaviour.releaseYearMentions,
+    },
     // Repaired rather than refused, like ducking above: an offset the talk
     // table's programme row cannot sample is a sign-off that never airs, and a
     // hand-edited settings.json is this path's input.
@@ -1599,6 +1621,20 @@ export async function update(patch) {
   if ('djTalkOnlyBetweenTracks' in patch) {
     next.djTalkOnlyBetweenTracks =
       parseSettingsPatchKey<boolean>('djTalkOnlyBetweenTracks', patch.djTalkOnlyBetweenTracks);
+  }
+  if ('pauseTalkMinSeconds' in patch) {
+    next.pauseTalkMinSeconds = parseSettingsPatchKey<number>('pauseTalkMinSeconds', patch.pauseTalkMinSeconds);
+  }
+  if ('djBehaviour' in patch) {
+    const behaviour = parseSettingsPatchKey<Record<string, boolean | string | undefined>>(
+      'djBehaviour', patch.djBehaviour,
+    );
+    for (const key of ['showWelcome', 'sameHostAcknowledgement', 'extendedSleeveNotes'] as const) {
+      if (behaviour[key] !== undefined) next.djBehaviour[key] = behaviour[key];
+    }
+    if (behaviour.releaseYearMentions !== undefined) {
+      next.djBehaviour.releaseYearMentions = behaviour.releaseYearMentions as typeof next.djBehaviour.releaseYearMentions;
+    }
   }
   if ('handover' in patch) {
     // No mixer restart: the offset is read live by broadcast/handover-policy.ts

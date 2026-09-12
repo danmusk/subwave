@@ -31,29 +31,21 @@ import { queue } from '../broadcast/queue.js';
 
 export const router = express.Router();
 
-// Match the persona id regex used in settings.ts — kept local to avoid widening
-// settings.ts's export surface for a 24-char regex.
+// Matches the persona id regex in settings.ts; kept local deliberately.
 const PERSONA_ID_RE = /^[a-z0-9_]{3,32}$/;
-// Hard cap on the decoded image. The browser-side resize lands us comfortably
-// below this for any reasonable source. Anything bigger almost certainly means
-// the operator bypassed the picker.
+// Hard cap on the DECODED image.
 const MAX_AVATAR_BYTES = 300 * 1024;
-// JSON payload cap is set per-route — the base64 body inflates the raw bytes
-// by ~33%, plus the data-URL prefix. 600 KB is plenty for a 300 KB image.
+// Per-route cap: base64 inflates the raw bytes by ~33%, plus the data-URL prefix.
 const JSON_BODY_LIMIT = '600kb';
 
-// Quick magic-byte sniff. The data-URL prefix is operator-supplied and easy
-// to fake; this checks the decoded bytes against the canonical signatures.
+// The data-URL prefix is easy to fake, so check the decoded bytes themselves.
 function sniffMime(buf: Buffer): 'image/png' | 'image/jpeg' | 'image/webp' | null {
   if (buf.length < 12) return null;
-  // PNG: 89 50 4E 47 0D 0A 1A 0A
   if (
     buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47 &&
     buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a
   ) return 'image/png';
-  // JPEG: FF D8 FF
   if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
-  // WebP: 'RIFF' .... 'WEBP'
   if (
     buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
     buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
@@ -67,10 +59,8 @@ function extForMime(mime: string): 'png' | 'jpg' | 'webp' {
   return 'png';
 }
 
-// Removes any existing avatar file for this persona, regardless of extension —
-// re-uploading a JPEG over a previous PNG would otherwise leave the PNG
-// behind and the persona.avatar field would (correctly) only point at the
-// newer one, so the orphan would just waste disk.
+// Removes any existing avatar regardless of extension, so a JPEG uploaded over a
+// PNG does not orphan the PNG on disk.
 async function removeExisting(personaId: string) {
   try {
     const entries = await readdir(settings.PERSONA_AVATAR_DIR);
@@ -80,7 +70,7 @@ async function removeExisting(personaId: string) {
         .map(e => unlink(`${settings.PERSONA_AVATAR_DIR}/${e}`).catch(() => {})),
     );
   } catch {
-    // Directory doesn't exist yet — nothing to remove.
+    // Directory doesn't exist yet.
   }
 }
 
@@ -88,8 +78,6 @@ async function writeAvatar(personaId: string, dataUrl: string) {
   if (!PERSONA_ID_RE.test(personaId)) {
     throw new Error('invalid persona id');
   }
-  // settings.load() may not have run yet if this is the first request; the
-  // server boot block does run it, but be defensive.
   await settings.load();
   const personas = settings.get().personas || [];
   if (!personas.some((p: any) => p.id === personaId)) {
@@ -117,10 +105,8 @@ async function writeAvatar(personaId: string, dataUrl: string) {
   const filename = `${personaId}.${extForMime(sniffed)}`;
   await writeFile(`${settings.PERSONA_AVATAR_DIR}/${filename}`, buf);
 
-  // Record the basename on the persona so /persona-avatar/:id and the
-  // /now-playing payload pick it up immediately. We resend the full personas
-  // array because settings.update() validates the whole list — the orphan
-  // sweep inside update() is what keeps the on-disk files consistent.
+  // Resend the whole array: update() validates the full list, and its orphan
+  // sweep is what keeps the on-disk files consistent.
   const nextPersonas = personas.map((p: any) =>
     p.id === personaId ? { ...p, avatar: filename } : p,
   );
@@ -177,15 +163,8 @@ router.delete('/personas/:id/avatar', requireAdmin, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// POST /personas/community/:slug/install — append a community catalog persona
-// to the station's roster as an ordinary persona: editable, deletable, and NOT
-// on air (activePersonaId is untouched — the analogue of a community skill
-// arriving disabled). Station-specific fields get the roster defaults: a
-// minted id, the piper tts block, no avatar, skills=null ("all skills").
-// Rejects a roster at PERSONA_LIMIT and a duplicate on-air name (409) so the
-// operator isn't left with two indistinguishable DJs.
-// ---------------------------------------------------------------------------
+// Installs a community persona as an ordinary roster entry, NOT on air
+// (activePersonaId is untouched). A full roster or a duplicate on-air name 409s.
 router.post('/personas/community/:slug/install', requireAdmin, async (req, res) => {
   const slug = String(req.params.slug);
   if (!SLUG_RE.test(slug)) {

@@ -11,6 +11,7 @@
 import {
   Radio, Palette, Cpu, Mic, Library, Search,
   Activity, Archive, Save, AlertTriangle, Heart, Music2, BrainCircuit,
+  MessageCircle,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
@@ -62,6 +63,13 @@ export const SECTIONS = [
     hint: 'player skin · palette', icon: Palette,
     formKeys: [],
   },
+  // First item in the DJ group: these are the on-air policy controls that
+  // frame the service-specific configuration which follows.
+  {
+    id: 'behaviour', group: 'the dj', label: 'DJ behaviour',
+    hint: 'talk placement · show changes', icon: MessageCircle,
+    formKeys: ['djTalkOnlyBetweenTracks', 'pauseTalkMinSeconds', 'djBehaviour'],
+  },
   {
     // One-field setup for the hosted DJ Brain: writes both `llm` and
     // `tts.cloud` in a single save, but owns neither slice — the LLM provider
@@ -83,7 +91,7 @@ export const SECTIONS = [
   {
     id: 'tts', group: 'the dj', label: 'TTS voice',
     hint: 'default engine', icon: Mic,
-    formKeys: ['tts', 'kokoroLang', 'djTalkOnlyBetweenTracks', 'handoverOffsetMinutes'],
+    formKeys: ['tts', 'kokoroLang'],
   },
   {
     id: 'library', group: 'the dj', label: 'Library tagger',
@@ -244,8 +252,6 @@ export const SETTINGS_INDEX: readonly IndexEntry[] = [
 
   // ── tts voice ──────────────────────────────────────────────────────────────
   { label: 'DJ speech', section: 'tts', card: 'Station voice', keywords: 'on air music only mute silent' },
-  { label: 'Talk placement', section: 'tts', card: 'Station voice', keywords: 'between tracks boundary interrupt over song duck mid-song' },
-  { label: 'Show handover', section: 'tts', card: 'Station voice', keywords: 'sign-off outro handover changeover boundary closing track programme' },
   { label: 'Engine', section: 'tts', card: 'Voice engine', keywords: 'piper kokoro chatterbox pocket-tts cloud remote' },
   { label: 'Voice', section: 'tts', card: 'Voice engine', keywords: 'speaker accent alba amy' },
   { label: 'Voice level (dB)', section: 'tts', card: 'Voice engine', keywords: 'gain trim loudness decibel' },
@@ -255,6 +261,12 @@ export const SETTINGS_INDEX: readonly IndexEntry[] = [
   { label: 'Latency mode', section: 'tts', card: 'Voice engine', keywords: 'fish audio low normal balanced' },
   { label: 'Server URL', section: 'tts', card: 'Voice engine', keywords: 'remote http endpoint' },
   { label: 'Fallback engine', section: 'tts', card: 'Fallback voice', keywords: 'rescue voice slot backup' },
+
+  // ── dj behaviour ───────────────────────────────────────────────────────────
+  { label: 'Talk placement', section: 'behaviour', card: 'Talk placement', keywords: 'between tracks boundary interrupt over song duck mid-song' },
+  { label: 'Show changes', section: 'behaviour', card: 'Show changes', keywords: 'handoff presenter same host acknowledgement shift transition programme' },
+  { label: 'Extended Sleeve Notes', section: 'behaviour', card: 'Extended Sleeve Notes', keywords: 'source backed editorial provenance provider credits artist context coming soon' },
+  { label: 'Link style', section: 'behaviour', card: 'Link style', keywords: 'release year regular occasional rare metadata sleeve notes' },
 
   // ── library tagger ─────────────────────────────────────────────────────────
   { label: 'Tagger', section: 'library', card: 'Tagger', keywords: 'enabled tagging runs moods genres' },

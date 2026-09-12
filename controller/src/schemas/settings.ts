@@ -836,6 +836,28 @@ export const djTalkOnlyBetweenTracksSchema = z.boolean({
   error: 'djTalkOnlyBetweenTracks must be a boolean',
 });
 
+// The floor a rendered skill segment must clear before an opted-in show gives
+// it a real gap instead of a duck. settingsIntLike, like every other numeric
+// settings key: it accepts the admin form's string and truncates a float rather
+// than refusing either, and its message names the field in house style instead
+// of leaking zod's own wording.
+export const PAUSE_TALK_MIN_SECONDS_BOUNDS: SettingsNumericBound = { min: 5, max: 90 };
+export const pauseTalkMinSecondsSchema = settingsIntLike(
+  PAUSE_TALK_MIN_SECONDS_BOUNDS,
+  'pauseTalkMinSeconds must be a whole number of seconds between 5 and 90',
+);
+
+// DJ policy controls are grouped so future speaking/transition behaviour has
+// one stable home in Settings. A missing block remains the pre-existing off.
+export const djBehaviourPatchSchema = settingsBlockOf({
+  showWelcome: z.boolean({ error: 'djBehaviour.showWelcome must be a boolean' }),
+  sameHostAcknowledgement: z.boolean({ error: 'djBehaviour.sameHostAcknowledgement must be a boolean' }),
+  extendedSleeveNotes: z.boolean({ error: 'djBehaviour.extendedSleeveNotes must be a boolean' }),
+  releaseYearMentions: z.enum(['regular', 'occasional', 'rare'], {
+    error: 'djBehaviour.releaseYearMentions must be regular, occasional or rare',
+  }),
+});
+
 /**
  * Station default for the show-boundary fade (#1574). Strict boolean, the same
  * posture as the two switches above and for the same reason — the key is new,

@@ -341,6 +341,13 @@ export interface DuckingForm {
   intro: string;
 }
 
+export interface DjBehaviourForm {
+  showWelcome: boolean;
+  sameHostAcknowledgement: boolean;
+  extendedSleeveNotes: boolean;
+  releaseYearMentions: 'regular' | 'occasional' | 'rare';
+}
+
 export interface FormState {
   crossfadeDuration: string;
   ducking: DuckingForm;
@@ -359,14 +366,11 @@ export interface FormState {
   locale: StationLocale;
   kokoroLang: string;
   /** Talk placement switch — every scheduled segment waits for the next track
-   *  boundary. Flat, like djSpeakClock, and owned by the TTS section. */
+   *  boundary. Flat, like djSpeakClock, and owned by DJ behaviour. */
   djTalkOnlyBetweenTracks: boolean;
-  /** settings.handover.offsetMinutes — how many minutes before a show boundary
-   *  the outgoing host signs off. A string like every other number control, but
-   *  the values are a fixed set (multiples of the talk table's sampling stride),
-   *  so it renders as a segmented control and can never carry a free-text
-   *  error. Owned by the TTS section, beside talk placement. */
-  handoverOffsetMinutes: string;
+  /** Station-wide minimum length before a show may use pause-and-talk. */
+  pauseTalkMinSeconds: string;
+  djBehaviour: DjBehaviourForm;
   weather: WeatherCfg;
   tts: TtsForm;
   llm: LlmForm;
@@ -441,6 +445,8 @@ export interface SettingsData {
     /** Absent on a settings.json predating the key — read it as false, which is
      *  what the controller's own coercion does. */
     djTalkOnlyBetweenTracks?: boolean;
+    pauseTalkMinSeconds?: number;
+    djBehaviour?: Partial<DjBehaviourForm>;
     /** Absent on a settings.json predating the key — the controller's own
      *  coercion reads it as the 5-minute default. */
     handover?: { offsetMinutes?: number };

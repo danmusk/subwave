@@ -10,7 +10,7 @@ import { cn } from '../../../lib/cn';
  
 import { SkeletonRows } from '@/components/ui/skeleton';
 import { EmptyState } from '@/components/ui/empty-state';
-import type { BlockRef, BlockType, LikeIndex, TableVariant, Track } from './types';
+import type { BlockRef, BlockType, LikeIndex, QueueBlockKind, TableVariant, Track } from './types';
 import {
   CHECK_HIT,
   EnergyMeter,
@@ -22,7 +22,7 @@ import {
   unblockLabel,
   useDismissOnOutside,
 } from './bits';
-import { BlockMenu, HeartButton, likeStateFor } from './row-actions';
+import { BlockMenu, HeartButton, QueueMenu, likeStateFor } from './row-actions';
 import { ManualTagEditor } from './ManualTagEditor';
 
 interface TrackTableProps {
@@ -33,6 +33,7 @@ interface TrackTableProps {
   retagging: string | null;
   flashId: string | null;
   onQueue: (t: Track) => void;
+  onQueueBlock: (t: Track, kind: QueueBlockKind) => void;
   onRetag: (t: Track) => void;
   blocking: string | null;
   onBlock: (t: Track, type: BlockType) => void;
@@ -89,8 +90,8 @@ export function TrackTable(p: TrackTableProps) {
   return (
     // Dim, don't blank, stale rows during a refetch so filter changes read as updating.
     <div className={cn(p.loading && 'opacity-60 transition-opacity')}>
-      {/* Below sm: the 5-column grid leaves the title ~60px, so rows lay out as a plain
-          flex line instead. `!` beats `.admin-root .lib-colhead/.lib-row`. */}
+      {/* Below sm: the 5-column grid leaves the title ~60px, so rows lay out as
+          a plain flex line. `!` beats `.admin-root .lib-colhead/.lib-row`. */}
       <div className="lib-colhead !flex sm:!grid">
         <span>
           <label className={CHECK_HIT}>
@@ -124,18 +125,17 @@ export function TrackTable(p: TrackTableProps) {
               />
             </label>
             <Thumb track={t} />
-            {/* flex-1 drives the phone layout; grid items ignore flex-*, so the sm:+
-                grid column sizing is untouched. */}
+            {/* flex-1 drives the phone layout; grid items ignore flex-*. */}
             <div className="min-w-0 flex-1">
-              {/* Badge sits with the TITLE, not the mood/energy cell: .lib-tags is
-                  display:none below 860px and this marker must survive a phone. */}
+              {/* Badge sits with the TITLE: .lib-tags is display:none below
+                  860px and this marker must survive a phone. */}
               <div className="flex min-w-0 items-center gap-2">
                 <div className="lib-title">{t.title || '—'}</div>
                 {t.blockedBy && (
                   <span className="lib-btag shrink-0" title={`blocked via ${blockedByLabel(t.blockedBy)}`}>
                     <Ban size={10} aria-hidden />
-                    {/* Scope word drops below sm: at 390px the badge and title share
-                        ~210px. The full scope stays in the row menu. */}
+                    {/* Scope word drops below sm:. The full scope stays in the
+                        row menu. */}
                     <span aria-hidden>
                       never play
                       {t.blockedBy.kind === 'rule' ? (
@@ -169,8 +169,8 @@ export function TrackTable(p: TrackTableProps) {
               {t.instrumental === true && <span className="lib-mtag lib-atag" title="no vocals detected">instrumental</span>}
               {t.similarity != null && <span className="lib-mtag lib-atag" title="sound match vs your description">≈ {Math.round(t.similarity * 100)}%</span>}
             </div>
-            {/* Four 36px buttons cost more than the title is worth on a phone, so below
-                sm: they collapse into the single overflow menu and each inline one hides. */}
+            {/* Four 36px buttons cost more than the title is worth on a phone,
+                so below sm: they collapse into the overflow menu. */}
             <div className="flex items-center justify-end gap-1.5">
               <RowActionsMenu
                 track={t}
@@ -181,6 +181,7 @@ export function TrackTable(p: TrackTableProps) {
                 blocking={p.blocking === t.id}
                 disabled={!!p.queuing || !!p.retagging || !!p.manualBusy || !!p.blocking}
                 onQueue={p.onQueue}
+                onQueueBlock={p.onQueueBlock}
                 onEdit={p.onEdit}
                 onRetag={p.onRetag}
                 onBlock={p.onBlock}
@@ -197,9 +198,14 @@ export function TrackTable(p: TrackTableProps) {
                 busy={p.liking === t.id}
                 onToggle={p.onToggleLike}
               />
-              <Btn sm className="hidden sm:inline-flex" onClick={() => p.onQueue(t)} disabled={!!p.queuing} title="Queue on air">
-                {p.queuing === t.id ? '…' : <ListPlus size={12} />}
-              </Btn>
+              <QueueMenu
+                className="hidden sm:block"
+                track={t}
+                busy={p.queuing === t.id}
+                disabled={!!p.queuing}
+                onQueue={p.onQueue}
+                onQueueBlock={p.onQueueBlock}
+              />
               <Btn
                 sm
                 className="hidden sm:inline-flex"
@@ -210,8 +216,7 @@ export function TrackTable(p: TrackTableProps) {
               >
                 {editing ? <X size={12} /> : <Pencil size={12} />}
               </Btn>
-              {/* Offered on every tab: an untagged search/recent row can be tagged on
-                  the spot (/library/retag takes the row body). */}
+              {/* Offered on every tab: an untagged row can be tagged on the spot. */}
               <Btn
                 sm
                 className="hidden sm:inline-flex"
@@ -224,11 +229,9 @@ export function TrackTable(p: TrackTableProps) {
                   ? <RotateCcw size={11} />
                   : <Sparkles size={11} />}
               </Btn>
-              {/* An entry-blocked row offers the reverse, not another scope to add:
-                  one click lifts the entry that matched, wherever it was made from.
-                  A RULE-blocked row keeps the block menu — the rule may cover
-                  hundreds of rows, so lifting it lives on the Blocked tab, and an
-                  id entry on top is still a legitimate ask. */}
+              {/* An entry-blocked row offers the reverse, not another scope: one
+                  click lifts the entry that matched. A RULE-blocked row keeps the
+                  block menu, since lifting a rule lives on the Blocked tab. */}
               {t.blockedBy && t.blockedBy.kind !== 'rule' ? (
                 <Btn
                   sm
@@ -270,7 +273,7 @@ export function TrackTable(p: TrackTableProps) {
 }
 
 export function RowActionsMenu({
-  track, tagged, editing, queuing, retagging, blocking, disabled, onQueue, onEdit, onRetag, onBlock, onUnblock,
+  track, tagged, editing, queuing, retagging, blocking, disabled, onQueue, onQueueBlock, onEdit, onRetag, onBlock, onUnblock,
   like, liking, onToggleLike, onClearLikes,
 }: {
   track: Track;
@@ -281,6 +284,7 @@ export function RowActionsMenu({
   blocking: boolean;
   disabled: boolean;
   onQueue: (t: Track) => void;
+  onQueueBlock: (t: Track, kind: QueueBlockKind) => void;
   onEdit: (t: Track) => void;
   onRetag: (t: Track) => void;
   onBlock: (t: Track, type: BlockType) => void;
@@ -316,6 +320,16 @@ export function RowActionsMenu({
           <button type="button" className={MENU_ITEM} disabled={disabled} onClick={() => run(() => onQueue(track))}>
             <ListPlus size={13} /> Queue on air
           </button>
+          {track.album && (
+            <button type="button" className={MENU_ITEM} disabled={disabled} onClick={() => run(() => onQueueBlock(track, 'album'))}>
+              <ListPlus size={13} /> Queue the whole album
+            </button>
+          )}
+          {track.artist && (
+            <button type="button" className={MENU_ITEM} disabled={disabled} onClick={() => run(() => onQueueBlock(track, 'artist'))}>
+              <ListPlus size={13} /> Queue a set by this artist
+            </button>
+          )}
           <button type="button" className={MENU_ITEM} disabled={disabled} onClick={() => run(() => onEdit(track))}>
             {editing ? <X size={13} /> : <Pencil size={13} />} {editing ? 'Close mood editor' : 'Edit moods'}
           </button>
@@ -337,8 +351,8 @@ export function RowActionsMenu({
           )}
           <span className="my-1 block border-t border-dashed border-separator-strong" />
           {track.blockedBy?.kind === 'rule' && (
-            /* Informational, not actionable: the rule may block hundreds of rows,
-               so lifting it happens on the Blocked tab, never as a row one-click. */
+            /* Informational, not actionable: the rule may block hundreds of
+               rows, so lifting it happens on the Blocked tab. */
             <span className={cn(MENU_ITEM, 'cursor-default items-start text-muted')}>
               <Ban size={13} className="mt-px flex-none" />
               <span>

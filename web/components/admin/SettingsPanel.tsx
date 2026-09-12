@@ -42,6 +42,7 @@ import {
 import { Advanced, SectionChromeProvider } from './settings/section-chrome';
 import { SettingsSearch, type SettingsJump } from './settings/SettingsSearch';
 import { TtsSection } from './settings/TtsSection';
+import { DjBehaviourSection } from './settings/DjBehaviourSection';
 import { LlmSection } from './settings/LlmSection';
 import { BrainSection } from './settings/BrainSection';
 import { SearchSection } from './settings/SearchSection';
@@ -291,7 +292,11 @@ function rebaselineSavedPatch(
   return next;
 }
 
-export default function SettingsPanel() {
+export default function SettingsPanel({ djBrainEnabled = false }: { djBrainEnabled?: boolean }) {
+  const sections = useMemo(
+    () => SECTIONS.filter(s => s.id !== 'brain' || djBrainEnabled),
+    [djBrainEnabled],
+  );
   const { adminFetch, needsAuth, hydrated } = useAdminAuth();
   const settingsQuery = useSettingsQuery<SettingsData>({
     adminFetch,
@@ -341,8 +346,12 @@ export default function SettingsPanel() {
       router.replace(`/admin/imaging?tab=${s}`);
       return;
     }
-    if (s && SECTIONS.some(x => x.id === s)) setActiveSection(s as SectionId);
-  }, [router, searchParams]);
+    if (s === 'brain' && !djBrainEnabled) {
+      setActiveSection('station');
+      return;
+    }
+    if (s && sections.some(x => x.id === s)) setActiveSection(s as SectionId);
+  }, [router, searchParams, sections, djBrainEnabled]);
 
   useEffect(() => {
     if (!data?.values) return;
@@ -420,9 +429,13 @@ export default function SettingsPanel() {
       // Absent (a settings.json predating the key) reads as OFF, matching the
       // controller's own coercion in settings.load().
       djTalkOnlyBetweenTracks: v.djTalkOnlyBetweenTracks === true,
-      // Absent (a settings.json predating the key) reads as the 5-minute
-      // default — where the sign-off has always aired.
-      handoverOffsetMinutes: String(v.handover?.offsetMinutes ?? 5),
+      pauseTalkMinSeconds: String(v.pauseTalkMinSeconds ?? 20),
+      djBehaviour: {
+        showWelcome: v.djBehaviour?.showWelcome === true,
+        sameHostAcknowledgement: v.djBehaviour?.sameHostAcknowledgement === true,
+        extendedSleeveNotes: v.djBehaviour?.extendedSleeveNotes === true,
+        releaseYearMentions: v.djBehaviour?.releaseYearMentions ?? 'regular',
+      },
       weather: {
         lat: String(v.weather?.lat ?? ''),
         lng: String(v.weather?.lng ?? ''),
@@ -829,6 +842,7 @@ export default function SettingsPanel() {
 
   /** Search result → switch section, open Advanced if needed, scroll and flash. */
   const jumpTo = useCallback(({ section, anchor, advanced }: SettingsJump) => {
+    if (!sections.some(s => s.id === section)) return;
     setActiveSection(section);
     if (advanced) setAdvOpen(prev => ({ ...prev, [section]: true }));
     // The section swap and the disclosure both have to commit before the target
@@ -848,7 +862,7 @@ export default function SettingsPanel() {
       window.setTimeout(() => el.removeAttribute('data-flash'), 2600);
     };
     window.requestAnimationFrame(settle);
-  }, []);
+  }, [sections]);
 
   const chrome = useMemo(() => ({
     saveSlot,
@@ -864,7 +878,7 @@ export default function SettingsPanel() {
         {SECTION_GROUPS.map(group => (
           <div key={group} className="grid gap-1">
             <span className="caption pb-1">{group}</span>
-            {SECTIONS.filter(s => s.group === group).map(s => {
+            {sections.filter(s => s.group === group).map(s => {
               const isActive = activeSection === s.id;
               const Icon = s.icon;
               // A section not on screen can only be dirty in form paths — its
@@ -906,7 +920,7 @@ export default function SettingsPanel() {
       </aside>
 
       <div className="grid gap-4">
-        <SettingsSearch onJump={jumpTo} />
+        <SettingsSearch onJump={jumpTo} sections={sections} />
         {err && <ErrorState error={err} onRetry={refresh} />}
         {pendingRestart && (
           <div
@@ -973,7 +987,13 @@ export default function SettingsPanel() {
                 saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch} refresh={refresh}
               />
             )}
-            {activeSection === 'brain' && (
+            {activeSection === 'behaviour' && (
+              <DjBehaviourSection
+                data={data} form={form} setForm={updateForm} busy={busy}
+                saveSettings={saveSettings} fieldErrors={fieldErrors}
+              />
+            )}
+            {djBrainEnabled && activeSection === 'brain' && (
               <BrainSection
                 data={data} form={form} setForm={updateForm} busy={busy}
                 saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch} refresh={refresh}

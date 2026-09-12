@@ -240,6 +240,16 @@ export const DEFAULTS = {
   // bound it. Policy lives in exactly one place — broadcast/talk-air.ts.
   // Applies live; no restart.
   djTalkOnlyBetweenTracks: false,
+  // Show opt-in only; clips shorter than this remain ordinary ducked speech.
+  pauseTalkMinSeconds: 20,
+  // Optional programme-opening line folded into the first hourly check after a
+  // scheduled show change. Off preserves the established terse time check.
+  djBehaviour: {
+    showWelcome: false,
+    sameHostAcknowledgement: false,
+    extendedSleeveNotes: false,
+    releaseYearMentions: 'regular',
+  },
   // Show handover timing (#1576). How many station-clock minutes BEFORE a show
   // boundary the outgoing host signs off — the programme outro beat's window.
   // 5 is exactly where the beat has always fired (:55 of the final hour), so an
@@ -251,9 +261,9 @@ export const DEFAULTS = {
   // cannot land on is a sign-off that never airs. Enforced at the save path and
   // repaired at load.
   //
-  // The ORDERING half of the handover carries no dial: whatever the offset, the
-  // incoming host waits for one closing track rather than following the
-  // sign-off straight onto the air (broadcast/handover-policy.ts).
+  // The ORDERING half of the handover carries no dial: the final outgoing track
+  // owns the complete sign-off/greeting pair, while between-tracks placement
+  // holds that pair for the first eligible seam at the boundary.
   handover: { offsetMinutes: 5 },
   // One persona is active at a time; a scheduled show can override who is on air.
   personas: SEED_PERSONAS,
@@ -577,7 +587,9 @@ export const DEFAULTS = {
     // Keep the Demucs stems the analysis pass already computes (head + tail
     // windows) as FLAC under state/stems/<id>/, so a transition render is a fast
     // mix instead of a fresh separation. Needs the demucs stack like
-    // vocalActivity; ~13-25 MB per track (#1257), LRU-swept to stemCacheGb.
+    // vocalActivity; ~13-25 MB per track (#1257), swept to stemCacheGb by the
+    // music/stem-priority.ts ranking (lowest value out first, mtime to break
+    // ties) — the same order the backfill scans in.
     stemCache: false,
     stemCacheGb: 15,
     // Pause the analysis pass while anyone is listening, resuming once the stream
