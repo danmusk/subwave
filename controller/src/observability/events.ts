@@ -12,6 +12,7 @@ import { appendFile, mkdir, readdir, unlink } from 'node:fs/promises';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { STATE_DIR } from '../config.js';
+import { seqLogEvent } from './seq.js';
 
 type TraceStore = { traceId: string; kind: string; seq: number };
 const als = new AsyncLocalStorage<TraceStore>();
@@ -49,6 +50,11 @@ export function logEvent(type: string, data: any = {}) {
   try {
     const trace = currentTrace();
     const seq = trace ? ++trace.seq : ++globalSeq;
+    // Mirror to Seq (inert unless SEQ_URL is set). Deliberately BEFORE the
+    // stringify below: a circular `data` throws there and the catch swallows the
+    // event whole, whereas Seq's serialiser is circular-safe. The traceId rides
+    // along, so one DJ decision reads as one trace.
+    seqLogEvent(type, data, trace);
     const line = JSON.stringify({
       t: new Date().toISOString(),
       traceId: trace?.traceId || null,
