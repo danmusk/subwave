@@ -33,7 +33,7 @@ test('an absent block loads as the shipped defaults (byte-identical upgrade)', a
     deviceName: '', bitrate: 320,
     pool: { playlistIds: [], includeSaved: true, includeSavedAlbums: false, maxTracks: 5000, fullWalkHours: 24 },
     quota: { requestsPer30s: 90, genresPerHour: 60 },
-    seamLeadMs: 1500, mismatch: 'reclaim',
+    seamLeadMs: 1500, mismatch: 'reclaim', verboseLog: false,
   });
   assert.equal(s.music.source, 'subsonic');
 });
@@ -45,7 +45,7 @@ test('every field survives a controller restart', async () => {
       deviceName: 'SUB/WAVE booth', bitrate: 160,
       pool: { playlistIds: ['37i9dQZF1DXcBWIGoYBM5M', '37i9dQZF1DX0XUsuxWHRQd'], includeSaved: false, includeSavedAlbums: true, maxTracks: 1200, fullWalkHours: 6 },
       quota: { requestsPer30s: 40, genresPerHour: 0 },
-      seamLeadMs: 3000, mismatch: 'follow',
+      seamLeadMs: 3000, mismatch: 'follow', verboseLog: true,
     },
   });
   assert.equal(s.music.source, 'spotify');
@@ -63,10 +63,11 @@ test('every field survives a controller restart', async () => {
   assert.equal(s.spotify.quota.genresPerHour, 0, '0 is a real value — genre enrichment off, not "unset, use the default"');
   assert.equal(s.spotify.seamLeadMs, 3000);
   assert.equal(s.spotify.mismatch, 'follow');
+  assert.equal(s.spotify.verboseLog, true, 'seam tracing is an operator toggle, so it must survive the restart it is used to debug');
 });
 
 test('a hand-edited block repairs rather than wedging boot', async () => {
-  const s = await coldLoad({ spotify: { bitrate: 999, mismatch: 'panic', pool: { playlistIds: 'nope', maxTracks: -5, fullWalkHours: 0 }, quota: { requestsPer30s: 'lots', genresPerHour: 99999 }, seamLeadMs: 'x', healthPollSec: 99999 } });
+  const s = await coldLoad({ spotify: { bitrate: 999, mismatch: 'panic', verboseLog: 'yes please', pool: { playlistIds: 'nope', maxTracks: -5, fullWalkHours: 0 }, quota: { requestsPer30s: 'lots', genresPerHour: 99999 }, seamLeadMs: 'x', healthPollSec: 99999 } });
   // healthPollSec was a knob that was defaulted, clamped, patchable, schema'd
   // and documented — and read by nothing. It is gone; a stored value is now
   // stripped like any other unknown key rather than pretending to do something.
@@ -79,6 +80,7 @@ test('a hand-edited block repairs rather than wedging boot', async () => {
   assert.equal(s.spotify.pool.fullWalkHours, 1, 'clamped to the floor — 0 would mean a full walk every get()');
   assert.equal(s.spotify.quota.requestsPer30s, 90, 'unparseable falls back to the default rather than NaN');
   assert.equal(s.spotify.quota.genresPerHour, 5000, 'clamped to the ceiling');
+  assert.equal(s.spotify.verboseLog, false, 'a non-boolean falls back to off — tracing must never switch itself on');
 });
 
 test('the patch path is strict where load() is lenient', () => {

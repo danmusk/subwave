@@ -16,6 +16,7 @@ import { saveSecrets } from '../../setup/secrets.js';
 import { SpotifyClient, SPOTIFY_SCOPES } from '../../music/sources/spotify/client.js';
 import { spotifyClient, spotifyCredentials, spotifyPool } from '../../music/sources/spotify/source.js';
 import { spotifyReadStats } from '../../music/sources/spotify/reads.js';
+import { unplayableCount, unplayableList, clearUnplayable, UNPLAYABLE_TTL_MS } from '../../music/sources/spotify/unplayable-file.js';
 import { writeLibrespotToken, readLibrespotToken, LIBRESPOT_CACHE_DIR } from '../../music/sources/spotify/token-file.js';
 import { beginReceiverAuth, takeReceiverVerifier, exchangeReceiverCode, parseReceiverRedirect, LIBRESPOT_REDIRECT_URI } from '../../music/sources/spotify/receiver-auth.js';
 import { existsSync } from 'node:fs';
@@ -115,6 +116,15 @@ export function spotifyStatus(req: express.Request) {
     redirectUri: spotifyRedirectUri(req),
     scopes: SPOTIFY_SCOPES,
     pool: poolStatus(),
+    // Tracks Spotify refused to play, which the station now remembers so the
+    // picker cannot keep choosing them. Surfaced because a silently shrinking
+    // library is exactly the kind of thing an operator should be able to see
+    // and undo — and because a high `hits` says something is still re-picking.
+    unplayable: {
+      count: unplayableCount(),
+      ttlDays: Math.round(UNPLAYABLE_TTL_MS / 86_400_000),
+      recent: unplayableList(20),
+    },
   };
 }
 
@@ -239,6 +249,17 @@ router.post('/settings/spotify/test', requireAdmin, async (_req, res) => {
 router.post('/settings/spotify/hold/clear', requireAdmin, (_req, res) => {
   spotifyClient().clearHold();
   res.json({ ok: true, pool: poolStatus() });
+});
+
+// Forget every refused track. Costs NO catalogue requests: the pool snapshot
+// keeps the rows a refusal only withheld, so republish() restores them from what
+// is already in memory. Deliberately does not invalidate() the pool — that would
+// buy a full re-walk to recover rows that were never actually lost.
+router.post('/settings/spotify/unplayable/clear', requireAdmin, (_req, res) => {
+  const forgotten = clearUnplayable();
+  const restored = spotifyPool().republish();
+  queue.log('scheduler', `Spotify: forgot ${forgotten} refused track(s); ${restored} returned to the library. They will be re-tagged when the tagger next runs.`);
+  res.json({ ok: true, forgotten, restored, pool: poolStatus() });
 });
 
 router.post('/settings/spotify/disconnect', requireAdmin, async (req, res) => {

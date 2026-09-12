@@ -21,6 +21,10 @@ function harness(over: Partial<TransportDeps> & { mismatch?: 'reclaim' | 'follow
   const calls: string[] = [];
   const logs: string[] = [];
   let marker: SpotifyPlayerEvent | null = null;
+  // The refused-track memory, standing in for unplayable-file.ts. Tests read it
+  // to assert that a refusal was actually remembered, which is the whole point
+  // of the feature — the substitute is a bonus.
+  const refused = new Map<string, { title: string; artist: string; reason: string }>();
   const deps: TransportDeps = {
     play: async (id) => { calls.push(`play:${id}`); return over.playResult ?? { ok: true }; },
     transferHere: async () => { calls.push('transfer'); return true; },
@@ -31,6 +35,11 @@ function harness(over: Partial<TransportDeps> & { mismatch?: 'reclaim' | 'follow
     songById: async (id) => ({ id, title: `song ${id.slice(0, 1)}`, artist: 'X', album: 'Y' }),
     fallbackSong: async () => ({ id: ID_X, title: 'pool track', artist: 'P', album: 'Q' }),
     onUnplayable: (item, reason) => { calls.push(`unplayable:${item.track.id}:${reason}`); },
+    // Default: no alternative exists. The tests that care override it.
+    findAlternative: async () => { calls.push('findAlternative'); return null; },
+    noteRefused: (id, info) => { calls.push(`refused:${id}:${info.reason}`); refused.set(id, info); },
+    isRefused: (id) => refused.has(id),
+    onTrackSubstituted: (item, track) => { calls.push(`substituted:${item.track.id}->${track.id}`); item.track = track; },
     log: (kind, line) => { logs.push(`${kind}: ${line}`); },
     seamLeadMs: () => 1500,
     mismatchPolicy: () => over.mismatch ?? 'reclaim',
@@ -43,7 +52,7 @@ function harness(over: Partial<TransportDeps> & { mismatch?: 'reclaim' | 'follow
   const emit = (event: string, o: Partial<SpotifyPlayerEvent> = {}) => { marker = { event, trackId: null, positionMs: null, durationMs: null, at: now, ...o }; };
   const advance = (ms: number) => { now += ms; };
   const item = (id: string, title: string) => ({ track: { id, title, artist: 'Portishead', album: 'Dummy', duration: 200 } } as any);
-  return { t, calls, logs, emit, advance, item, deps };
+  return { t, calls, logs, emit, advance, item, deps, refused };
 }
 
 test('happy path: handoff → seam → play → track_changed → mixer told; gap off/on around the seam', async () => {
@@ -123,6 +132,107 @@ test('a play that the API refuses as unplayable drops the item; a missing device
   await h2.t.handoff(h2.item(ID_B, 'Roads'));
   assert.equal((h2.t.status().pending as any).id, ID_B, 'kept — the receiver may come back');
   assert.ok(h2.logs.some((l) => /no-device/.test(l)));
+});
+
+// ── refused tracks: remember, substitute, never offer again ─────────────────
+//
+// The incident these pin: one track Spotify would not play was picked,
+// commanded and refused 212 times in a row, because the failure was logged and
+// then forgotten. Remembering it is the fix; the alternative release is the
+// bonus, and it is bounded so it can never become the new storm.
+
+const ID_ALT = 'RRRRRRRRRRRRRRRRRRRRRR';
+
+test('a refusal is REMEMBERED, not just dropped — that is what stops the re-pick loop', async () => {
+  const h = harness();
+  await h.t.handoff(h.item(ID_B, 'Roads'));
+  h.advance(3_500); h.emit('unavailable', { trackId: ID_B }); await h.t.tick();
+
+  assert.deepEqual(h.refused.get(ID_B), { title: 'Roads', artist: 'Portishead', reason: 'unavailable' });
+  assert.ok(h.logs.some((l) => /remembered so nothing picks it again/.test(l)),
+    'the operator is told the id was kept, not just that the track failed');
+});
+
+const altTrack = { id: ID_ALT, title: 'Roads - 2018 Remaster', artist: 'Portishead', album: 'Dummy (Remastered)', duration: 201 };
+
+test('one alternative release is tried, and now-playing names the release that actually played', async () => {
+  const h = harness({ findAlternative: async () => altTrack });
+  await h.t.handoff(h.item(ID_B, 'Roads'));
+  h.advance(3_500); h.emit('unavailable', { trackId: ID_B }); await h.t.tick();
+
+  assert.ok(h.calls.includes(`substituted:${ID_B}->${ID_ALT}`));
+  assert.equal(h.calls.includes(`unplayable:${ID_B}:unavailable`), false,
+    'the slot is not given up while a substitute is in hand');
+  assert.ok(h.calls.includes(`play:${ID_ALT}`), 'the seam step of the same tick commands it — no dead air');
+
+  h.advance(100); h.emit('track_changed', { trackId: ID_ALT, durationMs: 201_000 }); await h.t.tick();
+  assert.ok(h.calls.includes(`mixer:${ID_ALT}:Roads - 2018 Remaster`),
+    'the mixer is told the release that played, not the one that was refused');
+});
+
+test('a refusal inside the 3s floor defers the substitute rather than losing it', async () => {
+  // The realistic shape: librespot reports `unavailable` almost immediately, so
+  // the hard floor between play commands is still in force. The substitute must
+  // survive that — an earlier version put it back in `pending` and then sat out
+  // the full 15s idle window, because seamDecision reads "nothing playing, we
+  // commanded recently" as "wait for the player".
+  const h = harness({ findAlternative: async () => altTrack });
+  await h.t.handoff(h.item(ID_B, 'Roads'));
+  h.advance(200); h.emit('unavailable', { trackId: ID_B }); await h.t.tick();
+
+  assert.ok(h.calls.includes(`substituted:${ID_B}->${ID_ALT}`));
+  assert.equal(h.calls.includes(`play:${ID_ALT}`), false, 'the 3s floor held it');
+  assert.equal((h.t.status().pending as any).id, ID_ALT, 'kept, not dropped');
+
+  h.advance(3_000); await h.t.tick();
+  assert.ok(h.calls.includes(`play:${ID_ALT}`), 'commanded as soon as the floor allows, not 15s later');
+});
+
+test('the alternative gets ONE chance: refused too, both ids are remembered and the slot is given up', async () => {
+  const alt = { id: ID_ALT, title: 'Roads - 2018 Remaster', artist: 'Portishead', album: 'Dummy', duration: 201 };
+  let asked = 0;
+  const h = harness({ findAlternative: async () => { asked++; return asked === 1 ? alt : null; } });
+  await h.t.handoff(h.item(ID_B, 'Roads'));
+  h.advance(3_500); h.emit('unavailable', { trackId: ID_B }); await h.t.tick();
+  h.advance(3_500); await h.t.tick();                       // commands the substitute
+  h.emit('unavailable', { trackId: ID_ALT }); await h.t.tick();
+
+  assert.equal(asked, 1, 'one search per queue item, however many releases are refused');
+  assert.deepEqual([...h.refused.keys()], [ID_B, ID_ALT]);
+  assert.ok(h.calls.includes(`unplayable:${ID_ALT}:unavailable`), 'now the slot is given up');
+});
+
+test('a refused POOL FALLBACK never spends a search — drawing another pool track is free', async () => {
+  const h = harness();
+  await h.t.tick();                                          // nothing pending → pool fallback
+  assert.ok(h.calls.includes(`play:${ID_X}`));
+  h.emit('unavailable', { trackId: ID_X }); await h.t.tick();
+
+  assert.equal(h.calls.includes('findAlternative'), false);
+  assert.equal(h.refused.has(ID_X), true, 'still remembered — keep() must stop drawing it from the pool');
+});
+
+test('a known-refused pick is declined at handoff and never reaches the API', async () => {
+  const h = harness();
+  h.refused.set(ID_B, { title: 'Roads', artist: 'Portishead', reason: 'unavailable' });
+  await h.t.handoff(h.item(ID_B, 'Roads'));
+
+  assert.equal(h.calls.some((c) => c.startsWith('play:')), false, 'no request spent on a track we know is dead');
+  assert.equal(h.t.status().pending, null);
+  assert.ok(h.calls.includes(`unplayable:${ID_B}:known unavailable`));
+});
+
+test("a play 403 takes the same path as librespot's event: remembered, one alternative", async () => {
+  const alt = { id: ID_ALT, title: 'Roads', artist: 'Portishead', album: 'Dummy (Deluxe)', duration: 200 };
+  const h = harness({
+    playResult: { ok: false, reason: 'unplayable', message: 'restricted' },
+    findAlternative: async () => alt,
+  });
+  await h.t.handoff(h.item(ID_B, 'Roads'));
+
+  assert.equal(h.refused.get(ID_B)?.reason, 'restricted');
+  assert.ok(h.calls.includes(`substituted:${ID_B}->${ID_ALT}`));
+  assert.equal((h.t.status().pending as any).id, ID_ALT);
 });
 
 test('a commanded track that never starts is retried once, then dropped', async () => {

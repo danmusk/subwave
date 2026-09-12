@@ -25,6 +25,7 @@ import {
   DEFAULT_START_TIMEOUT_MS, DEFAULT_IDLE_MS,
   type CurrentTrack, type MismatchPolicy,
 } from './seam-pure.js';
+import { strace, straceThrottled } from './trace.js';
 
 export interface TransportDeps {
   // player commands
@@ -48,8 +49,22 @@ export interface TransportDeps {
   // catalog
   songById: (id: string) => Promise<any | null>;
   fallbackSong: () => Promise<any | null>;
+  // The same recording on another release, or null. ONE metered search, and the
+  // implementation declines outright while the rate-limit gate is shut — a
+  // substitute is optional and must never add delay to the seam (source.ts).
+  findAlternative: (want: any) => Promise<any | null>;
+  // The refused-track memory: remember the id and take it out of the live pool.
+  // Injected rather than imported so the transport keeps no store edge and the
+  // tests can watch it.
+  noteRefused: (trackId: string, info: { title: string; artist: string; reason: string }) => void;
+  isRefused: (trackId: string) => boolean;
   // queue hooks
   onUnplayable: (item: QueueItem, reason: string) => void;
+  // Point a queue item at a different recording of the same song. The item
+  // object is NOT replaced — `pending`/`expected` identity checks hold — only
+  // its track, so now-playing, the scrobble and the mixer metadata name what
+  // actually played.
+  onTrackSubstituted: (item: QueueItem, track: any) => void;
   log: (kind: string, line: string) => void;
   // settings
   seamLeadMs: () => number;
@@ -100,6 +115,20 @@ export class SpotifyTransport implements PlaybackTransport {
   private busy = false;
   private timer: NodeJS.Timeout | null = null;
   private lastLog = new Map<string, number>();
+  // Queue items that have already spent their one alternative-release search.
+  // A WeakSet rather than a flag on QueueItem: the cap is a property of this
+  // transport's handling, not of the queue's data, and an item that airs or is
+  // cancelled should take its entry with it.
+  private readonly altTried = new WeakSet<QueueItem>();
+  // "The last command is dead — do not sit out the idle window for it."
+  //
+  // seamDecision treats `current === null` as "we commanded something, give the
+  // player a moment", bounded by `idleMs` (15s). That is right when a command is
+  // genuinely in flight, and wrong after a refusal, where we KNOW nothing is
+  // coming. Without this a substitute sat in `pending` for the full idle window
+  // with the emergency loop on air. Consumed by the next tick that actually
+  // reaches a decision, so a failure backoff still holds it.
+  private resumeNow = false;
   private readonly now: () => number;
 
   constructor(private readonly deps: TransportDeps) {
@@ -143,6 +172,18 @@ export class SpotifyTransport implements PlaybackTransport {
   // ── PlaybackTransport ────────────────────────────────────────────────────
 
   async handoff(item: QueueItem): Promise<void> {
+    // Never accept a track we already know Spotify refuses. keep() keeps these
+    // out of every pick path, so reaching here means the agent named an id from
+    // its own conversation memory that no tool returned — the one route the
+    // source-level filter cannot cover. Refusing it now costs nothing; letting
+    // it through costs a play command, a start timeout and a dead slot.
+    const id = item.track?.id;
+    if (id && this.deps.isRefused(id)) {
+      this.deps.log('scheduler', `Spotify: "${item.track?.title ?? id}" was refused by Spotify before — not queueing it again`);
+      strace('handoff', `declined known-refused ${id}`, { id, title: item.track?.title });
+      this.deps.onUnplayable(item, 'known unavailable');
+      return;
+    }
     if (this.pending && this.pending !== item) {
       this.deps.log('scheduler', `Spotify transport: "${this.pending.track?.title}" replaced by "${item.track?.title}" before it aired`);
     }
@@ -230,6 +271,10 @@ export class SpotifyTransport implements PlaybackTransport {
         this.busy = false;
         return;
       }
+      // Consumed here rather than at the top of the tick: an early return on the
+      // failure backoff must not spend it.
+      const resume = this.resumeNow;
+      this.resumeNow = false;
       const d = seamDecision({
         now,
         current: this.current,
@@ -239,8 +284,15 @@ export class SpotifyTransport implements PlaybackTransport {
         seamLeadMs: this.deps.seamLeadMs(),
         lastCommandAt: this.lastCommandAt,
         startTimeoutMs: this.deps.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS,
-        idleMs: immediate ? 0 : (this.deps.idleMs ?? DEFAULT_IDLE_MS),
+        idleMs: (immediate || resume) ? 0 : (this.deps.idleMs ?? DEFAULT_IDLE_MS),
       });
+      // Twice a second, so keyed on the decision itself: straceThrottled prints
+      // a change immediately and otherwise heartbeats, instead of ~172,000
+      // identical lines a day burying everything else in the container log.
+      straceThrottled('seam', `${d.action}:${this.expected?.id ?? this.pending?.track?.id ?? ''}`,
+        `seam ${d.action} — ${d.reason}`,
+        { action: d.action, reason: d.reason, pending: this.pending?.track?.title ?? null, current: this.current?.id ?? null },
+        now);
       if (d.action === 'command-next') {
         await this.commandNext(d.reason);
       } else if (d.action === 'command-timeout') {
@@ -311,11 +363,7 @@ export class SpotifyTransport implements PlaybackTransport {
         const exp = this.expected;
         if (exp && (!meaning.trackId || meaning.trackId === exp.id)) {
           this.expected = null;
-          this.deps.log('error', `Spotify: "${exp.item?.track?.title ?? exp.id}" is unavailable on this account/market — dropping it`);
-          if (exp.item) this.deps.onUnplayable(exp.item, 'unavailable');
-          if (this.pending === exp.item) this.pending = null;
-          this.noteFailure('unavailable');
-          if (this.now() >= this.holdUntil) await this.commandNext('after an unavailable track');
+          await this.refused(exp, 'unavailable', 'is unavailable on this account/market', true);
         }
         return;
       }
@@ -361,25 +409,102 @@ export class SpotifyTransport implements PlaybackTransport {
   }
 
   private async command(trackId: string, item: QueueItem | null, attempts: number, reason: string, song: any | null = null): Promise<void> {
+    // Last line before a request is spent. handoff() already declines a known
+    // refusal, but a pool fallback and a retry reach here by other routes.
+    if (this.deps.isRefused(trackId)) {
+      this.deps.log('scheduler', `Spotify: not commanding "${item?.track?.title ?? song?.title ?? trackId}" — Spotify refused it before`);
+      if (item) {
+        this.deps.onUnplayable(item, 'known unavailable');
+        if (this.pending === item) this.pending = null;
+      }
+      return;
+    }
     // Hard floor between plays, whatever the reason: two commands a second is
     // never a station, it is a loop.
     if (this.lastCommandAt != null && this.now() - this.lastCommandAt < MIN_COMMAND_GAP_MS) {
       this.holdUntil = this.lastCommandAt + MIN_COMMAND_GAP_MS;
+      // The command did not go out, so whatever urgency brought us here still
+      // applies. Without re-arming this a substitute deferred by the floor lost
+      // its claim and then waited out the whole idle window instead.
+      this.resumeNow = true;
       return;
     }
     this.lastCommandAt = this.now();
-    this.expected = { id: trackId, item, song, commandedAt: this.now(), attempts };
+    const exp: Expected = { id: trackId, item, song, commandedAt: this.now(), attempts };
+    this.expected = exp;
+    strace('command', `play ${trackId} (${reason})`, { id: trackId, title: item?.track?.title ?? song?.title, attempts, reason });
     const r = await this.deps.play(trackId);
     if (r.ok) return;
     this.expected = null;
     this.deps.log('error', `Spotify: play "${item?.track?.title ?? trackId}" failed (${r.reason}: ${r.message}) [${reason}]`);
-    if (r.reason === 'unplayable' && item) {
-      this.deps.onUnplayable(item, r.message);
-      if (this.pending === item) this.pending = null;
+    // A 403 on the play command is the same verdict librespot's `unavailable`
+    // event gives, arriving by the other route — so it takes the same path:
+    // remembered, and offered one alternative release. `chain` is false because
+    // the tick is about to run anyway and commandNext from inside command()
+    // would recurse.
+    if (r.reason === 'unplayable') {
+      await this.refused(exp, r.message || 'unplayable', 'was refused by Spotify', false);
+      return;
     }
     this.noteFailure(`play ${r.reason}`);
     // no-device / auth / error: leave `pending` in place; the next tick retries
     // after the backoff, and the doctor/status shows why.
+  }
+
+  // Spotify will not play this track: remember it, and try ONE other release of
+  // the same recording before giving the slot up.
+  //
+  // Remembering is the half that matters. Without it the picker offered the same
+  // dead track on the very next cycle — measured at 212 consecutive unresolvable
+  // picks of one song, each costing an LLM call and a play command, with the auto
+  // playlist covering the air throughout. keep() reads the store, so one refusal
+  // removes the track from every pick path at once.
+  //
+  // The substitute is a bonus, not a guarantee, and it is bounded three ways: one
+  // search per queue item (`altTried`), never for a pool fallback (drawing
+  // another pool track is free and a search is not), and skipped entirely while
+  // the rate-limit gate is shut (source.ts owns that check).
+  //
+  // `chain` is whether to command the next track here. True for librespot's
+  // `unavailable`, which arrives mid-air with the slot already empty; false for a
+  // play command's own 403, where the caller is already inside command() and the
+  // tick is about to try again anyway.
+  private async refused(exp: Expected, reason: string, phrase: string, chain: boolean): Promise<void> {
+    const song = exp.item?.track ?? exp.song ?? null;
+    const title = song?.title ?? exp.id;
+
+    this.deps.noteRefused(exp.id, {
+      title: String(song?.title ?? ''),
+      artist: String(song?.artist ?? ''),
+      reason,
+    });
+    this.deps.log('error', `Spotify: "${title}" ${phrase} — dropped, and remembered so nothing picks it again`);
+    strace('refused', `${exp.id} refused (${reason})`, { id: exp.id, title, reason });
+
+    // A pool fallback has no queue item and needs no substitute: the next tick
+    // simply draws another pool track, which costs nothing.
+    if (exp.item && !this.altTried.has(exp.item)) {
+      this.altTried.add(exp.item);
+      const alt = await this.deps.findAlternative(song ?? { id: exp.id }).catch(() => null);
+      if (alt?.id) {
+        this.deps.onTrackSubstituted(exp.item, alt);
+        this.pending = exp.item;
+        this.resumeNow = true;
+        this.deps.log('scheduler', `Spotify: playing "${alt.title}"${alt.album ? ` from ${alt.album}` : ''} instead — same recording, a release this account can play`);
+        // Deliberately NOT noteFailure(): the transport is making progress, and
+        // the substitute's own outcome is what gets counted. It is also not
+        // commanded inline — command() early-returns under the 3s floor and
+        // would swallow it silently, so it goes back through `pending` and the
+        // normal tick picks it up, still inside every existing bound.
+        return;
+      }
+      this.deps.log('scheduler', `Spotify: no other release of "${title}" is playable on this account — picking something else`);
+    }
+
+    if (exp.item) this.deps.onUnplayable(exp.item, reason);
+    if (this.pending === exp.item) this.pending = null;
+    this.noteFailure(reason);
+    if (chain && this.now() >= this.holdUntil) await this.commandNext('after an unavailable track');
   }
 
   // Consecutive failures (a play refused, a track never starting, `unavailable`)
@@ -430,7 +555,8 @@ export async function startSpotifyTransportIfActive(): Promise<SpotifyTransport 
   const { setLiveTransport } = await import('../../../broadcast/queue/transport.js');
   const liq = await import('../../../broadcast/liquidsoap-control.js');
   const markers = await import('../../../broadcast/spotify-player.js');
-  const { spotifyClient, spotifySettings, spotifySource, receiverDeviceName } = await import('./source.js');
+  const { spotifyClient, spotifySettings, spotifySource, receiverDeviceName, spotifyPool, findAlternativeTrack } = await import('./source.js');
+  const { markUnplayable, isKnownUnplayable } = await import('./unplayable-file.js');
   const { readLibrespotToken, writeLibrespotToken } = await import('./token-file.js');
   const { SpotifyPlaybackController } = await import('./playback.js');
 
@@ -462,7 +588,23 @@ export async function startSpotifyTransportIfActive(): Promise<SpotifyTransport 
     readAudioState: () => markers.currentSpotifyAudioState(),
     songById: (id) => spotifySource.getSong(id),
     fallbackSong: async () => (await spotifySource.getRandomSongs({ size: 1 }))[0] ?? null,
-    onUnplayable: (item) => queue.onPushResolveFailed(item),
+    findAlternative: (want) => findAlternativeTrack(want),
+    // Two local writes, no request: remember the refusal, and take the row out
+    // of the live pool so the tagger, coverage and the orphan reconcile see the
+    // same library the picker does. The SNAPSHOT deliberately keeps it (pool.ts).
+    noteRefused: (trackId, info) => {
+      markUnplayable(trackId, info);
+      spotifyPool().dropTrack(trackId);
+    },
+    isRefused: (trackId) => isKnownUnplayable(trackId),
+    // The queue's own error wording is written for the file path and points at a
+    // `protocol.subhttp` line that does not exist in Spotify mode, so the reason
+    // is passed in rather than left to the default.
+    onUnplayable: (item, reason) => queue.onPushResolveFailed(item, {
+      reason,
+      detail: `Spotify would not play it on the station's receiver (${reason}). It has been remembered, so the picker will not offer it again.`,
+    }),
+    onTrackSubstituted: (item, track) => queue.substituteTrack(item, track),
     log: (kind, line) => queue.log(kind, line),
     seamLeadMs: () => Number(spotifySettings().seamLeadMs ?? 1500),
     mismatchPolicy: () => (spotifySettings().mismatch === 'follow' ? 'follow' : 'reclaim'),

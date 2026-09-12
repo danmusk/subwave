@@ -25,6 +25,9 @@ import { mapTrack, mapAlbum, mapArtist, mapPlaylist, unwrapItem, trackIdFromUri 
 import { listMyPlaylists, listSavedAlbums, listSavedTracks, getAlbumRaw, searchRaw } from './reads.js';
 import { readReceiverDeviceName } from './token-file.js';
 import { readHold, writeHold, clearHold } from './hold-file.js';
+import { unplayableIds } from './unplayable-file.js';
+import { rankAlternatives } from './alternative-pure.js';
+import { strace, traceWanted } from './trace.js';
 import { SPOTIFY_DEFAULT_DEVICE_NAME } from '../../../settings/liquidsoap.js';
 
 export const SPOTIFY_SOURCE_ID = 'spotify';
@@ -110,8 +113,19 @@ export function spotifyPool(): SpotifyPoolCache {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+// The one filter every song list this source hands back passes through — which
+// is why the refused-track memory is applied HERE and nowhere else on the pick
+// side. The pool picker, every agent discovery tool and the transport's own
+// pool fallback all read through one of the functions below, so they inherit it
+// with no new enforcement site, exactly as they inherit the blocklist.
+//
+// `isPlayable` is kept but is inert in practice: Spotify only populates
+// `is_playable` when a `market` is supplied, and since February 2026 nothing can
+// derive one (client.ts). unplayableIds() is what actually knows.
 const keep = (songs: Array<Song | null>, includeBlocked = false): Song[] => {
-  const list = songs.filter((s): s is Song => !!s && s.isPlayable !== false);
+  const refused = unplayableIds();
+  const list = songs.filter((s): s is Song =>
+    !!s && s.isPlayable !== false && !refused.has(s.id));
   return includeBlocked ? list : blocklist.rejectBlocked(list);
 };
 
@@ -475,6 +489,59 @@ async function getRecentSongs({ size = 20 } = {}): Promise<Song[]> {
   if (!dated.length) return [];
   dated.sort((a, b) => String(b.created).localeCompare(String(a.created)));
   return keep(dated).slice(0, Math.max(1, size));
+}
+
+// "That release is refused — is the same recording on another one?"
+//
+// ONE request, and only when it can be afforded. Three rules, all of them about
+// the metered quota rather than about matching:
+//
+//  • FOREGROUND lane. Deliberately not `critical` — that is the /me/player/*
+//    block and nothing else, and an exempt lane may not arm the gate. A
+//    substitute is a nice-to-have; the station keeps making sound without one.
+//  • Skipped outright while the gate is shut. Left to the foreground lane's own
+//    behaviour this would WAIT OUT a short window, and that delay lands directly
+//    in the seam. A rate-limit episode must not become a search storm either.
+//  • Exactly ten results, so it is ONE page. /search caps `limit` at 10, and
+//    asking for more makes searchPaged issue three HTTP requests for one
+//    logical search. Never raise it "to find more versions": the ranking refuses
+//    almost everything anyway.
+//
+// The `searchRaw` memo covers the repeats — the same track refused twice inside
+// the TTL costs one request, not two, and a search that 429s is not re-issued.
+export const ALTERNATIVE_SEARCH_LIMIT = 10;
+
+export async function findAlternativeTrack(want: Song): Promise<Song | null> {
+  const title = String(want?.title ?? '').trim();
+  const artist = String(want?.artist ?? '').trim();
+  if (!title || !artist) return null;
+
+  const hold = spotifyClient().rateLimitHold();
+  if (hold.msLeft > 0) {
+    strace('alternative', `skipping the alternative search for "${title}" — Spotify is holding us off for ${Math.ceil(hold.msLeft / 1000)}s`);
+    return null;
+  }
+
+  let rows: any[];
+  try {
+    rows = await searchPaged(`track:"${title}" artist:"${artist}"`, 'track', ALTERNATIVE_SEARCH_LIMIT);
+  } catch (err: any) {
+    strace('alternative', `alternative search for "${title}" failed: ${err?.message ?? err}`);
+    return null;
+  }
+
+  // The candidate list is filtered by keep() first, so anything already refused
+  // (or blocked) is gone before ranking; `unplayableIds()` is passed as well so
+  // the notes can say WHY a row was skipped rather than it silently vanishing.
+  const candidates = withPoolGenres(keep(rows.map((t: any) => mapTrack(t))));
+  const { ranked, notes } = rankAlternatives(want, candidates, unplayableIds());
+  if (traceWanted()) {
+    strace('alternative', `alternative search for "${title}": ${rows.length} rows, ${ranked.length} usable`, {
+      wantId: want.id,
+      candidates: notes.map((n) => ({ id: n.id, title: n.title, rejected: n.rejected })),
+    });
+  }
+  return ranked[0] ?? null;
 }
 
 export const spotifySource: MusicSource = {

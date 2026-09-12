@@ -110,6 +110,45 @@ the receiver.
   publishes the real track so now-playing is never wrong for long.
 - **Operator skip** (`/dj/skip`) commands the next pick immediately.
 
+## When Spotify refuses a track
+
+Some tracks will not play on your account — a licence that lapsed in your
+country, a release pulled from the catalogue, a regional restriction. **Spotify
+gives the station no way to know this in advance.** February 2026 removed
+`available_markets` and the `/markets` endpoint, and without a market parameter
+the API never fills in `is_playable`, so every track looks playable until it is
+tried. The station finds out the same way you would: by pressing play.
+
+What happens then:
+
+1. **It is remembered.** The track id goes into `state/spotify/unplayable.json`
+   and is filtered out of every pick path at once — the DJ agent's tools, the
+   pool picker, listener-request matching and the transport's own pool fallback.
+   Without this the picker simply chose it again on the next cycle; on one real
+   run the same track was picked, commanded and refused **212 times in a row**,
+   an LLM call and a play command each, with the auto playlist covering the air.
+2. **One other release is tried.** The station searches for the same recording
+   on a different release — a remaster, a deluxe edition — and plays that
+   instead, keeping the DJ's link intact because the title and artist match. A
+   live version, a karaoke backing or a remix is never accepted as a substitute.
+   That search is a single request, is skipped entirely while Spotify is rate
+   limiting the station, and happens at most once per pick.
+3. **If there is no playable release, the slot moves on** and the DJ picks
+   something else.
+
+Refusals are forgotten after **30 days**, in case the licensing comes back, and
+admin → Music source shows the count with a **Forget refused tracks** button if
+you want them back sooner. Both are free — the pool snapshot on disk keeps the
+rows a refusal only withholds, so nothing has to be re-walked. The one cost is
+that a track held back is also absent from the tagger's view of the library, so
+it will be re-tagged when it returns.
+
+Turn on **Seam tracing** in the same admin section to watch all of this happen —
+every player event, every seam decision, every candidate the substitute search
+considered and why it was rejected. It takes effect immediately, needs no
+restart, and writes to the controller's container log (`[spotify+]`) and to
+`state/logs/events-*.jsonl`, never to the booth log.
+
 ## What is different from Navidrome
 
 Spotify exposes no audio file, so everything the acoustic analyzer derives is
@@ -217,13 +256,15 @@ receiver launch flags and need a mixer restart; the rest apply live.
 | Pool card says *from the saved snapshot*, and the tagger reports a skipped prune | Library pool card | expected right after a restart: the pool was restored from disk (which is why the station was playing immediately) and has not been re-checked against Spotify yet. The next refresh clears it. The tagger never deletes against a view it has not confirmed itself |
 | Receiver missing from the device list | `spotify.deviceName`, `docker compose logs broadcast` | librespot not authenticated; the name is matched case-insensitively |
 | Picks never start, booth log says `no-device` | as above | the receiver is down; picks stay queued until it returns |
-| `unavailable` in the booth log | track/market | not playable on this account or market — dropped and re-picked |
+| `unavailable` in the booth log | admin → Music source, the refused-tracks line | not playable on this account or market. Expected on any library of size, and self-correcting: the id is remembered so nothing picks it again, one other release is tried, and it is forgotten after 30 days. **Forget refused tracks** puts them back at no quota cost |
 | Silence but `/state` transport shows `playing` | `state/spotify-audio.json` | receiver stalled; the transport re-commands after the idle window |
 | Doctor: `spotify connectivity` fails | credentials | refresh token revoked — reconnect |
 
 State files: `state/spotify/` (receiver credential cache, token,
-`artist-genres.json`, `pool.json` and `rate-limit.json` — all rebuildable
-caches, deliberately not in backups; delete them and the station re-walks),
+`artist-genres.json`, `pool.json`, `rate-limit.json` and `unplayable.json` — all
+rebuildable caches, deliberately not in backups; a refusal list in particular
+describes ONE account's licensing and would silently remove music if restored
+onto another machine. Delete them and the station re-walks),
 `state/spotify-player.json` (last player event), `state/spotify-audio.json`
 (silence detector), `state/logs/spotify-events.log` (rolling event log),
 `state/liquidsoap_music_mode.txt` and `state/liquidsoap_spotify.txt` (mixer

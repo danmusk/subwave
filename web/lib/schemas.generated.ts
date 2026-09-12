@@ -3399,6 +3399,7 @@ export const spotifyPatchSchema = settingsBlockOf({
     SPOTIFY_MISMATCH_MODES,
     `spotify.mismatch must be one of: ${SPOTIFY_MISMATCH_MODES.join(', ')}`,
   ),
+  verboseLog: settingsBoolLike(),
 });
 
 export const likesPatchSchema = settingsBlockOf({

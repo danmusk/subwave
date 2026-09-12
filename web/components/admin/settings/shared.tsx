@@ -534,6 +534,9 @@ export interface SettingsData {
       seamLeadMs?: number;
       healthPollSec?: number;
       mismatch?: string;
+      // Per-tick seam tracing to the container log + the durable event stream.
+      // Read live, so it can be turned on mid-incident without a restart.
+      verboseLog?: boolean;
     };
     likes?: {
       enabled?: boolean;
@@ -632,6 +635,15 @@ export interface SettingsData {
       // longer costing a request each time a pick asks for them again.
       reads?: { albums?: number; searches?: number };
     } | null;
+    // Tracks Spotify refused to play, remembered so the picker cannot keep
+    // choosing them. Availability is only knowable at play time (February 2026
+    // removed every field that could have said so in advance), so this list is
+    // the only record — and a library that quietly shrinks has to be visible.
+    unplayable?: {
+      count: number;
+      ttlDays: number;
+      recent?: Array<{ id: string; title: string; artist: string; reason: string; hits: number; at: number; lastAt: number }>;
+    };
     // The RECEIVER's (librespot) sign-in — a second login for Spotify's own
     // client id; see music/sources/spotify/receiver-auth.ts.
     receiver?: {

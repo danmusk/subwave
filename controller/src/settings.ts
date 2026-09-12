@@ -1239,6 +1239,10 @@ export async function load() {
       mismatch: SPOTIFY_MISMATCH_MODES.includes(stored.spotify?.mismatch)
         ? stored.spotify.mismatch
         : DEFAULTS.spotify.mismatch,
+      verboseLog:
+        typeof stored.spotify?.verboseLog === 'boolean'
+          ? stored.spotify.verboseLog
+          : DEFAULTS.spotify.verboseLog,
     },
     likes: {
       enabled:
@@ -2017,6 +2021,7 @@ export async function update(patch) {
     if (sp.seamLeadMs !== undefined) next.spotify.seamLeadMs = sp.seamLeadMs as number;
     if (sp.healthPollSec !== undefined) next.spotify.healthPollSec = sp.healthPollSec as number;
     if (sp.mismatch !== undefined) next.spotify.mismatch = sp.mismatch as string;
+    if (sp.verboseLog !== undefined) next.spotify.verboseLog = sp.verboseLog as boolean;
     if (sp.pool !== undefined) {
       const pool = sp.pool as Record<string, unknown>;
       if (pool.playlistIds !== undefined) next.spotify.pool.playlistIds = pool.playlistIds as string[];

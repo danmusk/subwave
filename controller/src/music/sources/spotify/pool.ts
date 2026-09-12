@@ -61,6 +61,7 @@ import { mapPool } from '../../../util/async-pool.js';
 import { writeFileAtomic } from '../../../util/atomic-file.js';
 import { SPOTIFY_STATE_DIR } from './token-file.js';
 import { listMyPlaylists, invalidateSpotifyReads } from './reads.js';
+import { unplayableIds } from './unplayable-file.js';
 import {
   SPOTIFY_POOL_PATH, SRC_SAVED_TRACKS, SRC_SAVED_ALBUMS, POOL_SNAPSHOT_VERSION,
   compactTrack, expandTrack, compactAlbum, expandAlbum, readSnapshot, writeSnapshot,
@@ -200,6 +201,13 @@ export function stampEraSuspicion(tracks: Map<string, Song>, albums: Map<string,
 
 export class SpotifyPoolCache {
   private pool: SpotifyPool | null = null;
+  // Everything the last walk (or snapshot) actually yielded, BEFORE refused
+  // tracks are withheld. `pool.tracks` is what the station reads; this is what
+  // the snapshot is written from and what a cleared refusal list is restored
+  // from, so forgetting a refusal costs no catalogue requests. The Song objects
+  // are shared by reference with `pool.tracks`, so this is one extra Map of
+  // pointers, not a second copy of the library.
+  private walked: Map<string, Song> | null = null;
   private refreshing: Promise<SpotifyPool> | null = null;
   private snapshotLoaded = false;
   // Set by invalidate(): the next refresh must happen even if the pool looks
@@ -385,9 +393,11 @@ export class SpotifyPoolCache {
       if (a) albums.set(a.id, a);
     }
     const pendingArtists = [...new Set([...tracks.values()].map((s) => s.artistId).filter(Boolean))] as string[];
+    this.walked = tracks;
+    const published = this.publishable(tracks);
     this.pool = {
-      tracks, albums,
-      ...this.deriveGenreMaps(tracks),
+      tracks: published, albums,
+      ...this.deriveGenreMaps(published),
       playlists: snap.playlists,
       builtAt: snap.builtAt,
       walkedAt: snap.builtAt,
@@ -989,9 +999,12 @@ export class SpotifyPoolCache {
     }
     stampEraSuspicion(tracks, albums);
 
+    const walked = tracks;
+    this.walked = walked;
+    const published = this.publishable(walked);
     this.pool = {
-      tracks, albums,
-      ...this.deriveGenreMaps(tracks),
+      tracks: published, albums,
+      ...this.deriveGenreMaps(published),
       playlists,
       builtAt: this.now(),
       walkedAt,
@@ -999,7 +1012,9 @@ export class SpotifyPoolCache {
       genresPending: pending,
       dripAt: existing?.dripAt ?? 0,
       dripSkip: existing?.dripSkip ?? null,
-      truncated: tracks.size >= cfg.maxTracks,
+      // Measured on the WALK: a refusal withholding a row does not mean the
+      // walk stopped at its cap, and truncated drives the orphan reconcile.
+      truncated: walked.size >= cfg.maxTracks,
       cfgSig: poolConfigSignature(cfg),
       savedTracks, savedAlbums,
       // Confirmed against Spotify in THIS process, which is what catalogHealth()
@@ -1007,8 +1022,63 @@ export class SpotifyPoolCache {
       fromDisk: false,
     };
     this.snapshotLoaded = true;
-    if (tracks.size) await this.saveSnapshot(this.pool);
+    // The SNAPSHOT is written from the walked set, not the published one. A
+    // refusal is a fact about this account's licensing today, while pool.json is
+    // the only copy of a walk that cost ~100 requests — so the row stays on disk
+    // and only the station's view of it goes. That is what makes "Forget refused
+    // tracks", and the 30-day expiry, free rather than a full catalogue re-walk.
+    if (walked.size) await this.saveSnapshot({ ...this.pool, tracks: walked });
     return this.pool;
+  }
+
+  // Withhold tracks Spotify has refused to play. Applied at the two points a
+  // SpotifyPool is published (a finished walk, a restored snapshot) so every
+  // consumer of `pool.tracks` — the picker, the agent's tools, iterateAllSongs
+  // and therefore the tagger, coverage and the orphan reconcile — sees the same
+  // library.
+  //
+  // ALWAYS A NEW MAP, even when nothing is refused. Handing the walked map back
+  // as the published one is the obvious saving and it is wrong: `dropTrack` then
+  // deletes from both, so the very thing the split exists for — the snapshot
+  // keeping a row the station is not playing — is lost the moment it is used.
+  // Same shape as the never-starve rule in the track floor: a filter must not
+  // return its input.
+  private publishable(walked: Map<string, Song>): Map<string, Song> {
+    const refused = unplayableIds();
+    const out = new Map<string, Song>();
+    let held = 0;
+    for (const [id, song] of walked) {
+      if (refused.size && refused.has(id)) { held++; continue; }
+      out.set(id, song);
+    }
+    if (held) this.log(`[spotify] holding back ${held} track(s) Spotify refused to play; the snapshot keeps them, so clearing the list costs no requests`);
+    return out;
+  }
+
+  // A track was just refused on air: take it out of the live pool now rather
+  // than at the next build. Deliberately does NOT invalidate() — that marks a
+  // refresh owed and drops the shared read memos, i.e. buys a catalogue re-walk
+  // to remove one row we have already removed — and does NOT rewrite the
+  // snapshot, which keeps the row on purpose (see finish()).
+  dropTrack(id: string): boolean {
+    const p = this.pool;
+    if (!p || !p.tracks.has(id)) return false;
+    p.tracks.delete(id);
+    Object.assign(p, this.deriveGenreMaps(p.tracks));
+    return true;
+  }
+
+  // The mirror: the refused list was cleared (or entries expired), so republish
+  // from the walked set held in memory. No disk read and no request — and if
+  // there is nothing to republish from, the existing pool is left exactly as it
+  // is rather than being thrown away.
+  republish(): number {
+    const p = this.pool;
+    if (!p || !this.walked) return 0;
+    const before = p.tracks.size;
+    p.tracks = this.publishable(this.walked);
+    Object.assign(p, this.deriveGenreMaps(p.tracks));
+    return p.tracks.size - before;
   }
 }
 

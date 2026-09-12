@@ -158,6 +158,16 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
     finally { setSaving(false); }
   };
 
+  const forgetRefused = async () => {
+    setSaving(true);
+    try {
+      const j = (await post('/settings/spotify/unplayable/clear')) as { forgotten?: number; restored?: number };
+      notify.ok(`Forgot ${j.forgotten ?? 0} refused track(s); ${j.restored ?? 0} back in the library`);
+      refresh();
+    } catch (err) { notify.err(errorMessage(err)); }
+    finally { setSaving(false); }
+  };
+
   const savePool = () => saveSettings({ spotify: { pool: { playlistIds: playlistText } } });
 
   const receiverSignIn = async () => {
@@ -324,6 +334,36 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
         {st?.pool?.dripSkip ? (
           <div className="field-hint mt-2">Artist genres: {st.pool.dripSkip}.</div>
         ) : null}
+        {/* Spotify only tells the station a track is unplayable when it tries to
+            play it — February 2026 removed every field that could have said so in
+            advance — so the refusals are remembered. A shrinking library must be
+            visible and undoable, hence the count, the titles and the button. */}
+        {(st?.unplayable?.count ?? 0) > 0 ? (
+          <div className="field-hint mt-2">
+            <b>{st!.unplayable!.count} track(s)</b> Spotify refused to play on this account are being held
+            back, so the DJ cannot keep picking them. Spotify gives no way to know this in advance — the
+            station finds out by trying — and each one is forgotten again after{' '}
+            {st!.unplayable!.ttlDays} days in case the licensing comes back.
+            {st!.unplayable!.recent?.length ? (
+              <div className="mt-1 opacity-80">
+                {st!.unplayable!.recent.slice(0, 5).map((r) => (
+                  <div key={r.id}>
+                    {r.title || r.id}{r.artist ? ` — ${r.artist}` : ''}
+                    {r.hits > 1 ? ` (refused ${r.hits}×)` : ''}
+                  </div>
+                ))}
+                {st!.unplayable!.count > 5 ? <div>…and {st!.unplayable!.count - 5} more</div> : null}
+              </div>
+            ) : null}
+            <div className="mt-2">
+              <Btn sm onClick={forgetRefused} disabled={saving}>Forget refused tracks</Btn>
+              <span className="ml-2">
+                Puts them back in the library at no cost to your Spotify quota. They will be re-tagged the
+                next time the tagger runs, and any that are still unplayable will simply be refused again.
+              </span>
+            </div>
+          </div>
+        ) : null}
         {st?.pool?.fromDisk ? (
           <div className="field-hint mt-2">
             This pool was restored from its saved snapshot, which is why the station was playing seconds after
@@ -332,6 +372,20 @@ export function SpotifySection({ data, busy, saveSettings, adminFetch, refresh }
             not confirmed itself.
           </div>
         ) : null}
+      </Card>
+
+      <Card title="Seam tracing" sub="Extra detail about how the station drives the Spotify receiver: every player event it folds, every seam decision, every play command and why a track was refused.">
+        <label className="flex items-center gap-2 text-sm">
+          <Toggle on={!!sp?.verboseLog} disabled={busy}
+            onClick={() => saveSettings({ spotify: { verboseLog: !sp?.verboseLog } })} ariaLabel="verbose Spotify logging" />
+          Verbose Spotify logging
+        </label>
+        <div className="field-hint mt-2">
+          Takes effect immediately — no restart, no rebuild. Lines go to the controller&apos;s container log
+          (<code>docker compose logs -f controller</code>, prefixed <code>[spotify+]</code>) and to the
+          station&apos;s event log under <code>state/logs/</code>, never to the booth log, which is only 200
+          lines deep and would be flushed within two minutes. Leave it off unless you are chasing something.
+        </div>
       </Card>
 
       <Card title="Spotify quota" sub="Spotify meters this app on a rolling 30-second window, and since July 2026 the Development Mode budget is shared across every app on your developer account. These bound what the station spends on the catalogue; playback is exempt and never waits on them.">

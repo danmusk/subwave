@@ -55,15 +55,31 @@ beforeEach(() => { invalidateSpotifyReads(); });
 // first calls spotifyClient(). Installed once here, steered per test through
 // `stubRoutes`; an unrouted URL 404s, which is what every test that does not opt
 // in wants (they drive fake clients instead).
+// A route's value is normally the JSON body. It may instead be a FUNCTION of the
+// URL returning `{ status?, body?, retryAfter? }`, which is how a test drives a
+// non-200 (a 429 arming the client's shared rate-limit gate) or counts the calls
+// a code path actually makes. Needed because SpotifyClient captures `fetch` at
+// construction and the client is a process singleton: a test cannot wrap
+// globalThis.fetch afterwards and expect the client to see it.
+type StubReply = { status?: number; body?: unknown; retryAfter?: string | null };
 let stubRoutes: Array<[RegExp, unknown]> = [];
 globalThis.fetch = (async (url: any) => {
   const hit = stubRoutes.find(([re]) => re.test(String(url)));
-  const body = JSON.stringify(hit ? hit[1] : {});
+  let status = hit ? 200 : 404;
+  let payload: unknown = hit ? hit[1] : {};
+  let retryAfter: string | null = null;
+  if (typeof payload === 'function') {
+    const r = (payload as (u: string) => StubReply)(String(url)) ?? {};
+    status = r.status ?? 200;
+    payload = r.body ?? {};
+    retryAfter = r.retryAfter ?? null;
+  }
+  const body = JSON.stringify(payload);
   return {
-    ok: !!hit,
-    status: hit ? 200 : 404,
-    statusText: hit ? 'OK' : 'Not Found',
-    headers: { get: () => null },
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: status === 200 ? 'OK' : status === 429 ? 'Too Many Requests' : 'Not Found',
+    headers: { get: (h: string) => (/retry-after/i.test(String(h)) ? retryAfter : null) },
     json: async () => JSON.parse(body),
     text: async () => body,
   } as any;
@@ -516,6 +532,138 @@ test('the library walk yields a blocklisted track; the pick paths still refuse i
     writeFileSync(path.join(stateRoot, 'settings.json'), '{}');
     setCache(null);
     await settings.load();
+  }
+});
+
+// A track Spotify REFUSED TO PLAY is the mirror image of a blocked one, and the
+// difference is the point. A blocklisted track stays in the library (deleting
+// its tags would be the bug); a refused track is not in the operator's library
+// in any useful sense — nothing can play it — so it leaves the published pool
+// entirely, walk included. The snapshot on disk keeps it, which is what makes
+// clearing the list, or the 30-day expiry, cost no catalogue requests.
+test('a refused track leaves the published pool AND the walk, while the snapshot keeps it', async () => {
+  const { spotifyPool, spotifyClient } = await import('../src/music/sources/spotify/source.js');
+  const unplayable = await import('../src/music/sources/spotify/unplayable-file.js');
+
+  const DEAD = 'FFFFFFFFFFFFFFFFFFFFFF';
+  const OK = 'GGGGGGGGGGGGGGGGGGGGGG';
+  const page = (items: any[]) => ({ items, next: null });
+  stubRoutes = [
+    [/accounts\.spotify\.com\/api\/token/, { access_token: 'T', expires_in: 3600 }],
+    [/\/me\/playlists/, page([{ id: 'PL9', name: 'Night', items: { total: 2 } }])],
+    [/\/playlists\/PL9\/items/, page([{ item: track(DEAD, 'Hurricane') }, { item: track(OK, 'Fine') }])],
+    [/\/me\/tracks/, page([])],
+    [/\/me\/albums/, page([])],
+    [/\/artists\//, { id: 'ar1', genres: ['trip hop'] }],
+  ];
+  process.env.SPOTIFY_CLIENT_ID = 'id';
+  process.env.SPOTIFY_CLIENT_SECRET = 'secret';
+  process.env.SPOTIFY_REFRESH_TOKEN = 'refresh';
+  unplayable.resetUnplayableCache(path.join(stateRoot, `unplayable-src-${Date.now()}.json`));
+
+  try {
+    writeFileSync(path.join(stateRoot, 'settings.json'), JSON.stringify({ music: { source: 'spotify' } }));
+    setCache(null);
+    await settings.load();
+    spotifyClient().resetToken();
+    // invalidate() only marks a refresh owed — get() deliberately serves the
+    // stale pool while it rebuilds behind, so the walk has to be awaited or an
+    // earlier test's pool answers this one.
+    spotifyPool().invalidate();
+    await facade.getRandomSongs({ size: 1 });
+    await spotifyPool().settled();
+
+    // Built clean: both tracks present everywhere.
+    assert.deepEqual((await facade.getRandomSongs({ size: 50 })).map((s: any) => s.id).sort(), [DEAD, OK].sort());
+
+    // Now Spotify refuses one on air.
+    unplayable.markUnplayable(DEAD, { title: 'Hurricane', artist: 'Portishead', reason: 'unavailable' });
+    spotifyPool().dropTrack(DEAD);
+
+    const picks = await facade.getRandomSongs({ size: 50 });
+    assert.deepEqual(picks.map((s: any) => s.id), [OK], 'every pick path filters it through keep()');
+
+    const walked: string[] = [];
+    for await (const s of facade.iterateAllSongs()) walked.push(s.id);
+    assert.deepEqual(walked, [OK], 'the tagger, coverage and the orphan reconcile see the same library');
+
+    // Forgetting it costs nothing: the walked set is still in memory, so the
+    // row comes back without a single catalogue request.
+    unplayable.clearUnplayable();
+    assert.equal(spotifyPool().republish(), 1);
+    assert.equal((await facade.getRandomSongs({ size: 50 })).length, 2);
+  } finally {
+    unplayable.clearUnplayable();
+    stubRoutes = [];
+    delete process.env.SPOTIFY_CLIENT_ID;
+    delete process.env.SPOTIFY_CLIENT_SECRET;
+    delete process.env.SPOTIFY_REFRESH_TOKEN;
+    writeFileSync(path.join(stateRoot, 'settings.json'), '{}');
+    setCache(null);
+    await settings.load();
+  }
+});
+
+// The alternative-release lookup is the ONLY new request this feature makes, so
+// its budget is pinned here rather than left to review. /search caps `limit` at
+// 10, and asking for more makes searchPaged issue three HTTP requests for one
+// logical search — on a metered quota Development Mode cannot buy its way out of.
+test('the alternative lookup is ONE search page, and free on a repeat', async () => {
+  const { spotifyClient, findAlternativeTrack } = await import('../src/music/sources/spotify/source.js');
+  const unplayable = await import('../src/music/sources/spotify/unplayable-file.js');
+
+  const ALT = 'HHHHHHHHHHHHHHHHHHHHHH';
+  let searches: string[] = [];
+  let gateOn429 = false;
+  const hit = { tracks: { items: [track(ALT, 'Hurricane - 2018 Remaster', { album: album('al2', 'Desire (Remastered)') })], next: null } };
+  stubRoutes = [
+    [/accounts\.spotify\.com\/api\/token/, { access_token: 'T', expires_in: 3600 }],
+    [/\/search/, (url: string) => {
+      searches.push(url);
+      return gateOn429 ? { status: 429, retryAfter: '60' } : { body: hit };
+    }],
+  ];
+  process.env.SPOTIFY_CLIENT_ID = 'id';
+  process.env.SPOTIFY_CLIENT_SECRET = 'secret';
+  process.env.SPOTIFY_REFRESH_TOKEN = 'refresh';
+  unplayable.resetUnplayableCache(path.join(stateRoot, `unplayable-alt-${Date.now()}.json`));
+
+  try {
+    spotifyClient().resetToken();
+    invalidateSpotifyReads();
+    const want = { id: 'IIIIIIIIIIIIIIIIIIIIII', title: 'Hurricane', artist: 'Portishead', duration: 245, albumId: 'al1' } as any;
+
+    const alt = await findAlternativeTrack(want);
+    assert.equal(alt?.id, ALT, 'a remaster on another release is the same recording');
+    assert.equal(searches.length, 1, 'one page, not the three a >10 ask would cost');
+    assert.match(searches[0], /limit=10/, '/search caps limit at 10; asking for more is three requests');
+
+    // The reads.ts memo covers the repeat — a track refused twice inside the TTL
+    // must not pay twice.
+    searches = [];
+    await findAlternativeTrack(want);
+    assert.equal(searches.length, 0);
+
+    // And once Spotify closes the gate, the lookup stops happening at all.
+    // Letting the foreground lane wait a window out would put that delay
+    // straight into the seam, for a lookup the station can do without.
+    gateOn429 = true;
+    invalidateSpotifyReads();
+    searches = [];
+    assert.equal(await findAlternativeTrack(want), null, 'a refused search is not a substitute');
+    assert.ok(spotifyClient().rateLimitedForMs() > 0, 'the 429 armed the shared gate');
+
+    invalidateSpotifyReads();   // so it is the GATE stopping it, not the failure memo
+    searches = [];
+    assert.equal(await findAlternativeTrack(want), null);
+    assert.equal(searches.length, 0, 'not one request spent while Spotify is holding the station off');
+  } finally {
+    spotifyClient().clearHold();
+    unplayable.clearUnplayable();
+    stubRoutes = [];
+    delete process.env.SPOTIFY_CLIENT_ID;
+    delete process.env.SPOTIFY_CLIENT_SECRET;
+    delete process.env.SPOTIFY_REFRESH_TOKEN;
   }
 });
 

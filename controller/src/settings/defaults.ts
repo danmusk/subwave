@@ -764,6 +764,11 @@ export const DEFAULTS = {
     },
     seamLeadMs: 1500,
     mismatch: 'reclaim',
+    // Per-tick seam tracing to the container log + the durable event stream
+    // (never the booth log — see music/sources/spotify/trace.ts). Read live, so
+    // an operator can turn it on mid-incident without a restart; SPOTIFY_VERBOSE_LOG
+    // can force it on but never off.
+    verboseLog: false,
   },
 
   // The player heart button (#991). `starInNavidrome` mirrors each first like
