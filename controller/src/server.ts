@@ -1,5 +1,13 @@
 // Controller HTTP API — thin entry point: wires middleware, mounts routes/ and
 // starts the background services.
+
+// KEEP THIS FIRST. Optional Seq log shipping (inert unless SEQ_URL is set).
+// ESM runs a dependency's body before the importing module's, in import order,
+// so from here the console tap is live before express, helmet or config.ts
+// evaluate — which is what catches util/env.ts's `[env] …` warnings and
+// everything else logged at import time. Moved below another import, it misses
+// them silently. See observability/seq-tap.ts.
+import { flushSeq, seqEnabled, SEQ_FLUSH_MS } from './observability/seq-tap.js';
 import express from 'express';
 import helmet from 'helmet';
 import { config } from './config.js';
@@ -70,10 +78,14 @@ process.on('unhandledRejection', (reason: any) => {
 
 // Graceful shutdown: fold the library DB's WAL back into library.db before the
 // process dies, else the -wal sidecar survives every restart and only grows
-// (#786). Synchronous work only.
+// (#786). Synchronous work only — the one exception is the Seq flush at the
+// very end, which runs only when an operator has opted into log shipping and is
+// bounded by a timer that exits regardless.
 let shuttingDown = false;
 function shutdown(signal: string): void {
-  if (shuttingDown) return;
+  // A second signal during the Seq flush below must still kill the process,
+  // which is why this now exits rather than returning.
+  if (shuttingDown) { process.exit(0); return; }
   shuttingDown = true;
   console.log(`[shutdown] ${signal} — reaping TTS workers + closing library DB`);
   // Reap resident Python TTS workers so they don't outlive a bare-process
@@ -90,7 +102,17 @@ function shutdown(signal: string): void {
   } catch (err: any) {
     console.error('[shutdown] library close failed:', err.message);
   }
-  process.exit(0);
+
+  // Seq batches, so a SIGTERM would drop whatever is buffered. With shipping
+  // off this is the same synchronous exit as before, on the same line. With it
+  // on we spend at most SEQ_FLUSH_MS — well inside docker's stop grace, and by
+  // now the DB is closed and the workers are reaped, so nothing can write and
+  // Liquidsoap keeps playing what is already in next.txt. No air impact.
+  if (!seqEnabled()) process.exit(0);
+  // Deliberately NOT unref'd: this timer has to be able to fire.
+  const bail = setTimeout(() => process.exit(0), SEQ_FLUSH_MS);
+  const done = () => { clearTimeout(bail); process.exit(0); };
+  flushSeq().then(done, done);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));

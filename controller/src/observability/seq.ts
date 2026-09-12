@@ -45,7 +45,9 @@ let logger: SeqLoggerLike | null = null;
 let floor: SeqLevel = 'Information';
 let remote: SeqLevel | null = null;
 let baseProps: Record<string, unknown> = {};
-let sent = 0;
+// Handed to the client, NOT confirmed delivered — the client batches and we never
+// see its HTTP result. Naming it `sent` would be a stat that lies.
+let queued = 0;
 let dropped = 0;
 
 // Degrade latch. A Seq outage must be genuinely free, not merely bounded: past
@@ -141,7 +143,7 @@ export function emitDraft(draft: SeqEventDraft): void {
       ...(draft.exception === undefined ? {} : { exception: draft.exception }),
       ...(draft.traceId === undefined ? {} : { traceId: draft.traceId }),
     });
-    sent += 1;
+    queued += 1;
   } catch {
     // Silent: a catch that logs is the loop.
     dropped += 1;
@@ -232,7 +234,7 @@ export function seqStats(): {
   enabled: boolean;
   floor: SeqLevel;
   remote: SeqLevel | null;
-  sent: number;
+  queued: number;
   dropped: number;
   pausedMs: number;
 } {
@@ -240,7 +242,7 @@ export function seqStats(): {
     enabled: !!logger,
     floor,
     remote,
-    sent,
+    queued,
     dropped,
     pausedMs: Math.max(0, pausedUntil - Date.now()),
   };
