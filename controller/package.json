@@ -40,6 +40,7 @@
     "mmdb-lib": "^3.0.3",
     "multer": "^2.0.1",
     "node-cron": "^4.6.0",
+    "seq-logging": "^3.2.0",
     "sqlite-vec": "^0.1.9",
     "tsx": "^4.19.2",
     "umap-js": "^1.4.0",
