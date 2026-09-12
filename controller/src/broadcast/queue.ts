@@ -52,6 +52,7 @@ import { getFullContext, getClockContext, energyForDaypart } from '../context.js
 import * as settings from '../settings.js';
 import { TRANSITION_EFFECTS } from '../settings/vocab.js';
 import { logEvent } from '../observability/events.js';
+import { seqBooth, seqMuted } from '../observability/seq.js';
 import { djCallsAllowed, presentListeners } from './listeners.js';
 import { autoVoiceAllowed } from './voice-policy.js';
 import { speakClockAllowed, stationIdDaypartDrifted, stationIdDaypartStamp } from './clock-policy.js';
@@ -555,7 +556,13 @@ class Queue {
     const entry = { id: Date.now() + Math.random(), kind, message, meta, t: new Date().toISOString() };
     this.djLog.unshift(entry);
     this.djLog = this.djLog.slice(0, 200);
-    console.log(`[${kind}] ${message}`);
+    // Seq gets the structured form — `kind` as the source, plus the `meta` bag
+    // the console line below cannot carry. The console line is then MUTED for
+    // Seq only: stdout is unchanged, but the tap would otherwise mirror the
+    // same booth entry a second time. Both calls are no-ops unless SEQ_URL is
+    // set.
+    seqBooth(kind, message, meta);
+    seqMuted(() => console.log(`[${kind}] ${message}`));
   }
 
   // Compact recap of recent on-air DJ utterances for injection into Ollama
